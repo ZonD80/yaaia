@@ -1,0 +1,1148 @@
+<template>
+  <div class="app">
+    <header class="header">
+      <h1>YAAIA <span class="version">v{{ appVersion }}</span></h1>
+      <p v-if="agentBrowserError" class="error">{{ agentBrowserError }}</p>
+    </header>
+    <div v-if="taskSummary" class="floating-task"
+      :class="{ finalized: taskFinalized, failed: taskFinalized && !taskSuccess }">
+      <span class="floating-task-name">{{ taskSummary }}</span>
+      <span class="floating-task-timer">{{ formatElapsed(taskElapsedSeconds) }}</span>
+    </div>
+    <main class="main">
+      <section class="config" v-if="!agentReady">
+        <h2>Configuration</h2>
+        <div class="field">
+          <label>Provider</label>
+          <select v-model="config.aiProvider">
+            <option value="claude">Claude</option>
+            <option value="openrouter">OpenRouter</option>
+          </select>
+        </div>
+        <div class="field" v-if="config.aiProvider === 'claude'">
+          <label>Claude API Key</label>
+          <input type="password" v-model="config.claudeApiKey" placeholder="sk-ant-..." />
+        </div>
+        <div class="field" v-if="config.aiProvider === 'claude'">
+          <label>Claude Model</label>
+          <input v-model="config.claudeModel" placeholder="claude-sonnet-4-6" />
+        </div>
+        <div class="field" v-if="config.aiProvider === 'openrouter'">
+          <label>OpenRouter API Key</label>
+          <input type="password" v-model="config.openrouterApiKey" placeholder="sk-or-..." />
+        </div>
+        <div class="field" v-if="config.aiProvider === 'openrouter'">
+          <label>OpenRouter Model</label>
+          <input v-model="config.openrouterModel" placeholder="google/gemini-2.5-flash" />
+        </div>
+        <button class="btn primary" @click="startChat" :disabled="starting">
+          {{ starting ? "Starting..." : "Start chat" }}
+        </button>
+      </section>
+      <section class="chat" v-else>
+        <div class="chat-messages" ref="messagesRef" @click="onChatLinkClick">
+          <div v-if="messages.length === 0" class="chat-placeholder">Agent is ready. Type your message below.</div>
+          <div v-for="(msg, i) in messages" :key="i" :class="['msg', msg.role, { error: msg.isError, report: msg.isReport }, msg.type]">
+            <template v-if="msg.role === 'user'">
+              <span v-if="msg.injected" class="msg-type-label">Injected:</span>
+              <span class="msg-text">{{ msg.content }}</span>
+            </template>
+            <template v-else>
+              <div v-if="msg.isError" class="msg-error">{{ msg.content }}</div>
+              <template v-else-if="msg.type === 'assessment'">
+                <span class="msg-type-label">Assessment</span>
+                <div class="msg-markdown" v-html="renderMarkdown(msg.content)"></div>
+              </template>
+              <template v-else-if="msg.type === 'clarification'">
+                <span class="msg-type-label">Clarification</span>
+                <div class="msg-markdown" v-html="renderMarkdown(msg.content)"></div>
+              </template>
+              <template v-else-if="msg.type === 'tool_running'">
+                <span class="msg-type-label">Tool: {{ msg.name }}</span>
+                <span class="msg-running">Running…</span>
+              </template>
+              <template v-else-if="msg.type === 'tool_call' && msg.accordion">
+                <span class="msg-type-label">Tool: {{ msg.name }}</span>
+                <div class="msg-markdown" v-html="msg.accordion"></div>
+              </template>
+              <template v-else-if="msg.isReport && msg.content">
+                <span class="msg-type-label">Detailed report</span>
+                <div class="msg-markdown" v-html="renderMarkdown(msg.content)"></div>
+              </template>
+              <div v-else-if="msg.content" class="msg-markdown" v-html="renderMarkdown(msg.content)"></div>
+            </template>
+          </div>
+          <template v-if="streaming">
+            <div v-for="(p, pi) in streamingParsed.parts" :key="'stream-' + pi" :class="['msg', p.role, p.type]">
+              <template v-if="p.role === 'user'">
+                <span v-if="p.injected" class="msg-type-label">Injected:</span>
+                <span class="msg-text">{{ p.content }}</span>
+              </template>
+              <template v-else-if="p.type === 'assessment'">
+                <span class="msg-type-label">Assessment</span>
+                <div class="msg-markdown" v-html="renderMarkdown(p.content)"></div>
+              </template>
+              <template v-else-if="p.type === 'clarification'">
+                <span class="msg-type-label">Clarification</span>
+                <div class="msg-markdown" v-html="renderMarkdown(p.content)"></div>
+              </template>
+              <template v-else-if="p.type === 'tool_running'">
+                <span class="msg-type-label">Tool: {{ p.name }}</span>
+                <span class="msg-running">Running…</span>
+              </template>
+              <template v-else-if="p.type === 'tool_call' && p.accordion">
+                <span class="msg-type-label">Tool: {{ p.name }}</span>
+                <div class="msg-markdown" v-html="p.accordion"></div>
+              </template>
+              <div v-else-if="p.content" class="msg-markdown" v-html="renderMarkdown(p.content)"></div>
+            </div>
+            <div class="msg assistant">
+              <div v-if="streamingParsed.tail" class="msg-markdown" v-html="renderMarkdown(streamingParsed.tail)"></div>
+              <span v-else>Thinking…</span>
+            </div>
+          </template>
+          <div ref="scrollAnchor" aria-hidden="true"></div>
+        </div>
+        <div class="chat-input">
+          <textarea
+            v-model="inputText"
+            :placeholder="sending ? 'Type to inject message…' : 'Ask the agent...'"
+            rows="2"
+            @keydown.enter.exact.prevent="send"
+          />
+          <button class="btn secondary" @click="stopAgent" :disabled="!sending">Stop</button>
+          <button class="btn primary" @click="send" :disabled="sending">Send</button>
+        </div>
+      </section>
+      <aside class="sidebar">
+        <button class="btn secondary" @click="openSecretsEditor">Secrets Editor</button>
+        <button class="btn secondary" @click="openConfigsEditor">Configs Editor</button>
+        <button class="btn secondary" @click="viewRecipe">View recipe</button>
+        <button class="btn secondary" @click="saveRecipe">Save recipe</button>
+        <button class="btn secondary" @click="loadRecipe">Load recipe</button>
+        <button class="btn secondary" @click="exitChat">Exit chat</button>
+      </aside>
+    </main>
+    <div v-if="askUserInfo" class="ask-user-overlay">
+      <div class="ask-user-modal">
+        <h3>Agent needs your input</h3>
+        <p v-if="askUserInfo.clarification" class="ask-user-clarification">{{ askUserInfo.clarification }}</p>
+        <p v-if="askUserInfo.assessment" class="ask-user-assessment">{{ askUserInfo.assessment }}</p>
+        <p class="ask-user-countdown">Reply within {{ askUserCountdown }} seconds</p>
+        <textarea v-model="askUserReply" placeholder="Type your reply..." rows="4" @keydown.enter.ctrl="submitAskUserReply" />
+        <div class="ask-user-actions">
+          <button class="btn primary" @click="submitAskUserReply">Send</button>
+          <button class="btn secondary" @click="dismissAskUser">Cancel</button>
+        </div>
+      </div>
+    </div>
+    <div v-if="showFinalizePopup" class="ask-user-overlay"
+      @click.self="dismissFinalize">
+      <div class="ask-user-modal finalize-modal"
+        :class="{ 'finalize-failed': finalizeInfo && !finalizeInfo.is_successful }">
+        <h3>Task {{ finalizeInfo?.is_successful ? 'completed' : 'failed' }}</h3>
+        <p v-if="finalizeInfo?.assessment" class="ask-user-assessment"><strong>Assessment:</strong> {{ finalizeInfo.assessment }}</p>
+        <p v-if="finalizeInfo?.clarification" class="ask-user-clarification"><strong>Clarification:</strong> {{ finalizeInfo.clarification }}</p>
+        <div v-if="finalizeInfo?.detailed_report" class="ask-user-clarification report-block">
+          <strong>Detailed report:</strong>
+          <div class="msg-markdown report-content" v-html="renderMarkdown(finalizeInfo.detailed_report)"></div>
+        </div>
+        <div class="ask-user-actions">
+          <button class="btn primary" @click="dismissFinalize">Close</button>
+        </div>
+      </div>
+    </div>
+    <div v-if="showSecretsEditor" class="ask-user-overlay editor-overlay" @click.self="showSecretsEditor = false">
+      <div class="ask-user-modal editor-modal">
+        <h3>Secrets Editor</h3>
+        <p v-if="secretsError" class="editor-error">{{ secretsError }}</p>
+        <div class="editor-form">
+          <input v-model="secretsForm.detailed_description" type="text" placeholder="Description" class="editor-input" />
+          <input v-model="secretsForm.first_factor" type="text" placeholder="First factor (e.g. user)" class="editor-input" />
+          <input v-model="secretsForm.first_factor_type" type="text" placeholder="First factor type (e.g. username)" class="editor-input" />
+          <input v-model="secretsForm.value" type="text" placeholder="Value (plaintext)" class="editor-input" />
+          <div class="editor-form-actions">
+            <button class="btn primary" @click="saveSecret">{{ secretsEditingId ? "Update" : "Add" }}</button>
+            <button v-if="secretsEditingId" class="btn secondary" @click="startAddSecret">Cancel edit</button>
+          </div>
+        </div>
+        <div class="editor-list">
+          <div v-for="item in secretsItems" :key="item.id" class="editor-row">
+            <div class="editor-row-fields">
+              <span class="editor-row-desc">{{ item.detailed_description }}</span>
+              <span class="editor-row-factor">{{ item.first_factor }}</span>
+              <span class="editor-row-type">{{ item.first_factor_type }}</span>
+              <span class="editor-row-value">{{ item.value }}</span>
+            </div>
+            <div class="editor-row-actions">
+              <button class="btn secondary small" @click="startEditSecret(item)">Edit</button>
+              <button class="btn secondary small" @click="deleteSecret(item.id)">Delete</button>
+            </div>
+          </div>
+        </div>
+        <div class="editor-modal-actions">
+          <button class="btn secondary" @click="startAddSecret">Add new</button>
+          <button class="btn secondary" @click="showSecretsEditor = false">Close</button>
+        </div>
+      </div>
+    </div>
+    <div v-if="showConfigsEditor" class="ask-user-overlay editor-overlay" @click.self="showConfigsEditor = false">
+      <div class="ask-user-modal editor-modal">
+        <h3>Configs Editor</h3>
+        <p v-if="configsError" class="editor-error">{{ configsError }}</p>
+        <div class="editor-form">
+          <input v-model="configsForm.detailed_description" type="text" placeholder="Description" class="editor-input" />
+          <input v-model="configsForm.value" type="text" placeholder="Value (plaintext)" class="editor-input" />
+          <div class="editor-form-actions">
+            <button class="btn primary" @click="saveConfigEntry">{{ configsEditingId ? "Update" : "Add" }}</button>
+            <button v-if="configsEditingId" class="btn secondary" @click="startAddConfig">Cancel edit</button>
+          </div>
+        </div>
+        <div class="editor-list">
+          <div v-for="item in configsItems" :key="item.id" class="editor-row">
+            <div class="editor-row-fields">
+              <span class="editor-row-desc">{{ item.detailed_description }}</span>
+              <span class="editor-row-value">{{ item.value }}</span>
+            </div>
+            <div class="editor-row-actions">
+              <button class="btn secondary small" @click="startEditConfig(item)">Edit</button>
+              <button class="btn secondary small" @click="deleteConfigEntry(item.id)">Delete</button>
+            </div>
+          </div>
+        </div>
+        <div class="editor-modal-actions">
+          <button class="btn secondary" @click="startAddConfig">Add new</button>
+          <button class="btn secondary" @click="showConfigsEditor = false">Close</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</template>
+
+<script setup lang="ts">
+import { ref, computed, watch, nextTick, onMounted, onUnmounted } from "vue";
+import { marked } from "marked";
+
+const appVersion = __APP_VERSION__;
+
+type ChatMessage = {
+  role: "user" | "assistant";
+  content: string;
+  injected?: boolean;
+  isError?: boolean;
+  isReport?: boolean;
+  type?: "assessment" | "clarification" | "tool_running" | "tool_call" | "content";
+  name?: string;
+  accordion?: string;
+  wait_seconds?: number;
+};
+
+const MSG_START = "<<<MSG>>>";
+const MSG_END = "<<<END>>>";
+
+function parseStream(raw: string): { parts: ChatMessage[]; tail: string } {
+  const parts: ChatMessage[] = [];
+  let remaining = raw;
+  let contentBuffer = "";
+
+  while (true) {
+    const idx = remaining.indexOf(MSG_START);
+    if (idx === -1) {
+      contentBuffer += remaining;
+      break;
+    }
+    contentBuffer += remaining.slice(0, idx);
+    const after = remaining.slice(idx + MSG_START.length);
+    const endIdx = after.indexOf(MSG_END);
+    if (endIdx === -1) {
+      contentBuffer += MSG_START + after;
+      break;
+    }
+    const jsonStr = after.slice(0, endIdx);
+    remaining = after.slice(endIdx + MSG_END.length);
+    try {
+      const msg = JSON.parse(jsonStr) as { type?: string; content?: string; name?: string; accordion?: string; wait_seconds?: number };
+      if (contentBuffer.trim()) {
+        parts.push({ role: "assistant", content: contentBuffer.trim(), type: "content" });
+        contentBuffer = "";
+      }
+      if (msg.type === "content_end") {
+        /* flush handled above */
+      } else if (msg.type === "assessment" && typeof msg.content === "string") {
+        parts.push({ role: "assistant", content: msg.content, type: "assessment" });
+      } else if (msg.type === "clarification" && typeof msg.content === "string") {
+        parts.push({ role: "assistant", content: msg.content, type: "clarification" });
+      } else if (msg.type === "tool_running" && msg.name) {
+        parts.push({ role: "assistant", type: "tool_running", name: msg.name, content: "", wait_seconds: msg.wait_seconds });
+      } else if (msg.type === "tool_call" && msg.name && msg.accordion) {
+        const last = parts[parts.length - 1];
+        if (last?.type === "tool_running" && last.name === msg.name) parts.pop();
+        parts.push({ role: "assistant", type: "tool_call", name: msg.name, accordion: msg.accordion, content: "", wait_seconds: msg.wait_seconds });
+      } else if (msg.type === "user_injected" && typeof msg.content === "string") {
+        parts.push({ role: "user", content: msg.content, injected: true });
+      }
+    } catch {
+      contentBuffer += MSG_START + jsonStr + MSG_END;
+    }
+  }
+  return { parts, tail: contentBuffer };
+}
+
+function renderMarkdown(text: string): string {
+  if (!text?.trim()) return "";
+  return marked.parse(text) as string;
+}
+
+function onChatLinkClick(e: MouseEvent) {
+  const anchor = (e.target as HTMLElement)?.closest?.("a");
+  if (!anchor?.href) return;
+  const url = anchor.getAttribute("href");
+  if (!url || !/^(https?|mailto):/i.test(url)) return;
+  e.preventDefault();
+  e.stopPropagation();
+  window.electronAPI?.openExternal?.(url);
+}
+
+function formatElapsed(seconds: number): string {
+  const d = Math.floor(seconds / 86400);
+  const h = Math.floor((seconds % 86400) / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = seconds % 60;
+  return `${d}d ${h}h ${m}m ${s}s`;
+}
+
+function startTaskTimer() {
+  if (taskTimerInterval) clearInterval(taskTimerInterval);
+  taskTimerInterval = setInterval(() => {
+    if (taskStartTime.value == null || taskFinalized.value) return;
+    taskElapsedSeconds.value = Math.floor((Date.now() - taskStartTime.value) / 1000);
+  }, 1000);
+}
+
+function stopTaskTimer() {
+  if (taskTimerInterval) {
+    clearInterval(taskTimerInterval);
+    taskTimerInterval = null;
+  }
+}
+
+function startAskUserCountdown() {
+  askUserCountdown.value = 60;
+  if (askUserCountdownTimer) clearInterval(askUserCountdownTimer);
+  askUserCountdownTimer = setInterval(() => {
+    askUserCountdown.value--;
+    if (askUserCountdown.value <= 0 && askUserCountdownTimer) {
+      clearInterval(askUserCountdownTimer);
+      askUserCountdownTimer = null;
+    }
+  }, 1000);
+}
+
+function stopAskUserCountdown() {
+  if (askUserCountdownTimer) {
+    clearInterval(askUserCountdownTimer);
+    askUserCountdownTimer = null;
+  }
+}
+
+function playNotificationSound() {
+  try {
+    const Ctx = window.AudioContext ?? (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (!Ctx) return;
+    const ctx = new Ctx();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.frequency.value = 880;
+    osc.type = "sine";
+    gain.gain.setValueAtTime(0.2, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.25);
+    osc.start(ctx.currentTime);
+    osc.stop(ctx.currentTime + 0.25);
+  } catch {
+    /* ignore */
+  }
+}
+
+function dismissFloatingTask() {
+  taskSummary.value = "";
+  taskStartTime.value = null;
+  taskFinalized.value = false;
+  taskSuccess.value = true;
+  taskElapsedSeconds.value = 0;
+  stopTaskTimer();
+}
+
+function dismissAskUser() {
+  window.electronAPI?.askUserCancel?.();
+  askUserInfo.value = null;
+  askUserReply.value = "";
+  stopAskUserCountdown();
+}
+
+function dismissFinalize() {
+  showFinalizePopup.value = false;
+  finalizeInfo.value = null;
+  dismissFloatingTask();
+}
+
+async function openSecretsEditor() {
+  showSecretsEditor.value = true;
+  secretsError.value = "";
+  await refreshSecretsList();
+}
+
+async function refreshSecretsList() {
+  try {
+    const list = (await window.electronAPI?.secretsListFull?.()) ?? [];
+    secretsItems.value = list as typeof secretsItems.value;
+  } catch (err) {
+    secretsItems.value = [];
+    secretsError.value = err instanceof Error ? err.message : "Failed to load";
+  }
+}
+
+function startAddSecret() {
+  secretsEditingId.value = null;
+  secretsForm.value = { detailed_description: "", first_factor: "", first_factor_type: "", value: "" };
+}
+
+function startEditSecret(entry: (typeof secretsItems.value)[0]) {
+  secretsEditingId.value = entry.id;
+  secretsForm.value = {
+    detailed_description: entry.detailed_description,
+    first_factor: entry.first_factor,
+    first_factor_type: entry.first_factor_type,
+    value: entry.value,
+  };
+}
+
+async function saveSecret() {
+  secretsError.value = "";
+  try {
+    if (secretsEditingId.value) {
+      await window.electronAPI?.secretsDelete?.(secretsEditingId.value);
+    }
+    await window.electronAPI?.secretsSet?.({
+      ...secretsForm.value,
+      force: false,
+    });
+    await refreshSecretsList();
+    secretsEditingId.value = null;
+    secretsForm.value = { detailed_description: "", first_factor: "", first_factor_type: "", value: "" };
+  } catch (err) {
+    secretsError.value = err instanceof Error ? err.message : "Failed to save";
+  }
+}
+
+async function deleteSecret(id: string) {
+  if (!confirm("Delete this secret?")) return;
+  secretsError.value = "";
+  try {
+    await window.electronAPI?.secretsDelete?.(id);
+    await refreshSecretsList();
+    if (secretsEditingId.value === id) {
+      secretsEditingId.value = null;
+      secretsForm.value = { detailed_description: "", first_factor: "", first_factor_type: "", value: "" };
+    }
+  } catch (err) {
+    secretsError.value = err instanceof Error ? err.message : "Failed to delete";
+  }
+}
+
+async function openConfigsEditor() {
+  showConfigsEditor.value = true;
+  configsError.value = "";
+  await refreshConfigsList();
+}
+
+async function refreshConfigsList() {
+  try {
+    const list = (await window.electronAPI?.agentConfigList?.()) ?? [];
+    configsItems.value = list as typeof configsItems.value;
+  } catch (err) {
+    configsItems.value = [];
+    configsError.value = err instanceof Error ? err.message : "Failed to load";
+  }
+}
+
+function startAddConfig() {
+  configsEditingId.value = null;
+  configsForm.value = { detailed_description: "", value: "" };
+}
+
+function startEditConfig(entry: (typeof configsItems.value)[0]) {
+  configsEditingId.value = entry.id;
+  configsForm.value = { detailed_description: entry.detailed_description, value: entry.value };
+}
+
+async function saveConfigEntry() {
+  configsError.value = "";
+  try {
+    if (configsEditingId.value) {
+      await window.electronAPI?.agentConfigDelete?.(configsEditingId.value);
+    }
+    await window.electronAPI?.agentConfigSet?.({
+      ...configsForm.value,
+      force: false,
+    });
+    await refreshConfigsList();
+    configsEditingId.value = null;
+    configsForm.value = { detailed_description: "", value: "" };
+  } catch (err) {
+    configsError.value = err instanceof Error ? err.message : "Failed to save";
+  }
+}
+
+async function deleteConfigEntry(id: string) {
+  if (!confirm("Delete this config?")) return;
+  configsError.value = "";
+  try {
+    await window.electronAPI?.agentConfigDelete?.(id);
+    await refreshConfigsList();
+    if (configsEditingId.value === id) {
+      configsEditingId.value = null;
+      configsForm.value = { detailed_description: "", value: "" };
+    }
+  } catch (err) {
+    configsError.value = err instanceof Error ? err.message : "Failed to delete";
+  }
+}
+
+const config = ref({
+  aiProvider: "claude" as "claude" | "openrouter",
+  claudeApiKey: "",
+  claudeModel: "claude-sonnet-4-6",
+  openrouterApiKey: "",
+  openrouterModel: "google/gemini-2.5-flash",
+});
+
+const agentReady = ref(false);
+const starting = ref(false);
+const agentBrowserError = ref("");
+const messages = ref<ChatMessage[]>([]);
+const inputText = ref("");
+const streaming = ref(false);
+const streamBuffer = ref("");
+const sending = ref(false);
+const messagesRef = ref<HTMLElement | null>(null);
+const scrollAnchor = ref<HTMLElement | null>(null);
+
+const SCROLL_THRESHOLD = 80;
+/** True when user is at/near bottom; false when they've scrolled up. Updated on scroll. */
+const userIsAtBottom = ref(true);
+
+function doScrollToBottom() {
+  scrollAnchor.value?.scrollIntoView({ behavior: "auto", block: "end" });
+}
+
+/** Only scroll if user was at bottom (hasn't scrolled up to read old content). */
+function scrollToBottomIfFollowing() {
+  if (!userIsAtBottom.value) return;
+  nextTick(() => {
+    requestAnimationFrame(() => {
+      doScrollToBottom();
+    });
+  });
+}
+
+/** Always scroll to bottom (e.g. when loading or after send). */
+function scrollToBottomAlways() {
+  userIsAtBottom.value = true;
+  nextTick(() => {
+    requestAnimationFrame(() => {
+      doScrollToBottom();
+    });
+  });
+}
+
+let scrollCleanup: (() => void) | null = null;
+
+function setupScrollTracking() {
+  scrollCleanup?.();
+  scrollCleanup = null;
+  const el = messagesRef.value;
+  if (!el) return;
+  const check = () => {
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < SCROLL_THRESHOLD;
+    userIsAtBottom.value = atBottom;
+  };
+  el.addEventListener("scroll", check, { passive: true });
+  check();
+  scrollCleanup = () => el.removeEventListener("scroll", check);
+}
+const askUserInfo = ref<{ clarification: string; assessment: string; attempt: number } | null>(null);
+const askUserReply = ref("");
+const showFinalizePopup = ref(false);
+const finalizeInfo = ref<{ assessment: string; clarification: string; is_successful: boolean; detailed_report: string } | null>(null);
+const pendingReportForNextMessage = ref(false);
+
+const taskSummary = ref("");
+const taskStartTime = ref<number | null>(null);
+const taskFinalized = ref(false);
+const taskSuccess = ref(true);
+const taskElapsedSeconds = ref(0);
+let taskTimerInterval: ReturnType<typeof setInterval> | null = null;
+
+const askUserCountdown = ref(60);
+
+// Secrets Editor
+const showSecretsEditor = ref(false);
+const secretsItems = ref<Array<{ id: string; detailed_description: string; first_factor: string; first_factor_type: string; value: string }>>([]);
+const secretsError = ref("");
+const secretsEditingId = ref<string | null>(null);
+const secretsForm = ref({ detailed_description: "", first_factor: "", first_factor_type: "", value: "" });
+
+// Configs Editor
+const showConfigsEditor = ref(false);
+const configsItems = ref<Array<{ id: string; detailed_description: string; value: string }>>([]);
+const configsError = ref("");
+const configsEditingId = ref<string | null>(null);
+const configsForm = ref({ detailed_description: "", value: "" });
+let askUserCountdownTimer: ReturnType<typeof setInterval> | null = null;
+
+let streamUnsub: (() => void) | undefined;
+let askUserUnsub: (() => void) | undefined;
+let askUserCloseUnsub: (() => void) | undefined;
+let taskStartUnsub: (() => void) | undefined;
+let finalizeUnsub: (() => void) | undefined;
+let agentBrowserErrorUnsub: (() => void) | undefined;
+
+const streamingParsed = computed(() => parseStream(streamBuffer.value));
+
+async function startChat() {
+  starting.value = true;
+  try {
+    const plainConfig = JSON.parse(JSON.stringify(config.value));
+    const result = await window.electronAPI?.startChat?.(plainConfig);
+    if (result?.ok) {
+      agentReady.value = true;
+      agentBrowserError.value = "";
+    } else {
+      alert(result?.message ?? "Failed to start");
+    }
+  } catch (err) {
+    alert(err instanceof Error ? err.message : String(err));
+  } finally {
+    starting.value = false;
+  }
+}
+
+async function exitChat() {
+  await window.electronAPI?.stopChat?.();
+  agentReady.value = false;
+}
+
+function stopAgent() {
+  if (sending.value) window.electronAPI?.agentAbort?.();
+}
+
+function buildHistory(msgs: ChatMessage[]): { role: "user" | "assistant"; content: string }[] {
+  const out: { role: "user" | "assistant"; content: string }[] = [];
+  const include = (x: ChatMessage) =>
+    x.role === "user" ||
+    (x.role === "assistant" &&
+      (x.type === "assessment" || x.type === "clarification" || x.type === "content" || (x.content && x.type !== "tool_call" && x.type !== "tool_running")));
+  const filtered = msgs.filter(include);
+  for (const m of filtered) {
+    if (m.role === "user") {
+      out.push({ role: "user", content: m.content });
+    } else {
+      const content = m.type === "assessment" ? `**Assessment:** ${m.content}\n\n` : m.type === "clarification" ? `**Clarification:** ${m.content}\n\n` : m.content + (m.content ? "\n\n" : "");
+      if (out.length > 0 && out[out.length - 1].role === "assistant") out[out.length - 1].content += content;
+      else out.push({ role: "assistant", content });
+    }
+  }
+  return out;
+}
+
+async function send() {
+  const text = inputText.value.trim();
+  if (!text || sending.value) return;
+  inputText.value = "";
+  messages.value.push({ role: "user", content: text });
+  sending.value = true;
+  streaming.value = true;
+  streamBuffer.value = "";
+  try {
+    const history = buildHistory(messages.value.slice(0, -1));
+    const reply = await window.electronAPI?.agentSendMessage?.(text, history);
+    const { parts, tail } = parseStream(streamBuffer.value);
+    for (const p of parts) messages.value.push(p);
+    let finalContent: string;
+    if (reply === "Stopped by user.") {
+      finalContent = (tail.trim() ? tail.trim() + "\n\n" : "") + "_Stopped by user._";
+    } else if (reply) {
+      finalContent = reply;
+    } else {
+      finalContent = tail.trim();
+    }
+    if (finalContent) {
+      const isReport = pendingReportForNextMessage.value;
+      if (isReport) pendingReportForNextMessage.value = false;
+      messages.value.push({ role: "assistant", content: finalContent, isReport: isReport || undefined });
+    }
+  } catch (err) {
+    const { parts, tail } = parseStream(streamBuffer.value);
+    for (const p of parts) messages.value.push(p);
+    const msg = err instanceof Error ? err.message : String(err);
+    const content = tail.trim() ? `${tail.trim()}\n\n**Error:** ${msg}` : `Error: ${msg}`;
+    messages.value.push({ role: "assistant", content, isError: true });
+  } finally {
+    sending.value = false;
+    streaming.value = false;
+    streamBuffer.value = "";
+    scrollToBottomAlways();
+  }
+}
+
+function submitAskUserReply() {
+  const reply = askUserReply.value.trim();
+  window.electronAPI?.askUserReply?.(reply || "(no message)");
+  dismissAskUser();
+}
+
+async function viewRecipe() {
+  await window.electronAPI?.recipeView?.();
+}
+
+async function saveRecipe() {
+  const path = await window.electronAPI?.recipeSave?.();
+  if (path) alert(`Saved to ${path}`);
+}
+
+async function loadRecipe() {
+  const r = await window.electronAPI?.recipeLoad?.();
+  if (r?.ok && r.markdown) {
+    const instructions = prompt("Optional custom instructions for this recipe:");
+    const msg = instructions
+      ? `Follow this recipe with my adjustments:\n\n${instructions}\n\n---\n\n${r.markdown}`
+      : `Follow this recipe:\n\n${r.markdown}`;
+    inputText.value = msg;
+  } else if (r?.error) {
+    alert(r.error);
+  }
+}
+
+watch(streamBuffer, () => scrollToBottomIfFollowing());
+watch(messages, () => scrollToBottomIfFollowing(), { deep: true });
+
+watch(agentReady, (ready) => {
+  if (ready) nextTick(setupScrollTracking);
+});
+
+onMounted(async () => {
+  const cfg = await window.electronAPI?.getConfig?.();
+  if (cfg) config.value = { ...config.value, ...cfg };
+
+  if (agentReady.value) nextTick(setupScrollTracking);
+
+  streamUnsub = window.electronAPI?.onAgentStreamChunk?.((chunk) => {
+    streamBuffer.value += chunk;
+    scrollToBottomIfFollowing();
+  });
+
+  askUserUnsub = window.electronAPI?.onAskUserPopup?.((info) => {
+    playNotificationSound();
+    askUserInfo.value = info;
+    askUserReply.value = "";
+    startAskUserCountdown();
+  });
+  askUserCloseUnsub = window.electronAPI?.onAskUserPopupClose?.(() => {
+    dismissAskUser();
+  });
+
+  taskStartUnsub = window.electronAPI?.onTaskStart?.((info) => {
+    taskSummary.value = info.summary || "";
+    taskStartTime.value = Date.now();
+    taskFinalized.value = false;
+    taskElapsedSeconds.value = 0;
+    startTaskTimer();
+  });
+
+  finalizeUnsub = window.electronAPI?.onFinalizeTaskPopup?.((info) => {
+    playNotificationSound();
+    taskFinalized.value = true;
+    taskSuccess.value = info.is_successful;
+    stopTaskTimer();
+    if (taskStartTime.value != null) {
+      taskElapsedSeconds.value = Math.floor((Date.now() - taskStartTime.value) / 1000);
+    }
+    showFinalizePopup.value = true;
+    finalizeInfo.value = info;
+    if (info.detailed_report) {
+      pendingReportForNextMessage.value = true;
+      const last = messages.value[messages.value.length - 1];
+      if (last?.role === "assistant" && !last.isReport) last.isReport = true;
+    }
+  });
+
+  agentBrowserErrorUnsub = window.electronAPI?.onAgentBrowserError?.((msg) => {
+    agentBrowserError.value = msg;
+  });
+});
+
+onUnmounted(() => {
+  scrollCleanup?.();
+  streamUnsub?.();
+  askUserUnsub?.();
+  askUserCloseUnsub?.();
+  taskStartUnsub?.();
+  finalizeUnsub?.();
+  agentBrowserErrorUnsub?.();
+  stopAskUserCountdown();
+  stopTaskTimer();
+});
+</script>
+
+<style scoped>
+.app {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+.header {
+  padding: 1rem 1.5rem;
+  border-bottom: 1px solid #333;
+}
+.header h1 {
+  margin: 0;
+  font-size: 1.5rem;
+}
+.header h1 .version {
+  font-size: 0.7em;
+  font-weight: 400;
+  opacity: 0.7;
+}
+.error {
+  color: #f85149;
+  margin: 0.5rem 0 0;
+}
+.main {
+  flex: 1;
+  display: flex;
+  gap: 1rem;
+  padding: 1rem;
+  padding-right: 11rem; /* space for fixed sidebar */
+  overflow: hidden;
+}
+.config {
+  max-width: 400px;
+}
+.config .field {
+  margin-bottom: 1rem;
+}
+.config label {
+  display: block;
+  margin-bottom: 0.25rem;
+  color: #8b949e;
+}
+.config input,
+.config select {
+  width: 100%;
+  padding: 0.5rem;
+  background: #21262d;
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  color: #e6edf3;
+}
+.chat {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.chat-messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: 1rem;
+  background: #0d1117;
+  border-radius: 8px;
+  margin-bottom: 1rem;
+}
+.msg {
+  margin-bottom: 1rem;
+  padding: 0.75rem;
+  border-radius: 6px;
+}
+.msg.user {
+  background: #21262d;
+  margin-left: 2rem;
+}
+.msg.assistant {
+  background: #161b22;
+  margin-right: 2rem;
+}
+.msg-type-label {
+  display: block;
+  font-size: 0.75rem;
+  color: #8b949e;
+  margin-bottom: 0.25rem;
+}
+.msg-markdown :deep(pre) {
+  background: #21262d;
+  padding: 0.5rem;
+  border-radius: 4px;
+  overflow-x: auto;
+  font-size: 0.85rem;
+}
+.msg-markdown :deep(details) {
+  margin-top: 0.25rem;
+}
+.msg-running {
+  color: #58a6ff;
+}
+.msg-error,
+.msg.error .msg-text {
+  color: #f85149;
+}
+.chat-placeholder {
+  color: #8b949e;
+  padding: 1rem;
+}
+.chat-input {
+  display: flex;
+  gap: 0.5rem;
+  align-items: flex-end;
+}
+.chat-input textarea {
+  flex: 1;
+  padding: 0.5rem;
+  background: #21262d;
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  color: #e6edf3;
+  resize: none;
+}
+.sidebar {
+  position: fixed;
+  top: 5rem; /* below header */
+  right: 1rem;
+  z-index: 50;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+.btn {
+  padding: 0.5rem 1rem;
+  border-radius: 6px;
+  border: none;
+  cursor: pointer;
+  font-size: 0.9rem;
+}
+.btn.primary {
+  background: #238636;
+  color: white;
+}
+.btn.primary:hover:not(:disabled) {
+  background: #2ea043;
+}
+.btn.secondary {
+  background: #21262d;
+  color: #e6edf3;
+  border: 1px solid #30363d;
+}
+.btn.secondary:hover {
+  background: #30363d;
+}
+.btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+.ask-user-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.7);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+.ask-user-modal {
+  background: #161b22;
+  border: 1px solid #30363d;
+  border-radius: 8px;
+  padding: 1.5rem;
+  min-width: 400px;
+}
+.ask-user-modal h3 {
+  margin-top: 0;
+}
+.ask-user-modal textarea {
+  width: 100%;
+  padding: 0.5rem;
+  background: #21262d;
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  color: #e6edf3;
+  margin: 1rem 0;
+  resize: vertical;
+}
+.ask-user-actions {
+  display: flex;
+  gap: 0.5rem;
+  justify-content: flex-end;
+}
+.ask-user-assessment,
+.ask-user-clarification {
+  margin: 0.5rem 0;
+}
+.ask-user-countdown {
+  color: #58a6ff;
+  font-size: 0.9rem;
+  margin: 0.5rem 0;
+}
+.report-block {
+  margin-top: 1rem;
+  padding: 0.75rem;
+  background: #21262d;
+  border-radius: 6px;
+  max-height: 300px;
+  overflow-y: auto;
+}
+.report-block .report-content {
+  margin-top: 0.5rem;
+}
+.msg.report {
+  border-left: 4px solid #58a6ff;
+}
+.finalize-modal.finalize-failed {
+  border-color: #6a4a4a;
+  background: #1e1616;
+}
+.finalize-modal.finalize-failed h3 {
+  color: #b86a6a;
+}
+.floating-task {
+  position: fixed;
+  top: 1rem;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.5rem 1rem;
+  background: #1e2a3a;
+  border: 1px solid #3a5a7a;
+  border-radius: 8px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+  z-index: 500;
+  font-size: 0.9rem;
+}
+.floating-task-name {
+  color: #e0e0e0;
+  font-weight: 500;
+}
+.floating-task-timer {
+  color: #6ab7ff;
+  font-variant-numeric: tabular-nums;
+}
+.floating-task.finalized {
+  border-color: #4a6a4a;
+  background: #1e2a1e;
+}
+.floating-task.finalized .floating-task-timer {
+  color: #6ab86a;
+}
+.floating-task.finalized.failed {
+  border-color: #6a4a4a;
+  background: #2a1e1e;
+}
+.floating-task.finalized.failed .floating-task-timer {
+  color: #b86a6a;
+}
+.editor-overlay {
+  z-index: 200;
+}
+.editor-modal {
+  max-width: 640px;
+  max-height: 85vh;
+  overflow: auto;
+  min-width: 420px;
+}
+.editor-error {
+  color: #f85149;
+  font-size: 0.9rem;
+  margin: 0 0 0.75rem;
+}
+.editor-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin-bottom: 1rem;
+}
+.editor-form input {
+  width: 100%;
+  box-sizing: border-box;
+}
+.editor-input {
+  padding: 0.5rem 0.75rem;
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  background: #21262d;
+  color: #e6edf3;
+  font-size: 0.95rem;
+}
+.editor-input:focus {
+  outline: none;
+  border-color: #58a6ff;
+}
+.editor-form-actions {
+  display: flex;
+  gap: 0.5rem;
+}
+.editor-list {
+  max-height: 240px;
+  overflow-y: auto;
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  background: #0d1117;
+  margin-bottom: 1rem;
+}
+.editor-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.5rem 0.75rem;
+  border-bottom: 1px solid #21262d;
+  gap: 0.75rem;
+}
+.editor-row:last-child {
+  border-bottom: none;
+}
+.editor-row-fields {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  font-size: 0.85rem;
+}
+.editor-row-desc {
+  font-weight: 600;
+  color: #58a6ff;
+}
+.editor-row-factor,
+.editor-row-type {
+  color: #8b949e;
+}
+.editor-row-value {
+  word-break: break-all;
+  color: #e6edf3;
+}
+.editor-row-actions {
+  flex-shrink: 0;
+  display: flex;
+  gap: 0.35rem;
+}
+.editor-modal-actions {
+  display: flex;
+  gap: 0.5rem;
+  justify-content: flex-end;
+}
+.btn.small {
+  padding: 0.35rem 0.6rem;
+  font-size: 0.85rem;
+}
+</style>

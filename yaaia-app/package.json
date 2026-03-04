@@ -1,0 +1,40 @@
+{
+  "name": "yaaia",
+  "version": "0.1.0",
+  "description": "Yet Another AI Agent - Browser automation with Chrome DevTools MCP",
+  "main": "dist-electron/main/index.js",
+  "type": "module",
+  "build": {
+    "asar": true
+  },
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build": "electron-vite build",
+    "preview": "electron-vite preview",
+    "pack": "npm run build && mkdir -p dist-electron/resources && cp -f resources/agent-browser-placeholder.html dist-electron/resources/ && electron-builder --mac"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.78.0",
+    "@modelcontextprotocol/sdk": "^1.27.0",
+    "adm-zip": "^0.5.16",
+    "archiver": "^7.0.1",
+    "chrome-devtools-mcp": "^0.18.1",
+    "express": "^4.21.0",
+    "imapflow": "^1.2.11",
+    "marked": "^17.0.2",
+    "vue": "^3.4.0",
+    "ws": "^8.19.0",
+    "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/ws": "^8.18.1",
+    "@vitejs/plugin-vue": "^5.0.0",
+    "electron": "^40.6.0",
+    "electron-builder": "^25.0.0",
+    "electron-vite": "^2.0.0",
+    "typescript": "^5.6.0",
+    "vite": "^5.0.0",
+    "vue-tsc": "^2.0.0"
+  }
+}

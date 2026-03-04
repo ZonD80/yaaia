@@ -1,0 +1,37 @@
+/**
+ * @see https://www.electron.build/configuration/configuration
+ * Note: files are explicit to prevent asar bloat from accidental inclusion.
+ */
+{
+  appId: "ai.yaaia",
+  productName: "YAAIA",
+  directories: {
+    output: "release/${version}",
+  },
+  files: [
+    "dist",
+    "dist-electron",
+    "!dist-electron/resources/**",
+    "!**/*.map",
+    "!**/*.ts",
+    "!**/*.tsbuildinfo",
+    "SYSTEM_PROMPT.md",
+  ],
+  extraResources: [
+    {
+      from: "dist-electron/resources/agent-browser-placeholder.html",
+      to: "agent-browser-placeholder.html",
+    },
+  ],
+  asar: true,
+  asarUnpack: [
+    "**/node_modules/archiver/**",
+    "**/node_modules/archiver-utils/**",
+    "**/node_modules/zip-stream/**",
+  ],
+  mac: {
+    target: [{ target: "dmg", arch: ["arm64", "x64"] }],
+    artifactName: "${productName}-${version}-${arch}.${ext}",
+    category: "public.app-category.developer-tools",
+  },
+}

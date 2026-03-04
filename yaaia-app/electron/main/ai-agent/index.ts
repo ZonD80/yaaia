@@ -1,0 +1,363 @@
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
+import Anthropic from "@anthropic-ai/sdk";
+import { readFileSync } from "node:fs";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const SYSTEM_PROMPT_PATH = join(__dirname, "../../SYSTEM_PROMPT.md");
+
+function loadSystemPrompt(): string {
+  try {
+    return readFileSync(SYSTEM_PROMPT_PATH, "utf-8").trim();
+  } catch (err) {
+    console.error("[YAAIA Agent] Failed to load SYSTEM_PROMPT.md:", err);
+    return "You control a Chrome browser via MCP tools. Always use start_task at the beginning and finalize_task when done.";
+  }
+}
+
+type JsonSchema = { type?: string; properties?: Record<string, unknown>; required?: string[] };
+
+function mcpToolToAnthropic(tool: { name: string; description?: string; inputSchema?: unknown }) {
+  const schema = (tool.inputSchema as JsonSchema) ?? { type: "object", properties: {}, required: [] };
+  const properties = schema.properties ?? {};
+  const propKeys = new Set(Object.keys(properties));
+  const required = (schema.required ?? []).filter((k) => propKeys.has(k));
+  return {
+    name: tool.name,
+    description: tool.description ?? `Tool: ${tool.name}`,
+    input_schema: {
+      type: "object" as const,
+      properties,
+      required,
+    },
+  } as const;
+}
+
+function mcpToolToOpenAI(tool: { name: string; description?: string; inputSchema?: unknown }) {
+  const schema = (tool.inputSchema as JsonSchema) ?? { type: "object", properties: {}, required: [] };
+  return {
+    type: "function" as const,
+    function: {
+      name: tool.name,
+      description: tool.description ?? `Tool: ${tool.name}`,
+      parameters: {
+        type: schema.type ?? "object",
+        properties: schema.properties ?? {},
+        required: schema.required ?? [],
+      },
+    },
+  };
+}
+
+function mcpToolResultToText(result: { content?: { type: string; text?: string }[] }): string {
+  const content = result.content ?? [];
+  const parts: string[] = [];
+  for (const item of content) {
+    if (item.type === "text" && typeof item.text === "string") {
+      parts.push(item.text);
+    }
+  }
+  return parts.join("\n").trim() || "(no output)";
+}
+
+const MSG_START = "<<<MSG>>>";
+const MSG_END = "<<<END>>>";
+
+function emitStructured(emitChunk: (chunk: string) => void, payload: Record<string, unknown>): void {
+  emitChunk(MSG_START + JSON.stringify(payload) + MSG_END);
+}
+
+function emitToolBlockStart(toolName: string, args: Record<string, unknown>, emitChunk: (chunk: string) => void): void {
+  const assessment = typeof args?.assessment === "string" ? args.assessment.trim() : "";
+  const clarification = typeof args?.clarification === "string" ? args.clarification.trim() : "";
+  if (assessment) emitStructured(emitChunk, { type: "assessment", content: assessment });
+  if (clarification) emitStructured(emitChunk, { type: "clarification", content: clarification });
+  emitStructured(emitChunk, { type: "tool_running", name: toolName });
+}
+
+function emitToolBlockResult(
+  toolName: string,
+  args: Record<string, unknown>,
+  resultText: string,
+  emitChunk: (chunk: string) => void
+): void {
+  const escaped = resultText
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+  const accordionHtml = `<details class="tool-result-debug"><summary>${toolName}</summary><pre>${escaped}</pre></details>`;
+  emitStructured(emitChunk, { type: "tool_call", name: toolName, accordion: accordionHtml });
+}
+
+let pendingInjectMessage: string | null = null;
+
+export function setPendingInjectMessage(msg: string | null): void {
+  pendingInjectMessage = msg?.trim() || null;
+}
+
+function getAndClearPendingInjectMessage(): string | null {
+  const m = pendingInjectMessage;
+  pendingInjectMessage = null;
+  return m;
+}
+
+function maybeInjectUserMessage(
+  resultText: string,
+  _toolName: string,
+  emitChunk?: (chunk: string) => void
+): string {
+  const injected = getAndClearPendingInjectMessage();
+  if (injected) {
+    const suffix = `\n\n[User message during reply]: ${injected}`;
+    if (emitChunk) emitStructured(emitChunk, { type: "user_injected", content: injected });
+    return resultText + suffix;
+  }
+  return resultText;
+}
+
+export type AiProvider = "claude" | "openrouter";
+
+export interface AgentConfig {
+  mcpPort: number;
+  aiProvider: AiProvider;
+  claudeApiKey: string;
+  claudeModel: string;
+  openrouterApiKey: string;
+  openrouterModel: string;
+}
+
+let mcpClient: Client | null = null;
+let mcpTransport: SSEClientTransport | null = null;
+let agentConfig: AgentConfig | null = null;
+
+let agentAbortRequested = false;
+
+export function requestAgentAbort(): void {
+  agentAbortRequested = true;
+}
+
+export async function startAgent(config: AgentConfig): Promise<void> {
+  if (config.aiProvider === "claude" && !config.claudeApiKey?.trim()) {
+    throw new Error("Claude API key is required");
+  }
+  if (config.aiProvider === "openrouter" && !config.openrouterApiKey?.trim()) {
+    throw new Error("OpenRouter API key is required");
+  }
+
+  agentConfig = config;
+  if (config.aiProvider === "claude") {
+    (globalThis as { __yaaiaClaudeApiKey?: string }).__yaaiaClaudeApiKey = config.claudeApiKey;
+  }
+
+  const sseUrl = new URL(`http://localhost:${config.mcpPort}/sse`);
+  mcpTransport = new SSEClientTransport(sseUrl);
+  mcpClient = new Client({ name: "yaaia-agent", version: "1.0.0" });
+  await mcpClient.connect(mcpTransport);
+
+  console.log("[YAAIA Agent] Connected to MCP server");
+}
+
+export function stopAgent(): void {
+  if (mcpTransport) {
+    mcpTransport.close();
+    mcpTransport = null;
+  }
+  mcpClient = null;
+  agentConfig = null;
+}
+
+export type StreamChunkCallback = (chunk: string) => void;
+export type HistoryMessage = { role: "user" | "assistant"; content: string };
+
+const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
+
+type OpenAIMessage =
+  | { role: "user" | "assistant" | "system"; content: string }
+  | { role: "assistant"; content: null; tool_calls: { id: string; type: "function"; function: { name: string; arguments: string } }[] }
+  | { role: "tool"; content: string; tool_call_id: string };
+
+async function runOpenRouterSendMessage(
+  mcpTools: { name: string; description?: string; inputSchema?: unknown }[],
+  userMessage: string,
+  onChunk?: StreamChunkCallback,
+  history: HistoryMessage[] = []
+): Promise<{ text: string }> {
+  const apiKey = agentConfig!.openrouterApiKey.trim();
+  const openAITools = mcpTools.map(mcpToolToOpenAI);
+  const messages: OpenAIMessage[] = [
+    ...history.map((h) => ({ role: h.role, content: h.content } as OpenAIMessage)),
+    { role: "user" as const, content: userMessage },
+  ];
+  const emitChunk = (chunk: string) => {
+    if (chunk && onChunk) onChunk(chunk);
+  };
+  let finalizeTaskCalled = false;
+  let hasExecutedActionTool = false;
+
+  while (true) {
+    if (agentAbortRequested) return { text: "Stopped by user." };
+
+    const res = await fetch(OPENROUTER_URL, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: agentConfig!.openrouterModel || "google/gemini-2.5-flash",
+        messages: [{ role: "system", content: loadSystemPrompt() }, ...messages],
+        tools: openAITools,
+        tool_choice: "auto",
+        max_tokens: 8192,
+        stream: false,
+      }),
+    });
+
+    if (!res.ok) {
+      const errText = await res.text();
+      throw new Error(errText || `OpenRouter API error ${res.status}`);
+    }
+
+    const data = await res.json();
+    const choice = data.choices?.[0]?.message;
+    if (!choice) throw new Error("OpenRouter returned no choices");
+
+    if (!choice.tool_calls?.length) {
+      const text = typeof choice.content === "string" ? choice.content : "";
+      const injected = getAndClearPendingInjectMessage();
+      if (injected) {
+        messages.push({ role: "assistant" as const, content: text });
+        messages.push({ role: "user" as const, content: "[User message during reply]: " + injected });
+        if (onChunk) emitStructured(emitChunk, { type: "user_injected", content: injected });
+        continue;
+      }
+      const missingFinalize = hasExecutedActionTool && !finalizeTaskCalled;
+      if (missingFinalize) {
+        messages.push({ role: "user" as const, content: "[System: You must call finalize_task to complete the task. Call it now.]" });
+        continue;
+      }
+      return { text: text.trim() || "Done." };
+    }
+
+    emitStructured(emitChunk, { type: "content_end" });
+    const toolResults: OpenAIMessage[] = [];
+    for (const tc of choice.tool_calls) {
+      if (tc.function.name === "finalize_task") finalizeTaskCalled = true;
+      else hasExecutedActionTool = true;
+      const args = JSON.parse(tc.function.arguments || "{}") as Record<string, unknown>;
+      console.log("[YAAIA Agent] Tool call:", tc.function.name, JSON.stringify(args));
+      emitToolBlockStart(tc.function.name, args, emitChunk);
+      let resultText: string;
+      try {
+        const callResult = await mcpClient!.callTool({ name: tc.function.name, arguments: args });
+        resultText = mcpToolResultToText(callResult);
+      } catch (err) {
+        resultText = err instanceof Error ? err.message : String(err);
+      }
+      resultText = maybeInjectUserMessage(resultText, tc.function.name, onChunk ? emitChunk : undefined);
+      emitToolBlockResult(tc.function.name, args, resultText, emitChunk);
+      toolResults.push({ role: "tool", content: resultText, tool_call_id: tc.id });
+    }
+    messages.push({ role: "assistant", content: null, tool_calls: choice.tool_calls });
+    messages.push(...toolResults);
+  }
+}
+
+export async function sendMessage(
+  userMessage: string,
+  onChunk?: StreamChunkCallback,
+  history: HistoryMessage[] = []
+): Promise<{ text: string }> {
+  if (!mcpClient || !mcpTransport || !agentConfig) {
+    throw new Error("Agent not started. Add API key and click Start chat.");
+  }
+
+  agentAbortRequested = false;
+  const { tools: mcpTools } = await mcpClient.listTools();
+
+  if (agentConfig.aiProvider === "openrouter") {
+    return runOpenRouterSendMessage(mcpTools, userMessage, onChunk, history);
+  }
+
+  const anthropicTools = mcpTools.map(mcpToolToAnthropic);
+  const apiKey = (globalThis as { __yaaiaClaudeApiKey?: string }).__yaaiaClaudeApiKey;
+  if (!apiKey) throw new Error("Claude API key not set.");
+
+  const client = new Anthropic({ apiKey });
+  const messages: Anthropic.MessageParam[] = [
+    ...history.map((h) => ({ role: h.role, content: h.content } as Anthropic.MessageParam)),
+    { role: "user", content: userMessage },
+  ];
+  const emitChunk = (chunk: string) => {
+    if (chunk && onChunk) onChunk(chunk);
+  };
+  let finalizeTaskCalled = false;
+  let hasExecutedActionTool = false;
+
+  while (true) {
+    if (agentAbortRequested) return { text: "Stopped by user." };
+
+    const response = await client.messages.create(
+      {
+        model: agentConfig.claudeModel || "claude-sonnet-4-6",
+        max_tokens: 16384,
+        system: loadSystemPrompt(),
+        messages,
+        tools: anthropicTools,
+        tool_choice: { type: "auto" },
+      },
+      { headers: { "anthropic-beta": "context-1m-2025-08-07" } }
+    );
+
+    const toolUseBlocks = response.content.filter((b) => (b as { type?: string }).type === "tool_use") as {
+      type: "tool_use";
+      id: string;
+      name: string;
+      input: unknown;
+    }[];
+
+    if (toolUseBlocks.length === 0) {
+      const textBlock = response.content.find((b) => (b as { type?: string }).type === "text") as { text?: string } | undefined;
+      const text = textBlock?.text ?? "";
+      const injected = getAndClearPendingInjectMessage();
+      if (injected) {
+        messages.push({ role: "assistant", content: response.content });
+        messages.push({ role: "user", content: "[User message during reply]: " + injected });
+        if (onChunk) emitStructured(emitChunk, { type: "user_injected", content: injected });
+        continue;
+      }
+      const missingFinalize = hasExecutedActionTool && !finalizeTaskCalled;
+      if (missingFinalize) {
+        messages.push({ role: "user", content: "[System: You must call finalize_task to complete the task. Call it now.]" });
+        continue;
+      }
+      return { text: text.trim() || "Done." };
+    }
+
+    emitStructured(emitChunk, { type: "content_end" });
+    const toolResults: Anthropic.ToolResultBlockParam[] = [];
+    for (const toolUse of toolUseBlocks) {
+      if (toolUse.name === "finalize_task") finalizeTaskCalled = true;
+      else hasExecutedActionTool = true;
+      const args = (toolUse.input as Record<string, unknown>) ?? {};
+      console.log("[YAAIA Agent] Tool call:", toolUse.name, JSON.stringify(args));
+      emitToolBlockStart(toolUse.name, args, emitChunk);
+      let resultText: string;
+      try {
+        const callResult = await mcpClient!.callTool({ name: toolUse.name, arguments: args });
+        resultText = mcpToolResultToText(callResult);
+      } catch (err) {
+        resultText = err instanceof Error ? err.message : String(err);
+      }
+      resultText = maybeInjectUserMessage(resultText, toolUse.name, emitChunk);
+      emitToolBlockResult(toolUse.name, args, resultText, emitChunk);
+      toolResults.push({ type: "tool_result", tool_use_id: toolUse.id, content: resultText });
+    }
+    messages.push({ role: "assistant", content: response.content });
+    messages.push({ role: "user", content: toolResults });
+  }
+}

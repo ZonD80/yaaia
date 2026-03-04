@@ -1,0 +1,77 @@
+import { contextBridge, ipcRenderer } from "electron";
+
+export type AiProvider = "claude" | "openrouter";
+
+export interface McpConfig {
+  aiProvider: AiProvider;
+  claudeApiKey: string;
+  claudeModel: string;
+  openrouterApiKey: string;
+  openrouterModel: string;
+}
+
+try {
+  contextBridge.exposeInMainWorld("electronAPI", {
+    getConfig: () => ipcRenderer.invoke("get-config"),
+    startChat: (config: McpConfig) => ipcRenderer.invoke("start-chat", config),
+    stopChat: () => ipcRenderer.invoke("stop-chat"),
+    agentSendMessage: (message: string, history?: { role: "user" | "assistant"; content: string }[]) =>
+      ipcRenderer.invoke("agent-send-message", message, history ?? []),
+    agentAbort: () => ipcRenderer.invoke("agent-abort"),
+    askUserReply: (reply: string) => ipcRenderer.invoke("ask-user-reply", reply),
+    askUserCancel: () => ipcRenderer.invoke("ask-user-cancel"),
+    recipeView: () => ipcRenderer.invoke("recipe-view"),
+    recipeSave: () => ipcRenderer.invoke("recipe-save"),
+    recipeLoad: () => ipcRenderer.invoke("recipe-load"),
+    agentInjectMessage: (message: string, placeAfterAskUser?: boolean) =>
+      ipcRenderer.invoke("agent-inject-message", message, placeAfterAskUser),
+    secretsListFull: () => ipcRenderer.invoke("secrets-list-full"),
+    secretsSet: (args: {
+      detailed_description: string;
+      first_factor: string;
+      first_factor_type: string;
+      value: string;
+      force?: boolean;
+    }) => ipcRenderer.invoke("secrets-set", args),
+    secretsDelete: (id: string) => ipcRenderer.invoke("secrets-delete", id),
+    wipeSecrets: () => ipcRenderer.invoke("wipe-secrets"),
+    agentConfigList: () => ipcRenderer.invoke("agent-config-list"),
+    agentConfigSet: (args: { detailed_description: string; value: string; force?: boolean }) =>
+      ipcRenderer.invoke("agent-config-set", args),
+    agentConfigDelete: (id: string) => ipcRenderer.invoke("agent-config-delete", id),
+    wipeConfigs: () => ipcRenderer.invoke("wipe-configs"),
+    openExternal: (url: string) => ipcRenderer.invoke("open-external", url),
+    onAgentStreamChunk: (callback: (chunk: string) => void) => {
+      const fn = (_: unknown, chunk: string) => callback(chunk);
+      ipcRenderer.on("agent-stream-chunk", fn);
+      return () => ipcRenderer.removeListener("agent-stream-chunk", fn);
+    },
+    onAskUserPopup: (callback: (info: { clarification: string; assessment: string; attempt: number }) => void) => {
+      const fn = (_: unknown, info: { clarification: string; assessment: string; attempt: number }) => callback(info);
+      ipcRenderer.on("ask-user-popup", fn);
+      return () => ipcRenderer.removeListener("ask-user-popup", fn);
+    },
+    onAskUserPopupClose: (callback: () => void) => {
+      const fn = () => callback();
+      ipcRenderer.on("ask-user-popup-close", fn);
+      return () => ipcRenderer.removeListener("ask-user-popup-close", fn);
+    },
+    onTaskStart: (callback: (info: { summary: string }) => void) => {
+      const fn = (_: unknown, info: { summary: string }) => callback(info);
+      ipcRenderer.on("task-start", fn);
+      return () => ipcRenderer.removeListener("task-start", fn);
+    },
+    onFinalizeTaskPopup: (callback: (info: { assessment: string; clarification: string; is_successful: boolean; detailed_report: string }) => void) => {
+      const fn = (_: unknown, info: { assessment: string; clarification: string; is_successful: boolean }) => callback(info);
+      ipcRenderer.on("finalize-task-popup", fn);
+      return () => ipcRenderer.removeListener("finalize-task-popup", fn);
+    },
+    onAgentBrowserError: (callback: (message: string) => void) => {
+      const fn = (_: unknown, message: string) => callback(message);
+      ipcRenderer.on("agent-browser-error", fn);
+      return () => ipcRenderer.removeListener("agent-browser-error", fn);
+    },
+  });
+} catch (err) {
+  console.error("[YAAIA preload] Failed to expose electronAPI:", err);
+}
