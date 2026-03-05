@@ -29,6 +29,20 @@ import {
 } from "../agent-config-store.js";
 import * as recipeStore from "../recipe-store.js";
 import {
+  connectKbMcp,
+  disconnectKbMcp,
+  listKbTools,
+  callKbTool,
+  runQmdCli,
+  kbWrite,
+  kbDelete,
+  kbList,
+  kbCollectionAdd,
+  kbCollectionList,
+  kbCollectionRemove,
+  type KbTool,
+} from "./kb-client.js";
+import {
   mailConnect,
   mailDisconnect,
   mailList,
@@ -129,11 +143,14 @@ function applyDefaultsNoFocusSteal(
   return out;
 }
 
-function contentToText(content: { type: string; text?: string }[]): string {
+function contentToText(content: { type: string; text?: string; resource?: { text?: string } }[]): string {
   const parts: string[] = [];
   for (const item of content ?? []) {
     if (item.type === "text" && typeof item.text === "string") {
       parts.push(item.text);
+    } else if (item.type === "resource" && item.resource && typeof item.resource.text === "string") {
+      // qmd get/multi_get return document body in resource.text
+      parts.push(item.resource.text);
     }
   }
   return parts.join("\n").trim() || "(no output)";
@@ -198,9 +215,35 @@ function buildChromeToolInputSchema(
   return z.object(shape);
 }
 
+function buildKbToolInputSchema(
+  baseSchema: KbTool["inputSchema"],
+  required: string[]
+): z.ZodObject<Record<string, z.ZodTypeAny>> {
+  const props = baseSchema?.properties ?? {};
+  const baseRequired = new Set(baseSchema?.required ?? []);
+  const shape: Record<string, z.ZodTypeAny> = {
+    assessment: ASSESSMENT_PARAM,
+    clarification: CLARIFICATION_PARAM,
+  };
+  for (const [key, prop] of Object.entries(props)) {
+    if (key === "assessment" || key === "clarification") continue;
+    const p = prop as JsonSchemaProp;
+    shape[key] = jsonSchemaPropToZod(p ?? {}, baseRequired.has(key));
+  }
+  return z.object(shape);
+}
+
 async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
+  config.onStartupProgress?.("Connecting Chrome MCP...");
   await connectChromeMcp(BROWSER_URL);
+  config.onStartupProgress?.("Chrome ready");
+
+  config.onStartupProgress?.("Connecting Knowledge Base...");
+  await connectKbMcp((line) => config.onStartupProgress?.(line));
+  config.onStartupProgress?.("KB ready");
+
   const chromeTools = await listChromeTools();
+  const kbTools = await listKbTools();
 
   const server = new McpServer(
     { name: "yaaia", version: "1.0.0" },
@@ -253,6 +296,302 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
       }
     );
   }
+
+  for (const tool of kbTools) {
+    const qmdName = tool.name;
+    const name = `kb__qmd_${qmdName.replace(/^qmd_/, "")}`;
+    const baseSchema = tool.inputSchema ?? { type: "object", properties: {}, required: [] };
+    const required = [...(baseSchema.required ?? [])];
+    if (!required.includes("assessment")) required.push("assessment");
+    if (!required.includes("clarification")) required.push("clarification");
+
+    server.registerTool(
+      name,
+      {
+        description: (tool.description ?? `KB/QMD: ${qmdName}`) + " Always provide assessment and clarification.",
+        inputSchema: buildKbToolInputSchema(baseSchema, required),
+      },
+      async (args) => {
+        const a = args as Record<string, unknown>;
+        logToolCall(name, args);
+        logClarification(name, args);
+        logAssessment(name, args);
+        let forwardArgs = stripAssessmentClarification(a);
+        if (qmdName === "get" && typeof forwardArgs.file === "string") {
+          const f = forwardArgs.file.trim();
+          if (f && !f.startsWith("qmd://") && !f.startsWith("#")) {
+            // Pass path as-is: QMD stores actual filesystem paths (e.g. fred_smith.md), not handelized
+            forwardArgs = { ...forwardArgs, file: `qmd://${f.replace(/^\/+/, "")}` };
+          }
+        }
+        try {
+          const result = await callKbTool(qmdName, forwardArgs);
+          const text = contentToText(result.content);
+          recipeStore.appendToolCall(name, args, text);
+          return toolResult(text);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          recipeStore.appendToolCall(name, args, msg);
+          return toolResult(`Error: ${msg}`);
+        }
+      }
+    );
+  }
+
+  const KB_BASE = new Set(["assessment", "clarification"]);
+
+  server.registerTool(
+    "kb__write",
+    {
+      description: "Create or overwrite a .md or .qmd file in the knowledge base. Path relative to ~/yaaia/kb. Auto-runs qmd update after write.",
+      inputSchema: z.object({
+        path: z.string().describe("Relative path e.g. notes/idea.md"),
+        content: z.string().describe("File content"),
+        assessment: ASSESSMENT_PARAM,
+        clarification: CLARIFICATION_PARAM,
+      }),
+    },
+    async (args) => {
+      logToolCall("kb__write", args);
+      const allowed = new Set([...KB_BASE, "path", "content"]);
+      const unknownMsg = validateUnknownParams("kb__write", args, allowed);
+      if (unknownMsg) {
+        recipeStore.appendToolCall("kb__write", args, unknownMsg);
+        return toolResult(unknownMsg);
+      }
+      const { path: p, content } = args as { path: string; content: string };
+      logClarification("kb__write", args);
+      logAssessment("kb__write", args);
+      try {
+        kbWrite(p, content);
+        await runQmdCli(["update"]);
+        await runQmdCli(["embed"]);
+        recipeStore.appendToolCall("kb__write", args, "Written.");
+        return toolResult(`Written ${p}. Index updated.`);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        recipeStore.appendToolCall("kb__write", args, msg);
+        return toolResult(`Error: ${msg}`);
+      }
+    }
+  );
+
+  server.registerTool(
+    "kb__delete",
+    {
+      description: "Delete a .md or .qmd file from the knowledge base. Path relative to ~/yaaia/kb. Auto-runs qmd update after delete.",
+      inputSchema: z.object({
+        path: z.string().describe("Relative path e.g. notes/idea.md"),
+        assessment: ASSESSMENT_PARAM,
+        clarification: CLARIFICATION_PARAM,
+      }),
+    },
+    async (args) => {
+      logToolCall("kb__delete", args);
+      const allowed = new Set([...KB_BASE, "path"]);
+      const unknownMsg = validateUnknownParams("kb__delete", args, allowed);
+      if (unknownMsg) {
+        recipeStore.appendToolCall("kb__delete", args, unknownMsg);
+        return toolResult(unknownMsg);
+      }
+      const { path: p } = args as { path: string };
+      logClarification("kb__delete", args);
+      logAssessment("kb__delete", args);
+      try {
+        kbDelete(p);
+        await runQmdCli(["update"]);
+        await runQmdCli(["embed"]);
+        recipeStore.appendToolCall("kb__delete", args, "Deleted.");
+        return toolResult(`Deleted ${p}. Index updated.`);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        recipeStore.appendToolCall("kb__delete", args, msg);
+        return toolResult(`Error: ${msg}`);
+      }
+    }
+  );
+
+  server.registerTool(
+    "kb__list",
+    {
+      description: "List files and folders in the knowledge base recursively. Path relative to ~/yaaia/kb.",
+      inputSchema: z.object({
+        path: z.string().optional().default("").describe("Relative path, empty for root"),
+        assessment: ASSESSMENT_PARAM,
+        clarification: CLARIFICATION_PARAM,
+      }),
+    },
+    async (args) => {
+      logToolCall("kb__list", args);
+      const allowed = new Set([...KB_BASE, "path"]);
+      const unknownMsg = validateUnknownParams("kb__list", args, allowed);
+      if (unknownMsg) {
+        recipeStore.appendToolCall("kb__list", args, unknownMsg);
+        return toolResult(unknownMsg);
+      }
+      const { path: p = "" } = args as { path?: string };
+      logClarification("kb__list", args);
+      logAssessment("kb__list", args);
+      try {
+        const list = kbList(p, true);
+        const text = list.length ? list.join("\n") : "(empty)";
+        recipeStore.appendToolCall("kb__list", args, text);
+        return toolResult(text);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        recipeStore.appendToolCall("kb__list", args, msg);
+        return toolResult(`Error: ${msg}`);
+      }
+    }
+  );
+
+  server.registerTool(
+    "kb__qmd_collection_add",
+    {
+      description: "Add a collection to the KB index. Creates folder if needed. subpath is relative to ~/yaaia/kb.",
+      inputSchema: z.object({
+        name: z.string().describe("Collection name"),
+        subpath: z.string().optional().describe("Path under ~/yaaia/kb (default: name)"),
+        assessment: ASSESSMENT_PARAM,
+        clarification: CLARIFICATION_PARAM,
+      }),
+    },
+    async (args) => {
+      logToolCall("kb__qmd_collection_add", args);
+      const allowed = new Set([...KB_BASE, "name", "subpath"]);
+      const unknownMsg = validateUnknownParams("kb__qmd_collection_add", args, allowed);
+      if (unknownMsg) {
+        recipeStore.appendToolCall("kb__qmd_collection_add", args, unknownMsg);
+        return toolResult(unknownMsg);
+      }
+      const { name, subpath } = args as { name: string; subpath?: string };
+      logClarification("kb__qmd_collection_add", args);
+      logAssessment("kb__qmd_collection_add", args);
+      try {
+        const result = await kbCollectionAdd(name, subpath);
+        recipeStore.appendToolCall("kb__qmd_collection_add", args, result);
+        return toolResult(result);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        recipeStore.appendToolCall("kb__qmd_collection_add", args, msg);
+        return toolResult(`Error: ${msg}`);
+      }
+    }
+  );
+
+  server.registerTool(
+    "kb__qmd_collection_list",
+    {
+      description: "List all KB collections.",
+      inputSchema: z.object({ assessment: ASSESSMENT_PARAM, clarification: CLARIFICATION_PARAM }),
+    },
+    async (args) => {
+      logToolCall("kb__qmd_collection_list", args);
+      const unknownMsg = validateUnknownParams("kb__qmd_collection_list", args, KB_BASE);
+      if (unknownMsg) {
+        recipeStore.appendToolCall("kb__qmd_collection_list", args, unknownMsg);
+        return toolResult(unknownMsg);
+      }
+      logClarification("kb__qmd_collection_list", args);
+      logAssessment("kb__qmd_collection_list", args);
+      try {
+        const result = await kbCollectionList();
+        recipeStore.appendToolCall("kb__qmd_collection_list", args, result);
+        return toolResult(result);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        recipeStore.appendToolCall("kb__qmd_collection_list", args, msg);
+        return toolResult(`Error: ${msg}`);
+      }
+    }
+  );
+
+  server.registerTool(
+    "kb__qmd_collection_remove",
+    {
+      description: "Remove a collection from the KB index.",
+      inputSchema: z.object({
+        name: z.string().describe("Collection name"),
+        assessment: ASSESSMENT_PARAM,
+        clarification: CLARIFICATION_PARAM,
+      }),
+    },
+    async (args) => {
+      logToolCall("kb__qmd_collection_remove", args);
+      const allowed = new Set([...KB_BASE, "name"]);
+      const unknownMsg = validateUnknownParams("kb__qmd_collection_remove", args, allowed);
+      if (unknownMsg) {
+        recipeStore.appendToolCall("kb__qmd_collection_remove", args, unknownMsg);
+        return toolResult(unknownMsg);
+      }
+      const { name } = args as { name: string };
+      logClarification("kb__qmd_collection_remove", args);
+      logAssessment("kb__qmd_collection_remove", args);
+      try {
+        const result = await kbCollectionRemove(name);
+        recipeStore.appendToolCall("kb__qmd_collection_remove", args, result);
+        return toolResult(result);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        recipeStore.appendToolCall("kb__qmd_collection_remove", args, msg);
+        return toolResult(`Error: ${msg}`);
+      }
+    }
+  );
+
+  server.registerTool(
+    "kb__qmd_update",
+    {
+      description: "Run qmd update to re-index the knowledge base.",
+      inputSchema: z.object({ assessment: ASSESSMENT_PARAM, clarification: CLARIFICATION_PARAM }),
+    },
+    async (args) => {
+      logToolCall("kb__qmd_update", args);
+      const unknownMsg = validateUnknownParams("kb__qmd_update", args, KB_BASE);
+      if (unknownMsg) {
+        recipeStore.appendToolCall("kb__qmd_update", args, unknownMsg);
+        return toolResult(unknownMsg);
+      }
+      logClarification("kb__qmd_update", args);
+      logAssessment("kb__qmd_update", args);
+      try {
+        await runQmdCli(["update"]);
+        recipeStore.appendToolCall("kb__qmd_update", args, "Updated.");
+        return toolResult("Index updated.");
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        recipeStore.appendToolCall("kb__qmd_update", args, msg);
+        return toolResult(`Error: ${msg}`);
+      }
+    }
+  );
+
+  server.registerTool(
+    "kb__qmd_embed",
+    {
+      description: "Run qmd embed to update vector embeddings.",
+      inputSchema: z.object({ assessment: ASSESSMENT_PARAM, clarification: CLARIFICATION_PARAM }),
+    },
+    async (args) => {
+      logToolCall("kb__qmd_embed", args);
+      const unknownMsg = validateUnknownParams("kb__qmd_embed", args, KB_BASE);
+      if (unknownMsg) {
+        recipeStore.appendToolCall("kb__qmd_embed", args, unknownMsg);
+        return toolResult(unknownMsg);
+      }
+      logClarification("kb__qmd_embed", args);
+      logAssessment("kb__qmd_embed", args);
+      try {
+        await runQmdCli(["embed"]);
+        recipeStore.appendToolCall("kb__qmd_embed", args, "Embedded.");
+        return toolResult("Embeddings updated.");
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        recipeStore.appendToolCall("kb__qmd_embed", args, msg);
+        return toolResult(`Error: ${msg}`);
+      }
+    }
+  );
 
   server.registerTool(
     "start_task",
@@ -1566,6 +1905,10 @@ export function getMcpServerPort(server: Server): number {
 
 export async function stopChromeMcp(): Promise<void> {
   await disconnectChromeMcp();
+}
+
+export async function stopKbMcp(): Promise<void> {
+  await disconnectKbMcp();
 }
 
 export async function stopMailClient(): Promise<void> {

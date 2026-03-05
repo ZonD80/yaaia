@@ -40,6 +40,10 @@ try {
       ipcRenderer.invoke("agent-config-set", args),
     agentConfigDelete: (id: string) => ipcRenderer.invoke("agent-config-delete", id),
     wipeConfigs: () => ipcRenderer.invoke("wipe-configs"),
+    kbList: (path?: string, recursive?: boolean) => ipcRenderer.invoke("kb-list", path ?? ".", recursive ?? true),
+    kbRead: (path: string) => ipcRenderer.invoke("kb-read", path),
+    kbWrite: (path: string, content: string) => ipcRenderer.invoke("kb-write", path, content),
+    kbDelete: (path: string) => ipcRenderer.invoke("kb-delete", path),
     openExternal: (url: string) => ipcRenderer.invoke("open-external", url),
     onAgentStreamChunk: (callback: (chunk: string) => void) => {
       const fn = (_: unknown, chunk: string) => callback(chunk);
@@ -70,6 +74,16 @@ try {
       const fn = (_: unknown, message: string) => callback(message);
       ipcRenderer.on("agent-browser-error", fn);
       return () => ipcRenderer.removeListener("agent-browser-error", fn);
+    },
+    onStartupProgress: (callback: (step: string) => void) => {
+      const fn = (_: unknown, step: string) => callback(step);
+      ipcRenderer.on("startup-progress", fn);
+      return () => ipcRenderer.removeListener("startup-progress", fn);
+    },
+    onStartupProgressReset: (callback: () => void) => {
+      const fn = () => callback();
+      ipcRenderer.on("startup-progress-reset", fn);
+      return () => ipcRenderer.removeListener("startup-progress-reset", fn);
     },
   });
 } catch (err) {

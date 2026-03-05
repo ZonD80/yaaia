@@ -258,11 +258,11 @@ ${paramsMd}${imgMd}${clickMd}${visionMd}${resultMd}`;
 
   const finalAssessmentMd =
     r.finalizedAt != null && r.finalAssessment
-      ? `\n## Final assessment\n\n${mdBlock(r.finalAssessment)}\n`
+      ? `\n## Final assessment\n\n${r.finalAssessment}\n`
       : "";
   const detailedReportMd =
     r.detailedReport
-      ? `\n## Detailed report\n\n${mdBlock(r.detailedReport)}\n`
+      ? `\n## Detailed report\n\n${r.detailedReport}\n`
       : "";
 
   return `# Recipe: ${r.taskSummary}
@@ -419,10 +419,15 @@ export function generateRecipeIndexHtml(md: string): string {
     h2 { font-size: 1.2rem; margin-top: 1.5rem; }
     h3 { font-size: 1rem; color: #58a6ff; margin-top: 1rem; }
     .meta { color: #8b949e; font-size: 0.9rem; margin-bottom: 1.5rem; }
-    pre { background: #21262d; padding: 0.5rem; border-radius: 4px; font-size: 0.85rem; overflow-x: auto; white-space: pre-wrap; word-break: break-word; }
-    blockquote { background: #21262d; border-left: 4px solid #58a6ff; padding: 0.75rem 1rem; margin: 1rem 0; border-radius: 4px; }
-    .screenshot img, #content img { max-width: 100%; height: auto; object-fit: contain; }
     #content { overflow: hidden; }
+    #content pre { background: #21262d; padding: 0.5rem; border-radius: 4px; font-size: 0.85rem; overflow-x: auto; white-space: pre-wrap; word-break: break-word; }
+    #content code { background: #21262d; padding: 0.15em 0.4em; border-radius: 4px; font-size: 0.9em; }
+    #content pre code { padding: 0; background: none; }
+    #content blockquote { background: #21262d; border-left: 4px solid #58a6ff; padding: 0.75rem 1rem; margin: 1rem 0; border-radius: 4px; }
+    #content details { margin-top: 0.25rem; }
+    #content a { color: #58a6ff; }
+    #content ul, #content ol { margin: 0.5rem 0; padding-left: 1.5rem; }
+    .screenshot img, #content img { max-width: 100%; height: auto; object-fit: contain; }
   </style>
 </head>
 <body>

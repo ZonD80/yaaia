@@ -28,6 +28,10 @@ interface ElectronAPI {
   agentConfigSet: (args: unknown) => Promise<string>;
   agentConfigDelete: (id: string) => Promise<void>;
   wipeConfigs: () => Promise<void>;
+  kbList: (path?: string, recursive?: boolean) => Promise<string[]>;
+  kbRead: (path: string) => Promise<string>;
+  kbWrite: (path: string, content: string) => Promise<void>;
+  kbDelete: (path: string) => Promise<void>;
   openExternal: (url: string) => Promise<void>;
   onAgentStreamChunk: (callback: (chunk: string) => void) => () => void;
   onAskUserPopup: (callback: (info: { clarification: string; assessment: string; attempt: number }) => void) => () => void;
@@ -35,6 +39,8 @@ interface ElectronAPI {
   onTaskStart: (callback: (info: { summary: string }) => void) => () => void;
   onFinalizeTaskPopup: (callback: (info: { assessment: string; clarification: string; is_successful: boolean; detailed_report: string }) => void) => () => void;
   onAgentBrowserError: (callback: (message: string) => void) => () => void;
+  onStartupProgress: (callback: (step: string) => void) => () => void;
+  onStartupProgressReset: (callback: () => void) => () => void;
 }
 
 declare global {

@@ -36,6 +36,21 @@ export async function mailConnect(params: MailConnectParams): Promise<void> {
     port,
     secure,
     auth: { user, pass },
+    socketTimeout: 10 * 60 * 1000, // 10 min (default 5 min can trigger on slow ops)
+  });
+  // Prevent uncaught exceptions from socket timeout / connection errors
+  client.on("error", (err: Error) => {
+    console.error("[YAAIA Mail] IMAP error:", err.message);
+    if (client) {
+      try {
+        client.close();
+      } catch {
+        /* ignore */
+      }
+      client = null;
+      currentLock = null;
+      lastOpenedMailbox = null;
+    }
   });
   await client.connect();
   lastOpenedMailbox = null;

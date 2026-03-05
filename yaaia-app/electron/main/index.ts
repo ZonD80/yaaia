@@ -9,7 +9,7 @@ import { readFile, writeFile } from "node:fs/promises";
 import { spawn, execSync } from "node:child_process";
 import { platform } from "node:os";
 import type { Server } from "node:http";
-import { startMcpServer, getMcpServerPort, stopChromeMcp, stopMailClient } from "./mcp-server/index.js";
+import { startMcpServer, getMcpServerPort, stopChromeMcp, stopKbMcp, stopMailClient } from "./mcp-server/index.js";
 import { startAgent, stopAgent, sendMessage, requestAgentAbort, setPendingInjectMessage } from "./ai-agent/index.js";
 import { deliverUserReply } from "./ask-user-bridge.js";
 import {
@@ -27,6 +27,7 @@ import {
   validateDetailedDescription as validateConfigDesc,
 } from "./agent-config-store.js";
 import * as recipeStore from "./recipe-store.js";
+import { kbList, kbRead, kbWrite, kbDelete, runQmdCli } from "./mcp-server/kb-client.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -366,12 +367,14 @@ app.setPath("userData", APP_DATA_DIR);
 app.whenReady().then(async () => {
   createMainWindow();
 
+  mainWindow?.webContents?.send("startup-progress", "Starting agent browser...");
   await ensureNoRestoreTabs();
   await new Promise((r) => setTimeout(r, 200));
   spawnAgentBrowser();
 
   try {
     await pollCdpUntilReady();
+    mainWindow?.webContents?.send("startup-progress", "Agent browser ready");
     await new Promise((r) => setTimeout(r, 1500));
     await grantClipboardPermission();
     console.log("[YAAIA] Agent browser ready");
@@ -390,6 +393,7 @@ app.on("before-quit", async (event) => {
 
   stopMcpServer();
   await stopChromeMcp();
+  await stopKbMcp();
   await stopMailClient();
   if (agentBrowserProcess) {
     try {
@@ -430,6 +434,8 @@ ipcMain.handle("start-chat", async (_event, config: McpConfig) => {
     }
 
     recipeStore.clearPendingFinalize();
+    mainWindow?.webContents?.send("startup-progress-reset");
+    mainWindow?.webContents?.send("startup-progress", "Starting MCP server...");
     mcpHttpServer = await startMcpServer({
       onAskUserRequest: (info) => {
         mainWindow?.show();
@@ -443,9 +449,11 @@ ipcMain.handle("start-chat", async (_event, config: McpConfig) => {
         mainWindow?.webContents?.send("task-start", info);
       },
       onRefocusMainWindow: refocusMainWindow,
+      onStartupProgress: (step) => mainWindow?.webContents?.send("startup-progress", step),
     });
 
     const mcpPort = getMcpServerPort(mcpHttpServer);
+    mainWindow?.webContents?.send("startup-progress", "Starting agent...");
     const modelName =
       config.aiProvider === "claude" ? config.claudeModel : config.openrouterModel;
     recipeStore.setModel(modelName);
@@ -458,6 +466,7 @@ ipcMain.handle("start-chat", async (_event, config: McpConfig) => {
       openrouterApiKey: config.openrouterApiKey,
       openrouterModel: config.openrouterModel,
     });
+    mainWindow?.webContents?.send("startup-progress", "Agent ready");
 
     return safeForIPC({
       ok: true,
@@ -476,6 +485,7 @@ ipcMain.handle("start-chat", async (_event, config: McpConfig) => {
 ipcMain.handle("stop-chat", async () => {
   stopMcpServer();
   await stopChromeMcp();
+  await stopKbMcp();
   await stopMailClient();
   return safeForIPC({ ok: true });
 });
@@ -589,6 +599,37 @@ ipcMain.handle("agent-config-delete", (_, id: string) => {
 ipcMain.handle("wipe-configs", () => {
   agentConfigWipe();
   return undefined;
+});
+
+ipcMain.handle("kb-list", (_, path: string, recursive: boolean) =>
+  safeForIPC(kbList(path ?? ".", recursive ?? true))
+);
+ipcMain.handle("kb-read", (_, path: string) => {
+  try {
+    return kbRead(path);
+  } catch (err) {
+    throw err instanceof Error ? err : new Error(String(err));
+  }
+});
+ipcMain.handle("kb-write", async (_, path: string, content: string) => {
+  try {
+    kbWrite(path, content);
+    await runQmdCli(["update"]);
+    await runQmdCli(["embed"]);
+    return undefined;
+  } catch (err) {
+    throw err instanceof Error ? err : new Error(String(err));
+  }
+});
+ipcMain.handle("kb-delete", async (_, path: string) => {
+  try {
+    kbDelete(path);
+    await runQmdCli(["update"]);
+    await runQmdCli(["embed"]);
+    return undefined;
+  } catch (err) {
+    throw err instanceof Error ? err : new Error(String(err));
+  }
 });
 
 const RECIPE_PORT = 17892;

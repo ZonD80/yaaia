@@ -35,6 +35,12 @@
           <label>OpenRouter Model</label>
           <input v-model="config.openrouterModel" placeholder="google/gemini-2.5-flash" />
         </div>
+        <ul v-if="startupSteps.length" class="startup-progress">
+          <li v-for="(step, i) in startupSteps" :key="i" :class="{ done: i < startupSteps.length - 1 || startupMilestones.includes(step) }">
+            <span class="check">{{ (i < startupSteps.length - 1 || startupMilestones.includes(step)) ? "✓" : "" }}</span>
+            <span class="text">{{ step }}</span>
+          </li>
+        </ul>
         <button class="btn primary" @click="startChat" :disabled="starting">
           {{ starting ? "Starting..." : "Start chat" }}
         </button>
@@ -104,19 +110,25 @@
           <div ref="scrollAnchor" aria-hidden="true"></div>
         </div>
         <div class="chat-input">
-          <textarea
-            v-model="inputText"
-            :placeholder="sending ? 'Type to inject message…' : 'Ask the agent...'"
-            rows="2"
-            @keydown.enter.exact.prevent="send"
-          />
-          <button class="btn secondary" @click="stopAgent" :disabled="!sending">Stop</button>
-          <button class="btn primary" @click="send" :disabled="sending">Send</button>
+          <div class="chat-input-row">
+            <textarea
+              v-model="inputText"
+              :placeholder="sending ? 'Type to inject message…' : 'Ask the agent...'"
+              rows="2"
+              @keydown.enter.exact.prevent="send"
+              @focus="textareaFocused = true"
+              @blur="textareaFocused = false"
+            />
+            <button class="btn secondary" @click="stopAgent" :disabled="!sending">Stop</button>
+            <button class="btn primary" @click="send" :disabled="!inputText.trim()">{{ sending ? 'Inject' : 'Send' }}</button>
+          </div>
+          <p class="chat-scroll-hint">Click outside the message box to stop automatic scrolling</p>
         </div>
       </section>
       <aside class="sidebar">
         <button class="btn secondary" @click="openSecretsEditor">Secrets Editor</button>
         <button class="btn secondary" @click="openConfigsEditor">Configs Editor</button>
+        <button class="btn secondary" @click="openKbEditor">KB Editor</button>
         <button class="btn secondary" @click="viewRecipe">View recipe</button>
         <button class="btn secondary" @click="saveRecipe">Save recipe</button>
         <button class="btn secondary" @click="loadRecipe">Load recipe</button>
@@ -213,6 +225,41 @@
         <div class="editor-modal-actions">
           <button class="btn secondary" @click="startAddConfig">Add new</button>
           <button class="btn secondary" @click="showConfigsEditor = false">Close</button>
+        </div>
+      </div>
+    </div>
+    <div v-if="showKbEditor" class="ask-user-overlay editor-overlay kb-editor-overlay" @click.self="showKbEditor = false">
+      <div class="ask-user-modal editor-modal kb-editor-modal">
+        <h3>KB Editor</h3>
+        <p v-if="kbError" class="editor-error">{{ kbError }}</p>
+        <div class="kb-editor-layout">
+          <div class="kb-editor-list">
+            <div v-for="path in kbFiles" :key="path" class="kb-editor-item"
+              :class="{ selected: kbSelectedPath === path }"
+              @click="selectKbFile(path)">
+              {{ path }}
+            </div>
+          </div>
+          <div class="kb-editor-form">
+            <input v-model="kbFormPath" type="text" placeholder="Path (e.g. notes/doc.md)" class="editor-input" />
+            <div v-if="kbEditorPreview" class="kb-editor-preview">
+              <div class="msg-markdown" v-html="renderMarkdown(kbFormContent)"></div>
+            </div>
+            <textarea v-else v-model="kbFormContent" placeholder="Markdown content..." rows="12" class="editor-textarea"></textarea>
+            <div class="editor-form-actions">
+              <button class="btn primary" @click="saveKbFile" :disabled="kbSaving">
+                {{ kbSaving ? "Saving…" : "Save" }}
+              </button>
+              <button class="btn secondary" @click="kbEditorPreview = !kbEditorPreview">
+                {{ kbEditorPreview ? "Edit" : "Preview" }}
+              </button>
+              <button v-if="kbSelectedPath" class="btn secondary" @click="deleteKbFile" :disabled="kbSaving">Delete</button>
+            </div>
+          </div>
+        </div>
+        <div class="editor-modal-actions">
+          <button class="btn secondary" @click="startAddKbFile">Add new</button>
+          <button class="btn secondary" @click="showKbEditor = false">Close</button>
         </div>
       </div>
     </div>
@@ -457,6 +504,78 @@ async function openConfigsEditor() {
   await refreshConfigsList();
 }
 
+async function openKbEditor() {
+  showKbEditor.value = true;
+  kbError.value = "";
+  await refreshKbList();
+}
+
+async function refreshKbList() {
+  try {
+    const list = (await window.electronAPI?.kbList?.(".", true)) ?? [];
+    kbFiles.value = list.filter((p: string) => !p.endsWith("/")) as string[];
+  } catch (err) {
+    kbFiles.value = [];
+    kbError.value = err instanceof Error ? err.message : "Failed to load";
+  }
+}
+
+function selectKbFile(path: string) {
+  kbSelectedPath.value = path;
+  kbFormPath.value = path;
+  kbError.value = "";
+  window.electronAPI?.kbRead?.(path).then((c) => {
+    kbFormContent.value = c;
+  }).catch((err) => {
+    kbError.value = err instanceof Error ? err.message : "Failed to read";
+  });
+}
+
+function startAddKbFile() {
+  kbSelectedPath.value = null;
+  kbFormPath.value = "";
+  kbFormContent.value = "";
+  kbError.value = "";
+}
+
+async function saveKbFile() {
+  const path = kbFormPath.value.trim();
+  if (!path) {
+    kbError.value = "Path is required";
+    return;
+  }
+  if (!path.endsWith(".md") && !path.endsWith(".qmd")) {
+    kbError.value = "Path must end with .md or .qmd";
+    return;
+  }
+  kbError.value = "";
+  kbSaving.value = true;
+  try {
+    await window.electronAPI?.kbWrite?.(path, kbFormContent.value);
+    await refreshKbList();
+    kbSelectedPath.value = path;
+  } catch (err) {
+    kbError.value = err instanceof Error ? err.message : "Failed to save";
+  } finally {
+    kbSaving.value = false;
+  }
+}
+
+async function deleteKbFile() {
+  if (!kbSelectedPath.value || !confirm(`Delete ${kbSelectedPath.value}?`)) return;
+  kbError.value = "";
+  kbSaving.value = true;
+  try {
+    await window.electronAPI?.kbDelete?.(kbSelectedPath.value);
+    await refreshKbList();
+    startAddKbFile();
+  } catch (err) {
+    kbError.value = err instanceof Error ? err.message : "Failed to delete";
+  } finally {
+    kbSaving.value = false;
+  }
+}
+
 async function refreshConfigsList() {
   try {
     const list = (await window.electronAPI?.agentConfigList?.()) ?? [];
@@ -520,6 +639,8 @@ const config = ref({
 
 const agentReady = ref(false);
 const starting = ref(false);
+const startupSteps = ref<string[]>([]);
+const startupMilestones = ["KB ready", "Chrome ready", "Agent ready", "Agent browser ready"];
 const agentBrowserError = ref("");
 const messages = ref<ChatMessage[]>([]);
 const inputText = ref("");
@@ -529,48 +650,26 @@ const sending = ref(false);
 const messagesRef = ref<HTMLElement | null>(null);
 const scrollAnchor = ref<HTMLElement | null>(null);
 
-const SCROLL_THRESHOLD = 80;
-/** True when user is at/near bottom; false when they've scrolled up. Updated on scroll. */
-const userIsAtBottom = ref(true);
+/** When true, new content triggers auto-scroll. Set by textarea focus/blur. */
+const textareaFocused = ref(false);
 
 function doScrollToBottom() {
   scrollAnchor.value?.scrollIntoView({ behavior: "auto", block: "end" });
 }
 
-/** Only scroll if user was at bottom (hasn't scrolled up to read old content). */
+/** Scroll to bottom only when textarea is focused (user is composing). */
 function scrollToBottomIfFollowing() {
-  if (!userIsAtBottom.value) return;
+  if (!textareaFocused.value) return;
   nextTick(() => {
-    requestAnimationFrame(() => {
-      doScrollToBottom();
-    });
+    requestAnimationFrame(() => doScrollToBottom());
   });
 }
 
-/** Always scroll to bottom (e.g. when loading or after send). */
+/** Force scroll to bottom (e.g. after send). */
 function scrollToBottomAlways() {
-  userIsAtBottom.value = true;
   nextTick(() => {
-    requestAnimationFrame(() => {
-      doScrollToBottom();
-    });
+    requestAnimationFrame(() => doScrollToBottom());
   });
-}
-
-let scrollCleanup: (() => void) | null = null;
-
-function setupScrollTracking() {
-  scrollCleanup?.();
-  scrollCleanup = null;
-  const el = messagesRef.value;
-  if (!el) return;
-  const check = () => {
-    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < SCROLL_THRESHOLD;
-    userIsAtBottom.value = atBottom;
-  };
-  el.addEventListener("scroll", check, { passive: true });
-  check();
-  scrollCleanup = () => el.removeEventListener("scroll", check);
 }
 const askUserInfo = ref<{ clarification: string; assessment: string; attempt: number } | null>(null);
 const askUserReply = ref("");
@@ -600,6 +699,17 @@ const configsItems = ref<Array<{ id: string; detailed_description: string; value
 const configsError = ref("");
 const configsEditingId = ref<string | null>(null);
 const configsForm = ref({ detailed_description: "", value: "" });
+
+// KB Editor
+const showKbEditor = ref(false);
+const kbEditorPreview = ref(false);
+const kbFiles = ref<string[]>([]);
+const kbSelectedPath = ref<string | null>(null);
+const kbFormPath = ref("");
+const kbFormContent = ref("");
+const kbError = ref("");
+const kbSaving = ref(false);
+
 let askUserCountdownTimer: ReturnType<typeof setInterval> | null = null;
 
 let streamUnsub: (() => void) | undefined;
@@ -608,6 +718,8 @@ let askUserCloseUnsub: (() => void) | undefined;
 let taskStartUnsub: (() => void) | undefined;
 let finalizeUnsub: (() => void) | undefined;
 let agentBrowserErrorUnsub: (() => void) | undefined;
+let startupProgressUnsub: (() => void) | undefined;
+let startupProgressResetUnsub: (() => void) | undefined;
 
 const streamingParsed = computed(() => parseStream(streamBuffer.value));
 
@@ -617,6 +729,17 @@ async function startChat() {
     const plainConfig = JSON.parse(JSON.stringify(config.value));
     const result = await window.electronAPI?.startChat?.(plainConfig);
     if (result?.ok) {
+      messages.value = [];
+      streamBuffer.value = "";
+      stopTaskTimer();
+      taskSummary.value = "";
+      taskStartTime.value = null;
+      taskFinalized.value = false;
+      taskSuccess.value = true;
+      taskElapsedSeconds.value = 0;
+      showFinalizePopup.value = false;
+      finalizeInfo.value = null;
+      pendingReportForNextMessage.value = false;
       agentReady.value = true;
       agentBrowserError.value = "";
     } else {
@@ -659,9 +782,20 @@ function buildHistory(msgs: ChatMessage[]): { role: "user" | "assistant"; conten
 
 async function send() {
   const text = inputText.value.trim();
-  if (!text || sending.value) return;
+  if (!text) return;
+
+  if (sending.value) {
+    // Inject message into running agent (after last tool result)
+    inputText.value = "";
+    messages.value.push({ role: "user", content: text, injected: true });
+    window.electronAPI?.agentInjectMessage?.(text, false);
+    scrollToBottomAlways();
+    return;
+  }
+
   inputText.value = "";
   messages.value.push({ role: "user", content: text });
+  textareaFocused.value = true;
   sending.value = true;
   streaming.value = true;
   streamBuffer.value = "";
@@ -727,16 +861,13 @@ async function loadRecipe() {
 
 watch(streamBuffer, () => scrollToBottomIfFollowing());
 watch(messages, () => scrollToBottomIfFollowing(), { deep: true });
-
-watch(agentReady, (ready) => {
-  if (ready) nextTick(setupScrollTracking);
+watch(showKbEditor, (v) => {
+  if (!v) kbEditorPreview.value = false;
 });
 
 onMounted(async () => {
   const cfg = await window.electronAPI?.getConfig?.();
   if (cfg) config.value = { ...config.value, ...cfg };
-
-  if (agentReady.value) nextTick(setupScrollTracking);
 
   streamUnsub = window.electronAPI?.onAgentStreamChunk?.((chunk) => {
     streamBuffer.value += chunk;
@@ -781,6 +912,23 @@ onMounted(async () => {
   agentBrowserErrorUnsub = window.electronAPI?.onAgentBrowserError?.((msg) => {
     agentBrowserError.value = msg;
   });
+
+  startupProgressResetUnsub = window.electronAPI?.onStartupProgressReset?.(() => {
+    startupSteps.value = [];
+  });
+  startupProgressUnsub = window.electronAPI?.onStartupProgress?.((step) => {
+    const prev = startupSteps.value;
+    const last = prev[prev.length - 1];
+    const isQmdSubstep =
+      last &&
+      (last === "Connecting Knowledge Base..." || last.startsWith("Indexing") || last.includes("%") || /^\d+\/\d+/.test(last));
+    const isMilestone = startupMilestones.includes(step);
+    if (isQmdSubstep && !isMilestone && step !== last) {
+      startupSteps.value = [...prev.slice(0, -1), step];
+    } else {
+      startupSteps.value = [...prev, step].slice(-15);
+    }
+  });
 });
 
 onUnmounted(() => {
@@ -791,6 +939,8 @@ onUnmounted(() => {
   taskStartUnsub?.();
   finalizeUnsub?.();
   agentBrowserErrorUnsub?.();
+  startupProgressUnsub?.();
+  startupProgressResetUnsub?.();
   stopAskUserCountdown();
   stopTaskTimer();
 });
@@ -798,11 +948,13 @@ onUnmounted(() => {
 
 <style scoped>
 .app {
-  min-height: 100vh;
+  height: 100vh;
   display: flex;
   flex-direction: column;
+  overflow: hidden;
 }
 .header {
+  flex-shrink: 0;
   padding: 1rem 1.5rem;
   border-bottom: 1px solid #333;
 }
@@ -821,6 +973,7 @@ onUnmounted(() => {
 }
 .main {
   flex: 1;
+  min-height: 0;
   display: flex;
   gap: 1rem;
   padding: 1rem;
@@ -828,7 +981,8 @@ onUnmounted(() => {
   overflow: hidden;
 }
 .config {
-  max-width: 400px;
+  flex: 1;
+  min-width: 0;
 }
 .config .field {
   margin-bottom: 1rem;
@@ -847,15 +1001,38 @@ onUnmounted(() => {
   border-radius: 6px;
   color: #e6edf3;
 }
+.startup-progress {
+  list-style: none;
+  padding: 0;
+  margin: 1rem 0;
+  font-size: 0.9rem;
+}
+.startup-progress li {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.25rem 0;
+  color: #8b949e;
+}
+.startup-progress li.done {
+  color: #3fb950;
+}
+.startup-progress .check {
+  width: 1.2em;
+  font-weight: bold;
+}
 .chat {
   flex: 1;
   display: flex;
   flex-direction: column;
   min-width: 0;
+  min-height: 0;
 }
 .chat-messages {
   flex: 1;
+  min-height: 0;
   overflow-y: auto;
+  overflow-x: hidden;
   padding: 1rem;
   background: #0d1117;
   border-radius: 8px;
@@ -867,12 +1044,35 @@ onUnmounted(() => {
   border-radius: 6px;
 }
 .msg.user {
-  background: #21262d;
+  background: #1a2d3d;
+  border: 1px solid #2d3d4d;
   margin-left: 2rem;
 }
 .msg.assistant {
   background: #161b22;
   margin-right: 2rem;
+}
+.msg.assistant.assessment {
+  background: #2a2518;
+  border: 1px solid #3d3520;
+}
+.msg.assistant.clarification {
+  background: #1e1a2a;
+  border: 1px solid #2d2840;
+}
+.msg.assistant.content,
+.msg.assistant:not(.assessment):not(.clarification):not(.tool_running):not(.tool_call):not(.report) {
+  background: #1a1f26;
+  border: 1px solid #252b33;
+}
+.msg.assistant.tool_running,
+.msg.assistant.tool_call {
+  background: #1e2228;
+  border: 1px solid #2a3038;
+}
+.msg.report {
+  background: #1a2a1e;
+  border: 1px solid #2d4035;
 }
 .msg-type-label {
   display: block;
@@ -902,6 +1102,12 @@ onUnmounted(() => {
   padding: 1rem;
 }
 .chat-input {
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+.chat-input-row {
   display: flex;
   gap: 0.5rem;
   align-items: flex-end;
@@ -914,6 +1120,11 @@ onUnmounted(() => {
   border-radius: 6px;
   color: #e6edf3;
   resize: none;
+}
+.chat-scroll-hint {
+  font-size: 0.75rem;
+  color: #8b949e;
+  margin: 0;
 }
 .sidebar {
   position: fixed;
@@ -996,16 +1207,14 @@ onUnmounted(() => {
 .report-block {
   margin-top: 1rem;
   padding: 0.75rem;
-  background: #21262d;
+  background: #1a2a1e;
   border-radius: 6px;
   max-height: 300px;
   overflow-y: auto;
+  border: 1px solid #2d4035;
 }
 .report-block .report-content {
   margin-top: 0.5rem;
-}
-.msg.report {
-  border-left: 4px solid #58a6ff;
 }
 .finalize-modal.finalize-failed {
   border-color: #6a4a4a;
@@ -1144,5 +1353,85 @@ onUnmounted(() => {
 .btn.small {
   padding: 0.35rem 0.6rem;
   font-size: 0.85rem;
+}
+.kb-editor-overlay .kb-editor-modal {
+  width: 95vw !important;
+  max-width: 95vw !important;
+  height: 95vh !important;
+  max-height: 95vh !important;
+  display: flex;
+  flex-direction: column;
+}
+.kb-editor-overlay .kb-editor-modal .kb-editor-layout {
+  flex: 1;
+  min-height: 0;
+}
+.kb-editor-modal {
+  max-width: 800px;
+}
+.kb-editor-layout {
+  display: flex;
+  gap: 1rem;
+  margin-bottom: 1rem;
+  min-height: 280px;
+}
+.kb-editor-list {
+  width: 220px;
+  flex-shrink: 0;
+  overflow-y: auto;
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  background: #0d1117;
+}
+.kb-editor-preview {
+  flex: 1;
+  min-height: 200px;
+  padding: 0.75rem 1rem;
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  background: #0d1117;
+  overflow-y: auto;
+}
+.kb-editor-preview .msg-markdown {
+  font-size: 0.95rem;
+  line-height: 1.6;
+}
+.kb-editor-item {
+  padding: 0.4rem 0.75rem;
+  font-size: 0.85rem;
+  cursor: pointer;
+  border-bottom: 1px solid #21262d;
+  word-break: break-all;
+}
+.kb-editor-item:hover {
+  background: #21262d;
+}
+.kb-editor-item.selected {
+  background: #1a3a5c;
+  color: #58a6ff;
+}
+.kb-editor-form {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+.editor-textarea {
+  flex: 1;
+  min-height: 200px;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  background: #21262d;
+  color: #e6edf3;
+  font-family: inherit;
+  font-size: 0.9rem;
+  resize: vertical;
+}
+.editor-textarea:focus {
+  outline: none;
+  border-color: #58a6ff;
 }
 </style>

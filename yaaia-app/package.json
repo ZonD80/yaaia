@@ -1,6 +1,6 @@
 {
   "name": "yaaia",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Yet Another AI Agent - Browser automation with Chrome DevTools MCP",
   "main": "dist-electron/main/index.js",
   "type": "module",
@@ -8,6 +8,8 @@
     "asar": true
   },
   "scripts": {
+    "postinstall": "node scripts/patch-qmd.js",
+    "install:conda": "PYTHON=$(conda run -n yaaia-build which python) npm install && PYTHON=$(conda run -n yaaia-build which python) node node_modules/@electron/rebuild/lib/cli.js",
     "dev": "electron-vite dev",
     "build": "electron-vite build",
     "preview": "electron-vite preview",
@@ -16,6 +18,7 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^0.78.0",
     "@modelcontextprotocol/sdk": "^1.27.0",
+    "@tobilu/qmd": "^1.0.7",
     "adm-zip": "^0.5.16",
     "archiver": "^7.0.1",
     "chrome-devtools-mcp": "^0.18.1",
@@ -25,6 +28,9 @@
     "vue": "^3.4.0",
     "ws": "^8.19.0",
     "zod": "^3.23.0"
+  },
+  "overrides": {
+    "better-sqlite3": "^12.4.2"
   },
   "devDependencies": {
     "@types/express": "^5.0.6",
