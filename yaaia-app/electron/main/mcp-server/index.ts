@@ -40,6 +40,8 @@ import {
   kbCollectionAdd,
   kbCollectionList,
   kbCollectionRemove,
+  kbEnsureCollection,
+  buildKbPathFromCollection,
   type KbTool,
 } from "./kb-client.js";
 import {
@@ -343,9 +345,10 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
   server.registerTool(
     "kb__write",
     {
-      description: "Create or overwrite a .md or .qmd file in the knowledge base. Path relative to ~/yaaia/kb. Auto-runs qmd update after write.",
+      description: "Create or overwrite a .md or .qmd file in the knowledge base. Requires collection (created if missing). Path is relative to collection root.",
       inputSchema: z.object({
-        path: z.string().describe("Relative path e.g. notes/idea.md"),
+        collection: z.string().describe("Collection name (e.g. lessons_learned, identity). Created if missing."),
+        path: z.string().describe("Path relative to collection e.g. file.md or subfolder/note.md"),
         content: z.string().describe("File content"),
         assessment: ASSESSMENT_PARAM,
         clarification: CLARIFICATION_PARAM,
@@ -353,21 +356,23 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
     },
     async (args) => {
       logToolCall("kb__write", args);
-      const allowed = new Set([...KB_BASE, "path", "content"]);
+      const allowed = new Set([...KB_BASE, "collection", "path", "content"]);
       const unknownMsg = validateUnknownParams("kb__write", args, allowed);
       if (unknownMsg) {
         recipeStore.appendToolCall("kb__write", args, unknownMsg);
         return toolResult(unknownMsg);
       }
-      const { path: p, content } = args as { path: string; content: string };
+      const { collection, path: p, content } = args as { collection: string; path: string; content: string };
       logClarification("kb__write", args);
       logAssessment("kb__write", args);
       try {
-        kbWrite(p, content);
+        await kbEnsureCollection(collection);
+        const fullPath = buildKbPathFromCollection(collection, p);
+        kbWrite(fullPath, content);
         await runQmdCli(["update"]);
         await runQmdCli(["embed"]);
         recipeStore.appendToolCall("kb__write", args, "Written.");
-        return toolResult(`Written ${p}. Index updated.`);
+        return toolResult(`Written ${collection}/${p}. Index updated.`);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         recipeStore.appendToolCall("kb__write", args, msg);
@@ -379,30 +384,32 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
   server.registerTool(
     "kb__delete",
     {
-      description: "Delete a .md or .qmd file from the knowledge base. Path relative to ~/yaaia/kb. Auto-runs qmd update after delete.",
+      description: "Delete a .md or .qmd file from the knowledge base. Requires collection. Path is relative to collection root.",
       inputSchema: z.object({
-        path: z.string().describe("Relative path e.g. notes/idea.md"),
+        collection: z.string().describe("Collection name (e.g. lessons_learned, identity)"),
+        path: z.string().describe("Path relative to collection e.g. file.md or subfolder/note.md"),
         assessment: ASSESSMENT_PARAM,
         clarification: CLARIFICATION_PARAM,
       }),
     },
     async (args) => {
       logToolCall("kb__delete", args);
-      const allowed = new Set([...KB_BASE, "path"]);
+      const allowed = new Set([...KB_BASE, "collection", "path"]);
       const unknownMsg = validateUnknownParams("kb__delete", args, allowed);
       if (unknownMsg) {
         recipeStore.appendToolCall("kb__delete", args, unknownMsg);
         return toolResult(unknownMsg);
       }
-      const { path: p } = args as { path: string };
+      const { collection, path: p } = args as { collection: string; path: string };
       logClarification("kb__delete", args);
       logAssessment("kb__delete", args);
       try {
-        kbDelete(p);
+        const fullPath = buildKbPathFromCollection(collection, p);
+        kbDelete(fullPath);
         await runQmdCli(["update"]);
         await runQmdCli(["embed"]);
         recipeStore.appendToolCall("kb__delete", args, "Deleted.");
-        return toolResult(`Deleted ${p}. Index updated.`);
+        return toolResult(`Deleted ${collection}/${p}. Index updated.`);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         recipeStore.appendToolCall("kb__delete", args, msg);
@@ -414,26 +421,28 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
   server.registerTool(
     "kb__list",
     {
-      description: "List files and folders in the knowledge base recursively. Path relative to ~/yaaia/kb.",
+      description: "List files and folders in a collection. Path is relative to collection root.",
       inputSchema: z.object({
-        path: z.string().optional().default("").describe("Relative path, empty for root"),
+        collection: z.string().describe("Collection name (e.g. lessons_learned, identity)"),
+        path: z.string().optional().default("").describe("Path relative to collection, empty for root"),
         assessment: ASSESSMENT_PARAM,
         clarification: CLARIFICATION_PARAM,
       }),
     },
     async (args) => {
       logToolCall("kb__list", args);
-      const allowed = new Set([...KB_BASE, "path"]);
+      const allowed = new Set([...KB_BASE, "collection", "path"]);
       const unknownMsg = validateUnknownParams("kb__list", args, allowed);
       if (unknownMsg) {
         recipeStore.appendToolCall("kb__list", args, unknownMsg);
         return toolResult(unknownMsg);
       }
-      const { path: p = "" } = args as { path?: string };
+      const { collection, path: p = "" } = args as { collection: string; path?: string };
       logClarification("kb__list", args);
       logAssessment("kb__list", args);
       try {
-        const list = kbList(p, true);
+        const fullPath = buildKbPathFromCollection(collection, p || ".");
+        const list = kbList(fullPath, true);
         const text = list.length ? list.join("\n") : "(empty)";
         recipeStore.appendToolCall("kb__list", args, text);
         return toolResult(text);

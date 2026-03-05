@@ -333,10 +333,47 @@ export async function kbCollectionAdd(name: string, subpath?: string): Promise<s
 }
 
 export async function kbCollectionList(): Promise<string> {
-  return runQmdCli(["collection", "list"]);
+  return runQmdCliFullOutput(["collection", "list"]);
 }
 
 export async function kbCollectionRemove(name: string): Promise<string> {
   await runQmdCli(["collection", "remove", name]);
   return `Collection "${name}" removed`;
+}
+
+/** Normalize collection name for use as folder path (spaces -> underscores). */
+function collectionNameToPath(name: string): string {
+  return name.replace(/\s+/g, "_").replace(/\/+/g, "_").replace(/^_|_$/g, "") || name;
+}
+
+/** Build full path (relative to KB_ROOT) from collection + path. Path is relative to collection. Empty path = collection root. */
+export function buildKbPathFromCollection(collection: string, path: string): string {
+  const normalized = path.replace(/\\/g, "/").replace(/\/+/g, "/").trim();
+  if (normalized.startsWith("/") || normalized.includes("..")) {
+    throw new Error("Invalid path: no absolute paths or traversal allowed");
+  }
+  const collPath = collectionNameToPath(collection);
+  if (!collPath) return normalized;
+  return normalized ? `${collPath}/${normalized}` : collPath;
+}
+
+/** Check if collection already exists in QMD config. */
+async function kbCollectionExists(collectionName: string): Promise<boolean> {
+  const listOutput = await runQmdCliFullOutput(["collection", "list"]);
+  // Output contains "  collectionname (qmd://collectionname/)" for each collection
+  return listOutput.includes(`(qmd://${collectionName}/)`);
+}
+
+/** Ensure collection exists; create it if missing. Skips if already exists. */
+export async function kbEnsureCollection(collectionName: string): Promise<void> {
+  if (await kbCollectionExists(collectionName)) {
+    return;
+  }
+  const pathRel = collectionNameToPath(collectionName);
+  const fullPath = resolve(KB_ROOT, pathRel);
+  if (!existsSync(fullPath)) {
+    mkdirSync(fullPath, { recursive: true });
+    console.log(`${QMD_LOG_PREFIX} Created directory ${fullPath} for collection "${collectionName}"`);
+  }
+  await runQmdCli(["collection", "add", fullPath, "--name", collectionName]);
 }
