@@ -31,6 +31,7 @@ try {
       first_factor: string;
       first_factor_type: string;
       value: string;
+      totp_secret?: string;
       force?: boolean;
     }) => ipcRenderer.invoke("secrets-set", args),
     secretsDelete: (id: string) => ipcRenderer.invoke("secrets-delete", id),

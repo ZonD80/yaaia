@@ -1,5 +1,5 @@
 <template>
-  <div class="app">
+  <div class="app" @click="onAppLinkClick">
     <header class="header">
       <h1>YAAIA <span class="version">v{{ appVersion }}</span></h1>
       <p v-if="agentBrowserError" class="error">{{ agentBrowserError }}</p>
@@ -46,7 +46,7 @@
         </button>
       </section>
       <section class="chat" v-else>
-        <div class="chat-messages" ref="messagesRef" @click="onChatLinkClick">
+        <div class="chat-messages" ref="messagesRef">
           <div v-if="messages.length === 0" class="chat-placeholder">Agent is ready. Type your message below.</div>
           <div v-for="(msg, i) in messages" :key="i" :class="['msg', msg.role, { error: msg.isError, report: msg.isReport }, msg.type]">
             <template v-if="msg.role === 'user'">
@@ -173,6 +173,7 @@
           <input v-model="secretsForm.first_factor" type="text" placeholder="First factor (e.g. user)" class="editor-input" />
           <input v-model="secretsForm.first_factor_type" type="text" placeholder="First factor type (e.g. username)" class="editor-input" />
           <input v-model="secretsForm.value" type="text" placeholder="Value (plaintext)" class="editor-input" />
+          <input v-model="secretsForm.totp_secret" type="text" placeholder="TOTP seed (Base32, optional)" class="editor-input" />
           <div class="editor-form-actions">
             <button class="btn primary" @click="saveSecret">{{ secretsEditingId ? "Update" : "Add" }}</button>
             <button v-if="secretsEditingId" class="btn secondary" @click="startAddSecret">Cancel edit</button>
@@ -185,6 +186,7 @@
               <span class="editor-row-factor">{{ item.first_factor }}</span>
               <span class="editor-row-type">{{ item.first_factor_type }}</span>
               <span class="editor-row-value">{{ item.value }}</span>
+              <span v-if="item.totp_secret" class="editor-row-badge">2FA</span>
             </div>
             <div class="editor-row-actions">
               <button class="btn secondary small" @click="startEditSecret(item)">Edit</button>
@@ -340,7 +342,8 @@ function renderMarkdown(text: string): string {
   return marked.parse(text) as string;
 }
 
-function onChatLinkClick(e: MouseEvent) {
+/** Open links in external browser. Used globally so links in chat, popups, reports, etc. all open externally. */
+function onAppLinkClick(e: MouseEvent) {
   const anchor = (e.target as HTMLElement)?.closest?.("a");
   if (!anchor?.href) return;
   const url = anchor.getAttribute("href");
@@ -452,7 +455,13 @@ async function refreshSecretsList() {
 
 function startAddSecret() {
   secretsEditingId.value = null;
-  secretsForm.value = { detailed_description: "", first_factor: "", first_factor_type: "", value: "" };
+  secretsForm.value = {
+    detailed_description: "",
+    first_factor: "",
+    first_factor_type: "",
+    value: "",
+    totp_secret: "",
+  };
 }
 
 function startEditSecret(entry: (typeof secretsItems.value)[0]) {
@@ -462,6 +471,7 @@ function startEditSecret(entry: (typeof secretsItems.value)[0]) {
     first_factor: entry.first_factor,
     first_factor_type: entry.first_factor_type,
     value: entry.value,
+    totp_secret: entry.totp_secret ?? "",
   };
 }
 
@@ -477,7 +487,13 @@ async function saveSecret() {
     });
     await refreshSecretsList();
     secretsEditingId.value = null;
-    secretsForm.value = { detailed_description: "", first_factor: "", first_factor_type: "", value: "" };
+    secretsForm.value = {
+      detailed_description: "",
+      first_factor: "",
+      first_factor_type: "",
+      value: "",
+      totp_secret: "",
+    };
   } catch (err) {
     secretsError.value = err instanceof Error ? err.message : "Failed to save";
   }
@@ -491,7 +507,13 @@ async function deleteSecret(id: string) {
     await refreshSecretsList();
     if (secretsEditingId.value === id) {
       secretsEditingId.value = null;
-      secretsForm.value = { detailed_description: "", first_factor: "", first_factor_type: "", value: "" };
+      secretsForm.value = {
+        detailed_description: "",
+        first_factor: "",
+        first_factor_type: "",
+        value: "",
+        totp_secret: "",
+      };
     }
   } catch (err) {
     secretsError.value = err instanceof Error ? err.message : "Failed to delete";
@@ -688,10 +710,18 @@ const askUserCountdown = ref(60);
 
 // Secrets Editor
 const showSecretsEditor = ref(false);
-const secretsItems = ref<Array<{ id: string; detailed_description: string; first_factor: string; first_factor_type: string; value: string }>>([]);
+const secretsItems = ref<
+  Array<{ id: string; detailed_description: string; first_factor: string; first_factor_type: string; value: string; totp_secret?: string }>
+>([]);
 const secretsError = ref("");
 const secretsEditingId = ref<string | null>(null);
-const secretsForm = ref({ detailed_description: "", first_factor: "", first_factor_type: "", value: "" });
+const secretsForm = ref({
+  detailed_description: "",
+  first_factor: "",
+  first_factor_type: "",
+  value: "",
+  totp_secret: "",
+});
 
 // Configs Editor
 const showConfigsEditor = ref(false);
@@ -1093,6 +1123,9 @@ onUnmounted(() => {
 .msg-running {
   color: #58a6ff;
 }
+.msg-text {
+  white-space: pre-wrap;
+}
 .msg-error,
 .msg.error .msg-text {
   color: #f85149;
@@ -1339,6 +1372,14 @@ onUnmounted(() => {
 .editor-row-value {
   word-break: break-all;
   color: #e6edf3;
+}
+.editor-row-badge {
+  font-size: 0.7rem;
+  padding: 0.1rem 0.4rem;
+  background: #238636;
+  color: #fff;
+  border-radius: 4px;
+  margin-left: 0.25rem;
 }
 .editor-row-actions {
   flex-shrink: 0;

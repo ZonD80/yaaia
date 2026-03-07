@@ -8,6 +8,7 @@ import { mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
 import { spawn, execSync } from "node:child_process";
 import { platform } from "node:os";
+import { randomBytes } from "node:crypto";
 import type { Server } from "node:http";
 import { startMcpServer, getMcpServerPort, stopChromeMcp, stopKbMcp, stopMailClient } from "./mcp-server/index.js";
 import { startAgent, stopAgent, sendMessage, requestAgentAbort, setPendingInjectMessage } from "./ai-agent/index.js";
@@ -438,8 +439,7 @@ ipcMain.handle("start-chat", async (_event, config: McpConfig) => {
     mainWindow?.webContents?.send("startup-progress", "Starting MCP server...");
     mcpHttpServer = await startMcpServer({
       onAskUserRequest: (info) => {
-        mainWindow?.show();
-        mainWindow?.focus();
+        refocusMainWindow();
         mainWindow?.webContents?.send("ask-user-popup", info);
       },
       onAskUserTimeout: () => {
@@ -468,6 +468,8 @@ ipcMain.handle("start-chat", async (_event, config: McpConfig) => {
     });
     mainWindow?.webContents?.send("startup-progress", "Agent ready");
 
+    recipeStore.setSessionTag(randomBytes(16).toString("hex"));
+
     return safeForIPC({
       ok: true,
       agentReady: true,
@@ -487,6 +489,7 @@ ipcMain.handle("stop-chat", async () => {
   await stopChromeMcp();
   await stopKbMcp();
   await stopMailClient();
+  recipeStore.clearSessionTag();
   return safeForIPC({ ok: true });
 });
 
@@ -500,6 +503,7 @@ ipcMain.handle("agent-send-message", async (event, message: string, history: { r
     );
     const finalizeInfo = recipeStore.completeFinalizeWithReport(result.text ?? "");
     if (finalizeInfo) {
+      refocusMainWindow();
       mainWindow?.webContents?.send("finalize-task-popup", finalizeInfo);
     }
     return safeForIPC(String(result.text ?? ""));
@@ -547,6 +551,7 @@ ipcMain.handle(
       first_factor: string;
       first_factor_type: string;
       value: string;
+      totp_secret?: string;
       force?: boolean;
     }
   ) => {
@@ -557,7 +562,8 @@ ipcMain.handle(
         args.first_factor,
         args.first_factor_type,
         args.value,
-        args.force ?? false
+        args.force ?? false,
+        args.totp_secret
       );
     } catch (err) {
       throw err instanceof Error ? err : new Error(String(err));

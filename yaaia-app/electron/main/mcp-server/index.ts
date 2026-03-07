@@ -697,7 +697,8 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
   server.registerTool(
     "secrets_list",
     {
-      description: "List all secrets. Returns JSON array of {id, detailed_description, first_factor, first_factor_type}.",
+      description:
+        "List all secrets. Returns JSON array of {id, detailed_description, first_factor, first_factor_type, has_totp}.",
       inputSchema: z.object({ assessment: ASSESSMENT_PARAM, clarification: CLARIFICATION_PARAM }),
     },
     async (args) => {
@@ -719,7 +720,8 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
   server.registerTool(
     "secrets_get",
     {
-      description: "Get a secret value by id (UUID).",
+      description:
+        "Get a secret value by id (UUID). If TOTP seed is configured, returns JSON with value, totp_code, and totp_expires_in_seconds.",
       inputSchema: z.object({
         id: z.string().describe("Secret id from secrets_list"),
         assessment: ASSESSMENT_PARAM,
@@ -736,8 +738,13 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
       const { id } = args as { id: string };
       logClarification("secrets_get", args);
       logAssessment("secrets_get", args);
-      const value = secretsGet(id);
-      const resultText = value === null ? `Secret "${id}" not found.` : value;
+      const result = await secretsGet(id);
+      const resultText =
+        result === null
+          ? `Secret "${id}" not found.`
+          : typeof result === "string"
+            ? result
+            : JSON.stringify(result);
       recipeStore.appendToolCall("secrets_get", args, resultText);
       return toolResult(resultText);
     }
@@ -746,12 +753,14 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
   server.registerTool(
     "secrets_set",
     {
-      description: "Set a secret. Use force=true to overwrite.",
+      description:
+        "Set a secret. Use force=true to overwrite. Optional totp_secret: Base32 TOTP seed for 2FA code generation.",
       inputSchema: z.object({
         detailed_description: z.string(),
         first_factor: z.string(),
         first_factor_type: z.string(),
         value: z.string(),
+        totp_secret: z.string().optional().describe("Optional Base32 TOTP seed for 2FA code generation"),
         assessment: ASSESSMENT_PARAM,
         clarification: CLARIFICATION_PARAM,
         force: z.boolean().optional().default(false),
@@ -759,13 +768,23 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
     },
     async (args) => {
       logToolCall("secrets_set", args);
-      const allowed = new Set(["detailed_description", "first_factor", "first_factor_type", "value", "assessment", "clarification", "force"]);
+      const allowed = new Set([
+        "detailed_description",
+        "first_factor",
+        "first_factor_type",
+        "value",
+        "totp_secret",
+        "assessment",
+        "clarification",
+        "force",
+      ]);
       const unknownMsg = validateUnknownParams("secrets_set", args, allowed);
       if (unknownMsg) {
         recipeStore.appendToolCall("secrets_set", args, unknownMsg);
         return toolResult(unknownMsg);
       }
-      const { detailed_description, first_factor, first_factor_type, value, force = false } = args as Record<string, unknown>;
+      const { detailed_description, first_factor, first_factor_type, value, totp_secret, force = false } =
+        args as Record<string, unknown>;
       logClarification("secrets_set", args);
       logAssessment("secrets_set", args);
       const id = secretsSet(
@@ -773,7 +792,8 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
         String(first_factor),
         String(first_factor_type),
         String(value),
-        Boolean(force)
+        Boolean(force),
+        typeof totp_secret === "string" ? totp_secret : undefined
       );
       const resultText = `Secret set. id="${id}"`;
       recipeStore.appendToolCall("secrets_set", args, resultText);

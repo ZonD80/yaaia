@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
+import { generate } from "otplib";
 
 const YAAIA_DIR = join(homedir(), "yaaia");
 const SECRETS_PATH = join(YAAIA_DIR, "secrets.json");
@@ -12,7 +13,12 @@ export type SecretEntry = {
   first_factor: string;
   first_factor_type: string;
   value: string;
+  totp_secret?: string;
 };
+
+export type SecretsGetResult =
+  | { value: string }
+  | { value: string; totp_code: string; totp_expires_in_seconds: number };
 
 type SecretsFile = {
   v?: number;
@@ -66,19 +72,35 @@ export function validateDetailedDescription(d: string): void {
   }
 }
 
-export function secretsList(): Omit<SecretEntry, "value">[] {
+export function secretsList(): (Omit<SecretEntry, "value" | "totp_secret"> & { has_totp?: boolean })[] {
   const items = loadSecrets();
-  return items.map(({ value: _, ...rest }) => rest);
+  return items.map(({ value: _, totp_secret, ...rest }) => ({
+    ...rest,
+    has_totp: !!totp_secret,
+  }));
 }
 
 export function secretsListFull(): SecretEntry[] {
   return loadSecrets();
 }
 
-export function secretsGet(id: string): string | null {
+export async function secretsGet(id: string): Promise<string | SecretsGetResult | null> {
   const items = loadSecrets();
   const entry = items.find((e) => e.id === id);
-  return entry?.value ?? null;
+  if (!entry) return null;
+  const { value, totp_secret } = entry;
+  if (!totp_secret?.trim()) {
+    return value;
+  }
+  try {
+    const totp_code = await generate({ secret: totp_secret.trim() });
+    const epoch = Math.floor(Date.now() / 1000);
+    const totp_expires_in_seconds = 30 - (epoch % 30);
+    return { value, totp_code, totp_expires_in_seconds };
+  } catch (err) {
+    console.warn("[YAAIA] TOTP generation failed:", err);
+    return value;
+  }
 }
 
 export function secretsSet(
@@ -86,7 +108,8 @@ export function secretsSet(
   first_factor: string,
   first_factor_type: string,
   value: string,
-  force: boolean
+  force: boolean,
+  totp_secret?: string
 ): string {
   validateDetailedDescription(detailed_description);
   const items = loadSecrets();
@@ -104,6 +127,7 @@ export function secretsSet(
     first_factor,
     first_factor_type,
     value,
+    totp_secret: totp_secret?.trim() || undefined,
   };
   const rest = items.filter((e) => e.id !== entry.id);
   saveSecrets([...rest, entry]);
