@@ -74,8 +74,23 @@ import {
   mailMessageLabelsSet,
   mailAppend,
 } from "../mail-client.js";
+import {
+  listBuses,
+  setBusProperties,
+  deleteBus,
+  appendToBusHistory,
+  ensureBus,
+  getBusHistory,
+  getBusHistorySlice,
+  getBusTrustLevel,
+  ROOT_BUS_ID,
+} from "../message-bus-store.js";
 
 const BROWSER_URL = "http://127.0.0.1:9222";
+
+const BUS_ID_PARAM = z
+  .string()
+  .describe("Message bus id (e.g. root, telegram-123). Mandatory for every tool.");
 
 const CLARIFICATION_PARAM = z
   .string()
@@ -123,8 +138,9 @@ function validateUnknownParams(
   return `${toolName} does not accept: ${unknown.join(", ")}`;
 }
 
-function stripAssessmentClarification(args: Record<string, unknown>): Record<string, unknown> {
+function stripBusIdAssessmentClarification(args: Record<string, unknown>): Record<string, unknown> {
   const out = { ...args };
+  delete out.bus_id;
   delete out.assessment;
   delete out.clarification;
   return out;
@@ -206,11 +222,12 @@ function buildChromeToolInputSchema(
   const props = baseSchema?.properties ?? {};
   const baseRequired = new Set(baseSchema?.required ?? []);
   const shape: Record<string, z.ZodTypeAny> = {
+    bus_id: BUS_ID_PARAM,
     assessment: ASSESSMENT_PARAM,
     clarification: CLARIFICATION_PARAM,
   };
   for (const [key, prop] of Object.entries(props)) {
-    if (key === "assessment" || key === "clarification") continue;
+    if (key === "bus_id" || key === "assessment" || key === "clarification") continue;
     const p = prop as JsonSchemaProp;
     shape[key] = jsonSchemaPropToZod(p ?? {}, baseRequired.has(key));
   }
@@ -224,11 +241,12 @@ function buildKbToolInputSchema(
   const props = baseSchema?.properties ?? {};
   const baseRequired = new Set(baseSchema?.required ?? []);
   const shape: Record<string, z.ZodTypeAny> = {
+    bus_id: BUS_ID_PARAM,
     assessment: ASSESSMENT_PARAM,
     clarification: CLARIFICATION_PARAM,
   };
   for (const [key, prop] of Object.entries(props)) {
-    if (key === "assessment" || key === "clarification") continue;
+    if (key === "bus_id" || key === "assessment" || key === "clarification") continue;
     const p = prop as JsonSchemaProp;
     shape[key] = jsonSchemaPropToZod(p ?? {}, baseRequired.has(key));
   }
@@ -256,13 +274,14 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
     const name = tool.name;
     const baseSchema = tool.inputSchema ?? { type: "object", properties: {}, required: [] };
     const required = [...(baseSchema.required ?? [])];
+    if (!required.includes("bus_id")) required.push("bus_id");
     if (!required.includes("assessment")) required.push("assessment");
     if (!required.includes("clarification")) required.push("clarification");
 
     server.registerTool(
       name,
       {
-        description: (tool.description ?? `Chrome DevTools: ${name}`) + " Always provide assessment and clarification.",
+        description: (tool.description ?? `Chrome DevTools: ${name}`) + " Always provide bus_id, assessment and clarification.",
         inputSchema: buildChromeToolInputSchema(baseSchema, required),
       },
       async (args) => {
@@ -272,7 +291,7 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
         logAssessment(name, args);
         const forwardArgs = applyDefaultsNoFocusSteal(
           name,
-          stripAssessmentClarification(a)
+          stripBusIdAssessmentClarification(a)
         );
         try {
           const result = await callChromeTool(name, forwardArgs);
@@ -304,13 +323,14 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
     const name = `kb__qmd_${qmdName.replace(/^qmd_/, "")}`;
     const baseSchema = tool.inputSchema ?? { type: "object", properties: {}, required: [] };
     const required = [...(baseSchema.required ?? [])];
+    if (!required.includes("bus_id")) required.push("bus_id");
     if (!required.includes("assessment")) required.push("assessment");
     if (!required.includes("clarification")) required.push("clarification");
 
     server.registerTool(
       name,
       {
-        description: (tool.description ?? `KB/QMD: ${qmdName}`) + " Always provide assessment and clarification.",
+        description: (tool.description ?? `KB/QMD: ${qmdName}`) + " Always provide bus_id, assessment and clarification.",
         inputSchema: buildKbToolInputSchema(baseSchema, required),
       },
       async (args) => {
@@ -318,12 +338,19 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
         logToolCall(name, args);
         logClarification(name, args);
         logAssessment(name, args);
-        let forwardArgs = stripAssessmentClarification(a);
+        let forwardArgs = stripBusIdAssessmentClarification(a);
         if (qmdName === "get" && typeof forwardArgs.file === "string") {
           const f = forwardArgs.file.trim();
           if (f && !f.startsWith("qmd://") && !f.startsWith("#")) {
-            // Pass path as-is: QMD stores actual filesystem paths (e.g. fred_smith.md), not handelized
             forwardArgs = { ...forwardArgs, file: `qmd://${f.replace(/^\/+/, "")}` };
+          }
+        }
+        if (qmdName === "multi_get" && typeof forwardArgs.pattern === "string") {
+          const p = forwardArgs.pattern.trim();
+          // QMD matchFilesByGlob matches against virtual_path (qmd://collection/path). Patterns like
+          // "lessons_learned/*.md" must be prefixed with qmd:// to match.
+          if (p && !p.startsWith("qmd://") && !p.includes(",")) {
+            forwardArgs = { ...forwardArgs, pattern: `qmd://${p.replace(/^\/+/, "")}` };
           }
         }
         try {
@@ -340,13 +367,14 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
     );
   }
 
-  const KB_BASE = new Set(["assessment", "clarification"]);
+  const KB_BASE = new Set(["bus_id", "assessment", "clarification"]);
 
   server.registerTool(
     "kb__write",
     {
       description: "Create or overwrite a .md or .qmd file in the knowledge base. Requires collection (created if missing). Path is relative to collection root.",
       inputSchema: z.object({
+        bus_id: BUS_ID_PARAM,
         collection: z.string().describe("Collection name (e.g. lessons_learned, identity). Created if missing."),
         path: z.string().describe("Path relative to collection e.g. file.md or subfolder/note.md"),
         content: z.string().describe("File content"),
@@ -386,6 +414,7 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
     {
       description: "Delete a .md or .qmd file from the knowledge base. Requires collection. Path is relative to collection root.",
       inputSchema: z.object({
+        bus_id: BUS_ID_PARAM,
         collection: z.string().describe("Collection name (e.g. lessons_learned, identity)"),
         path: z.string().describe("Path relative to collection e.g. file.md or subfolder/note.md"),
         assessment: ASSESSMENT_PARAM,
@@ -423,6 +452,7 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
     {
       description: "List files and folders in a collection. Path is relative to collection root.",
       inputSchema: z.object({
+        bus_id: BUS_ID_PARAM,
         collection: z.string().describe("Collection name (e.g. lessons_learned, identity)"),
         path: z.string().optional().default("").describe("Path relative to collection, empty for root"),
         assessment: ASSESSMENT_PARAM,
@@ -459,6 +489,7 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
     {
       description: "Add a collection to the KB index. Creates folder if needed. subpath is relative to ~/yaaia/kb.",
       inputSchema: z.object({
+        bus_id: BUS_ID_PARAM,
         name: z.string().describe("Collection name"),
         subpath: z.string().optional().describe("Path under ~/yaaia/kb (default: name)"),
         assessment: ASSESSMENT_PARAM,
@@ -492,7 +523,7 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
     "kb__qmd_collection_list",
     {
       description: "List all KB collections.",
-      inputSchema: z.object({ assessment: ASSESSMENT_PARAM, clarification: CLARIFICATION_PARAM }),
+      inputSchema: z.object({ bus_id: BUS_ID_PARAM, assessment: ASSESSMENT_PARAM, clarification: CLARIFICATION_PARAM }),
     },
     async (args) => {
       logToolCall("kb__qmd_collection_list", args);
@@ -520,6 +551,7 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
     {
       description: "Remove a collection from the KB index.",
       inputSchema: z.object({
+        bus_id: BUS_ID_PARAM,
         name: z.string().describe("Collection name"),
         assessment: ASSESSMENT_PARAM,
         clarification: CLARIFICATION_PARAM,
@@ -552,7 +584,7 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
     "kb__qmd_update",
     {
       description: "Run qmd update to re-index the knowledge base.",
-      inputSchema: z.object({ assessment: ASSESSMENT_PARAM, clarification: CLARIFICATION_PARAM }),
+      inputSchema: z.object({ bus_id: BUS_ID_PARAM, assessment: ASSESSMENT_PARAM, clarification: CLARIFICATION_PARAM }),
     },
     async (args) => {
       logToolCall("kb__qmd_update", args);
@@ -579,7 +611,7 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
     "kb__qmd_embed",
     {
       description: "Run qmd embed to update vector embeddings.",
-      inputSchema: z.object({ assessment: ASSESSMENT_PARAM, clarification: CLARIFICATION_PARAM }),
+      inputSchema: z.object({ bus_id: BUS_ID_PARAM, assessment: ASSESSMENT_PARAM, clarification: CLARIFICATION_PARAM }),
     },
     async (args) => {
       logToolCall("kb__qmd_embed", args);
@@ -603,10 +635,324 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
   );
 
   server.registerTool(
+    "send_message",
+    {
+      description:
+        "Send a message to a bus. STRICTLY REQUIRED: Use this for every reply. Plain text output is forbidden—only send_message delivers messages. bus_id: root for desktop chat, telegram-{peer_id} for Telegram. wait_for_answer: if true, blocks until user replies (60s timeout). Use for approval, confirmation, or choices.",
+      inputSchema: z.object({
+        bus_id: BUS_ID_PARAM,
+        content: z.string().describe("Message content to send"),
+        wait_for_answer: z.boolean().optional().default(false).describe("If true, block until user replies (60s timeout). Use for approval/confirmation."),
+        assessment: ASSESSMENT_PARAM,
+        clarification: CLARIFICATION_PARAM,
+      }),
+    },
+    async (args) => {
+      const a = args as { bus_id?: string; content?: string; wait_for_answer?: boolean };
+      logToolCall("send_message", args);
+      const unknownMsg = validateUnknownParams("send_message", args, new Set(["bus_id", "content", "wait_for_answer", "assessment", "clarification"]));
+      if (unknownMsg) {
+        recipeStore.appendToolCall("send_message", args, unknownMsg);
+        return toolResult(unknownMsg);
+      }
+      const busId = String(a.bus_id ?? "").trim();
+      const content = String(a.content ?? "").trim();
+      const waitForAnswer = a.wait_for_answer === true;
+      if (!busId) {
+        recipeStore.appendToolCall("send_message", args, "bus_id is required");
+        return toolResult("Error: bus_id is required");
+      }
+      logClarification("send_message", args);
+      logAssessment("send_message", args);
+      if (waitForAnswer && busId !== ROOT_BUS_ID && !busId.startsWith("telegram-")) {
+        recipeStore.appendToolCall("send_message", args, "wait_for_answer only supports root or telegram-* buses");
+        return toolResult("Error: wait_for_answer only supports bus_id=root or telegram-{peer_id}.");
+      }
+      ensureBus(busId);
+      appendToBusHistory(busId, { role: "assistant", content });
+      if (busId !== ROOT_BUS_ID) {
+        appendToBusHistory(ROOT_BUS_ID, { role: "assistant", content, bus_id: busId });
+      }
+      const displayText = `[${busId}] ${content}`;
+      config.onSendMessage?.(busId);
+      if (busId === ROOT_BUS_ID) {
+        config.onSendMessageToRoot?.(content);
+        if (!waitForAnswer) recipeStore.setPendingReportFromSendMessage(content);
+      }
+      if (busId.startsWith("telegram-")) {
+        try {
+          await config.onSendMessageToTelegram?.(busId, content);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          recipeStore.appendToolCall("send_message", args, msg);
+          return toolResult(`Error sending to ${busId}: ${msg}`);
+        }
+      }
+      if (waitForAnswer) {
+        if (busId === ROOT_BUS_ID) {
+          config.onAskUserRequest?.({ clarification: content, assessment: "", attempt: 0 });
+        }
+        const reply = await waitForUserReply({
+          timeoutMs: 60_000,
+          onTimeout: config.onAskUserTimeout,
+          busId: busId !== ROOT_BUS_ID ? busId : undefined,
+        });
+        recipeStore.appendToolCall("send_message", args, reply);
+        return toolResult(reply);
+      }
+      if (busId === ROOT_BUS_ID) {
+        recipeStore.appendToolCall("send_message", args, displayText);
+        return toolResult(displayText);
+      }
+      recipeStore.appendToolCall("send_message", args, displayText);
+      return toolResult(displayText);
+    }
+  );
+
+  server.registerTool(
+    "list_buses",
+    {
+      description: "List all known message buses with their descriptions.",
+      inputSchema: z.object({
+        bus_id: BUS_ID_PARAM,
+        assessment: ASSESSMENT_PARAM,
+        clarification: CLARIFICATION_PARAM,
+      }),
+    },
+    async (args) => {
+      logToolCall("list_buses", args);
+      const unknownMsg = validateUnknownParams("list_buses", args, new Set(["bus_id", "assessment", "clarification"]));
+      if (unknownMsg) {
+        recipeStore.appendToolCall("list_buses", args, unknownMsg);
+        return toolResult(unknownMsg);
+      }
+      logClarification("list_buses", args);
+      logAssessment("list_buses", args);
+      const buses = listBuses();
+      const resultText = JSON.stringify(buses);
+      recipeStore.appendToolCall("list_buses", args, resultText);
+      return toolResult(resultText);
+    }
+  );
+
+  server.registerTool(
+    "get_bus_history",
+    {
+      description:
+        "Get conversation history for a bus. Use limit and offset for slices. offset=0, limit=N = last N; offset>0 = from start; offset<0 = from end. Call when you need more context.",
+      inputSchema: z.object({
+        bus_id: BUS_ID_PARAM,
+        assessment: ASSESSMENT_PARAM,
+        clarification: CLARIFICATION_PARAM,
+        limit: z.number().optional().default(50).describe("Max messages to return (default 50)."),
+        offset: z.number().optional().default(0).describe("Skip first N (0) or from end if negative (e.g. -20 for last 20)."),
+      }),
+    },
+    async (args) => {
+      const a = args as { bus_id?: string; limit?: number; offset?: number };
+      logToolCall("get_bus_history", args);
+      const unknownMsg = validateUnknownParams("get_bus_history", args, new Set(["bus_id", "assessment", "clarification", "limit", "offset"]));
+      if (unknownMsg) {
+        recipeStore.appendToolCall("get_bus_history", args, unknownMsg);
+        return toolResult(unknownMsg);
+      }
+      const busId = String(a.bus_id ?? "").trim();
+      const limit = Math.min(Math.max(0, Number(a.limit) || 50), 200);
+      const offset = Number(a.offset) || 0;
+      if (!busId) {
+        recipeStore.appendToolCall("get_bus_history", args, "bus_id is required");
+        return toolResult("Error: bus_id is required");
+      }
+      logClarification("get_bus_history", args);
+      logAssessment("get_bus_history", args);
+      const sliced = getBusHistorySlice(busId, limit, offset);
+      const resultText = JSON.stringify(sliced);
+      recipeStore.appendToolCall("get_bus_history", args, `Returned ${sliced.length} messages`);
+      return toolResult(resultText);
+    }
+  );
+
+  server.registerTool(
+    "telegram_connect",
+    {
+      description:
+        "Connect to Telegram as a user. Use when you want to receive/send messages via Telegram. Requires phone (mandatory). On success returns bus listings. Root is the unified context; use get_bus_history(bus_id, ..., limit, offset) for slices when you need more context.",
+      inputSchema: z.object({
+        bus_id: BUS_ID_PARAM,
+        phone: z.string().describe("Phone number in international format (e.g. +1234567890). Mandatory."),
+        assessment: ASSESSMENT_PARAM,
+        clarification: CLARIFICATION_PARAM,
+      }),
+    },
+    async (args) => {
+      const a = args as { phone?: string };
+      logToolCall("telegram_connect", args);
+      const unknownMsg = validateUnknownParams("telegram_connect", args, new Set(["bus_id", "phone", "assessment", "clarification"]));
+      if (unknownMsg) {
+        recipeStore.appendToolCall("telegram_connect", args, unknownMsg);
+        return toolResult(unknownMsg);
+      }
+      const phone = String(a.phone ?? "").trim();
+      if (!phone) {
+        recipeStore.appendToolCall("telegram_connect", args, "phone is required");
+        return toolResult("Error: phone is required.");
+      }
+      logClarification("telegram_connect", args);
+      logAssessment("telegram_connect", args);
+      try {
+        const result = await config.onTelegramConnect?.(phone);
+        if (!result) {
+          recipeStore.appendToolCall("telegram_connect", args, "Telegram connect not available");
+          return toolResult("Error: Telegram connect not available.");
+        }
+        if (!result.ok) {
+          recipeStore.appendToolCall("telegram_connect", args, result.error ?? "Unknown error");
+          return toolResult(`Error: ${result.error ?? "Unknown error"}`);
+        }
+        const buses = result.buses ?? [];
+        const instruction = result.instruction ?? "If you need conversation history for a bus, call get_bus_history(bus_id, assessment, clarification, limit).";
+        const out = `Connected. Buses: ${JSON.stringify(buses)}. ${instruction}`;
+        recipeStore.appendToolCall("telegram_connect", args, "Connected");
+        return toolResult(out);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        recipeStore.appendToolCall("telegram_connect", args, msg);
+        return toolResult(`Error: ${msg}`);
+      }
+    }
+  );
+
+  server.registerTool(
+    "telegram_search",
+    {
+      description:
+        "Resolve a Telegram username to bus_id. Use when you need to message a user/channel by username (e.g. @durov or durov). Requires Telegram to be connected. Returns bus_id for send_message.",
+      inputSchema: z.object({
+        bus_id: BUS_ID_PARAM,
+        username: z.string().describe("Telegram username with or without @ (e.g. durov or @durov)"),
+        assessment: ASSESSMENT_PARAM,
+        clarification: CLARIFICATION_PARAM,
+      }),
+    },
+    async (args) => {
+      const a = args as { username?: string };
+      logToolCall("telegram_search", args);
+      const unknownMsg = validateUnknownParams("telegram_search", args, new Set(["bus_id", "username", "assessment", "clarification"]));
+      if (unknownMsg) {
+        recipeStore.appendToolCall("telegram_search", args, unknownMsg);
+        return toolResult(unknownMsg);
+      }
+      const username = String(a.username ?? "").trim();
+      if (!username) {
+        recipeStore.appendToolCall("telegram_search", args, "username is required");
+        return toolResult("Error: username is required (e.g. durov or @durov).");
+      }
+      logClarification("telegram_search", args);
+      logAssessment("telegram_search", args);
+      try {
+        const result = await config.onTelegramSearch?.(username);
+        if (!result) {
+          recipeStore.appendToolCall("telegram_search", args, "Telegram search not available");
+          return toolResult("Error: Telegram not connected. Call telegram_connect first.");
+        }
+        const out = JSON.stringify(result);
+        recipeStore.appendToolCall("telegram_search", args, out);
+        return toolResult(out);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        recipeStore.appendToolCall("telegram_search", args, msg);
+        return toolResult(`Error: ${msg}`);
+      }
+    }
+  );
+
+  server.registerTool(
+    "set_mb_properties",
+    {
+      description: "Set or update properties for a message bus (description, trust_level). trust_level: normal (default) or root. Root-trusted bus messages are wrapped in session tag for model.",
+      inputSchema: z.object({
+        bus_id: BUS_ID_PARAM,
+        mb_id: z.string().describe("Message bus id (same as bus_id)"),
+        description: z.string().optional().describe("Description for the bus"),
+        trust_level: z.enum(["normal", "root"]).optional().describe("Trust level: normal (default) or root. Root = wrap messages in session tag."),
+        assessment: ASSESSMENT_PARAM,
+        clarification: CLARIFICATION_PARAM,
+      }),
+    },
+    async (args) => {
+      const a = args as { mb_id?: string; description?: string; trust_level?: "normal" | "root" };
+      logToolCall("set_mb_properties", args);
+      const unknownMsg = validateUnknownParams("set_mb_properties", args, new Set(["bus_id", "mb_id", "description", "trust_level", "assessment", "clarification"]));
+      if (unknownMsg) {
+        recipeStore.appendToolCall("set_mb_properties", args, unknownMsg);
+        return toolResult(unknownMsg);
+      }
+      const mbId = String(a.mb_id ?? a.bus_id ?? "").trim();
+      if (!mbId) {
+        recipeStore.appendToolCall("set_mb_properties", args, "mb_id is required");
+        return toolResult("Error: mb_id is required");
+      }
+      logClarification("set_mb_properties", args);
+      logAssessment("set_mb_properties", args);
+      try {
+        const props: { description?: string; trust_level?: "normal" | "root" } = {};
+        if (a.description !== undefined) props.description = String(a.description).trim();
+        if (a.trust_level !== undefined) props.trust_level = a.trust_level;
+        setBusProperties(mbId, props);
+        recipeStore.appendToolCall("set_mb_properties", args, `Properties set for ${mbId}`);
+        return toolResult(`Properties set for ${mbId}.`);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        recipeStore.appendToolCall("set_mb_properties", args, msg);
+        return toolResult(`Error: ${msg}`);
+      }
+    }
+  );
+
+  server.registerTool(
+    "delete_bus",
+    {
+      description: "Delete a message bus and its history. Root bus cannot be deleted.",
+      inputSchema: z.object({
+        bus_id: BUS_ID_PARAM,
+        mb_id: z.string().describe("Message bus id to delete"),
+        assessment: ASSESSMENT_PARAM,
+        clarification: CLARIFICATION_PARAM,
+      }),
+    },
+    async (args) => {
+      const a = args as { mb_id?: string };
+      logToolCall("delete_bus", args);
+      const unknownMsg = validateUnknownParams("delete_bus", args, new Set(["bus_id", "mb_id", "assessment", "clarification"]));
+      if (unknownMsg) {
+        recipeStore.appendToolCall("delete_bus", args, unknownMsg);
+        return toolResult(unknownMsg);
+      }
+      const mbId = String(a.mb_id ?? "").trim();
+      if (!mbId) {
+        recipeStore.appendToolCall("delete_bus", args, "mb_id is required");
+        return toolResult("Error: mb_id is required");
+      }
+      logClarification("delete_bus", args);
+      logAssessment("delete_bus", args);
+      try {
+        deleteBus(mbId);
+        recipeStore.appendToolCall("delete_bus", args, `Bus ${mbId} deleted`);
+        return toolResult(`Bus ${mbId} deleted.`);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        recipeStore.appendToolCall("delete_bus", args, msg);
+        return toolResult(`Error: ${msg}`);
+      }
+    }
+  );
+
+  server.registerTool(
     "start_task",
     {
       description: "Start a task. Call at the beginning of a new task.",
       inputSchema: z.object({
+        bus_id: BUS_ID_PARAM,
         summary: z.string().describe("Short task summary/name"),
         assessment: ASSESSMENT_PARAM,
         clarification: CLARIFICATION_PARAM,
@@ -614,16 +960,17 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
     },
     async (args) => {
       logToolCall("start_task", args);
-      const unknownMsg = validateUnknownParams("start_task", args, new Set(["summary", "assessment", "clarification"]));
+      const unknownMsg = validateUnknownParams("start_task", args, new Set(["bus_id", "summary", "assessment", "clarification"]));
       if (unknownMsg) {
         recipeStore.appendToolCall("start_task", args, unknownMsg);
         return toolResult(unknownMsg);
       }
       const summary = typeof (args as { summary?: string }).summary === "string" ? (args as { summary: string }).summary : "";
       const assessment = typeof (args as { assessment?: string }).assessment === "string" ? (args as { assessment: string }).assessment : "";
+      const busId = String((args as { bus_id?: string }).bus_id ?? "").trim();
       logClarification("start_task", args);
       logAssessment("start_task", args);
-      recipeStore.initFromStartTask(summary, assessment);
+      recipeStore.initFromStartTask(summary, assessment, busId);
       config.onStartTask?.({ summary });
       return toolResult("Task started.");
     }
@@ -632,8 +979,9 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
   server.registerTool(
     "finalize_task",
     {
-      description: "Mandatory when task is complete. Call before ending. is_successful (true/false) is mandatory. After calling, you may send one optional message as the detailed report.",
+      description: "Mandatory when task is complete. Call before ending. is_successful (true/false) is mandatory. After calling, you may send_message as the detailed report if necessary.",
       inputSchema: z.object({
+        bus_id: BUS_ID_PARAM,
         assessment: ASSESSMENT_PARAM,
         clarification: CLARIFICATION_PARAM,
         is_successful: z.boolean().describe("Whether the task completed successfully. Mandatory."),
@@ -641,7 +989,7 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
     },
     async (args) => {
       logToolCall("finalize_task", args);
-      const unknownMsg = validateUnknownParams("finalize_task", args, new Set(["assessment", "clarification", "is_successful"]));
+      const unknownMsg = validateUnknownParams("finalize_task", args, new Set(["bus_id", "assessment", "clarification", "is_successful"]));
       if (unknownMsg) {
         recipeStore.appendToolCall("finalize_task", args, unknownMsg);
         return toolResult(unknownMsg);
@@ -657,53 +1005,35 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
             : true;
       logClarification("finalize_task", args);
       logAssessment("finalize_task", args);
+      const taskBusId = recipeStore.getTaskBusId();
       recipeStore.finalize(is_successful, assessment, clarification);
-      return toolResult("Task finalized. You may send one optional message as the detailed report.");
+      if (taskBusId && taskBusId.startsWith("telegram-") && getBusTrustLevel(taskBusId) === "root") {
+        const status = is_successful ? "✅ Task completed successfully" : "❌ Task did not complete successfully";
+        const parts: string[] = [status];
+        if (assessment) parts.push(`**Assessment:** ${assessment}`);
+        if (clarification) parts.push(`**Clarification:** ${clarification}`);
+        try {
+          await config.onSendMessageToTelegram?.(taskBusId, parts.join("\n\n"));
+        } catch (err) {
+          console.warn("[YAAIA] Forward finalize to trusted bus failed:", err);
+        }
+      }
+      return toolResult("Task finalized. Write \"Done.\"");
     }
   );
 
-  server.registerTool(
-    "ask_user",
-    {
-      description: "Ask the user for input. Opens popup with 60-second countdown. Use attempt (0–2) when retrying.",
-      inputSchema: z.object({
-        assessment: ASSESSMENT_PARAM,
-        clarification: CLARIFICATION_PARAM,
-        attempt: z.number().optional().default(0).describe("Retry attempt (0–2). Default 0."),
-      }),
-    },
-    async (args) => {
-      logToolCall("ask_user", args);
-      const unknownMsg = validateUnknownParams("ask_user", args, new Set(["assessment", "clarification", "attempt"]));
-      if (unknownMsg) {
-        recipeStore.appendToolCall("ask_user", args, unknownMsg);
-        return toolResult(unknownMsg);
-      }
-      const assessment = typeof (args as { assessment?: string }).assessment === "string" ? (args as { assessment: string }).assessment : "";
-      const clarification = typeof (args as { clarification?: string }).clarification === "string" ? (args as { clarification: string }).clarification : "";
-      const attempt = typeof (args as { attempt?: number }).attempt === "number" ? (args as { attempt: number }).attempt : 0;
-      logClarification("ask_user", args);
-      logAssessment("ask_user", args);
-      config.onAskUserRequest?.({ clarification, assessment, attempt });
-      const reply = await waitForUserReply({
-        timeoutMs: 60_000,
-        onTimeout: config.onAskUserTimeout,
-      });
-      recipeStore.appendToolCall("ask_user", args, reply);
-      return toolResult(reply);
-    }
-  );
+  const TOOL_BASE = new Set(["bus_id", "assessment", "clarification"]);
 
   server.registerTool(
     "secrets_list",
     {
       description:
         "List all secrets. Returns JSON array of {id, detailed_description, first_factor, first_factor_type, has_totp}.",
-      inputSchema: z.object({ assessment: ASSESSMENT_PARAM, clarification: CLARIFICATION_PARAM }),
+      inputSchema: z.object({ bus_id: BUS_ID_PARAM, assessment: ASSESSMENT_PARAM, clarification: CLARIFICATION_PARAM }),
     },
     async (args) => {
       logToolCall("secrets_list", args);
-      const unknownMsg = validateUnknownParams("secrets_list", args, new Set(["assessment", "clarification"]));
+      const unknownMsg = validateUnknownParams("secrets_list", args, TOOL_BASE);
       if (unknownMsg) {
         recipeStore.appendToolCall("secrets_list", args, unknownMsg);
         return toolResult(unknownMsg);
@@ -723,6 +1053,7 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
       description:
         "Get a secret value by id (UUID). If TOTP seed is configured, returns JSON with value, totp_code, and totp_expires_in_seconds.",
       inputSchema: z.object({
+        bus_id: BUS_ID_PARAM,
         id: z.string().describe("Secret id from secrets_list"),
         assessment: ASSESSMENT_PARAM,
         clarification: CLARIFICATION_PARAM,
@@ -730,7 +1061,7 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
     },
     async (args) => {
       logToolCall("secrets_get", args);
-      const unknownMsg = validateUnknownParams("secrets_get", args, new Set(["id", "assessment", "clarification"]));
+      const unknownMsg = validateUnknownParams("secrets_get", args, new Set([...TOOL_BASE, "id"]));
       if (unknownMsg) {
         recipeStore.appendToolCall("secrets_get", args, unknownMsg);
         return toolResult(unknownMsg);
@@ -756,6 +1087,7 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
       description:
         "Set a secret. Use force=true to overwrite. Optional totp_secret: Base32 TOTP seed for 2FA code generation.",
       inputSchema: z.object({
+        bus_id: BUS_ID_PARAM,
         detailed_description: z.string(),
         first_factor: z.string(),
         first_factor_type: z.string(),
@@ -768,16 +1100,7 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
     },
     async (args) => {
       logToolCall("secrets_set", args);
-      const allowed = new Set([
-        "detailed_description",
-        "first_factor",
-        "first_factor_type",
-        "value",
-        "totp_secret",
-        "assessment",
-        "clarification",
-        "force",
-      ]);
+      const allowed = new Set([...TOOL_BASE, "detailed_description", "first_factor", "first_factor_type", "value", "totp_secret", "force"]);
       const unknownMsg = validateUnknownParams("secrets_set", args, allowed);
       if (unknownMsg) {
         recipeStore.appendToolCall("secrets_set", args, unknownMsg);
@@ -806,6 +1129,7 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
     {
       description: "Delete a secret by id.",
       inputSchema: z.object({
+        bus_id: BUS_ID_PARAM,
         id: z.string(),
         assessment: ASSESSMENT_PARAM,
         clarification: CLARIFICATION_PARAM,
@@ -813,7 +1137,7 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
     },
     async (args) => {
       logToolCall("secrets_delete", args);
-      const unknownMsg = validateUnknownParams("secrets_delete", args, new Set(["id", "assessment", "clarification"]));
+      const unknownMsg = validateUnknownParams("secrets_delete", args, new Set([...TOOL_BASE, "id"]));
       if (unknownMsg) {
         recipeStore.appendToolCall("secrets_delete", args, unknownMsg);
         return toolResult(unknownMsg);
@@ -831,11 +1155,11 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
     "config_list",
     {
       description: "List all agent config entries.",
-      inputSchema: z.object({ assessment: ASSESSMENT_PARAM, clarification: CLARIFICATION_PARAM }),
+      inputSchema: z.object({ bus_id: BUS_ID_PARAM, assessment: ASSESSMENT_PARAM, clarification: CLARIFICATION_PARAM }),
     },
     async (args) => {
       logToolCall("config_list", args);
-      const unknownMsg = validateUnknownParams("config_list", args, new Set(["assessment", "clarification"]));
+      const unknownMsg = validateUnknownParams("config_list", args, TOOL_BASE);
       if (unknownMsg) {
         recipeStore.appendToolCall("config_list", args, unknownMsg);
         return toolResult(unknownMsg);
@@ -854,6 +1178,7 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
     {
       description: "Set agent config. Use force=true to overwrite.",
       inputSchema: z.object({
+        bus_id: BUS_ID_PARAM,
         detailed_description: z.string(),
         value: z.string(),
         assessment: ASSESSMENT_PARAM,
@@ -863,7 +1188,7 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
     },
     async (args) => {
       logToolCall("config_set", args);
-      const allowed = new Set(["detailed_description", "value", "assessment", "clarification", "force"]);
+      const allowed = new Set([...TOOL_BASE, "detailed_description", "value", "force"]);
       const unknownMsg = validateUnknownParams("config_set", args, allowed);
       if (unknownMsg) {
         recipeStore.appendToolCall("config_set", args, unknownMsg);
@@ -884,6 +1209,7 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
     {
       description: "Delete agent config by id.",
       inputSchema: z.object({
+        bus_id: BUS_ID_PARAM,
         id: z.string(),
         assessment: ASSESSMENT_PARAM,
         clarification: CLARIFICATION_PARAM,
@@ -891,7 +1217,7 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
     },
     async (args) => {
       logToolCall("config_delete", args);
-      const unknownMsg = validateUnknownParams("config_delete", args, new Set(["id", "assessment", "clarification"]));
+      const unknownMsg = validateUnknownParams("config_delete", args, new Set([...TOOL_BASE, "id"]));
       if (unknownMsg) {
         recipeStore.appendToolCall("config_delete", args, unknownMsg);
         return toolResult(unknownMsg);
@@ -906,13 +1232,14 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
   );
 
   // --- Mail (IMAP) tools ---
-  const MAIL_BASE = new Set(["assessment", "clarification"]);
+  const MAIL_BASE = new Set([...TOOL_BASE]);
 
   server.registerTool(
     "mail__connect",
     {
       description: "Connect to IMAP server. Explicit params: host, port, user, pass. secure=true by default.",
       inputSchema: z.object({
+        bus_id: BUS_ID_PARAM,
         host: z.string(),
         port: z.number(),
         user: z.string(),
@@ -949,7 +1276,7 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
     "mail__disconnect",
     {
       description: "Disconnect from IMAP server.",
-      inputSchema: z.object({ assessment: ASSESSMENT_PARAM, clarification: CLARIFICATION_PARAM }),
+      inputSchema: z.object({ bus_id: BUS_ID_PARAM, assessment: ASSESSMENT_PARAM, clarification: CLARIFICATION_PARAM }),
     },
     async (args) => {
       logToolCall("mail__disconnect", args);
@@ -971,6 +1298,7 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
     {
       description: "List mailboxes. Optional statusQuery JSON: {messages, unseen, uidNext, uidValidity, recent, highestModseq}.",
       inputSchema: z.object({
+        bus_id: BUS_ID_PARAM,
         statusQuery: z.string().optional().describe("JSON object e.g. {\"messages\":true,\"unseen\":true}"),
         assessment: ASSESSMENT_PARAM,
         clarification: CLARIFICATION_PARAM,
@@ -1006,7 +1334,7 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
     "mail__list_tree",
     {
       description: "List mailboxes as tree structure.",
-      inputSchema: z.object({ assessment: ASSESSMENT_PARAM, clarification: CLARIFICATION_PARAM }),
+      inputSchema: z.object({ bus_id: BUS_ID_PARAM, assessment: ASSESSMENT_PARAM, clarification: CLARIFICATION_PARAM }),
     },
     async (args) => {
       logToolCall("mail__list_tree", args);
@@ -1035,6 +1363,7 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
     {
       description: "Open/select a mailbox. Use as current mailbox for subsequent operations.",
       inputSchema: z.object({
+        bus_id: BUS_ID_PARAM,
         path: z.string(),
         readOnly: z.boolean().optional().default(false),
         assessment: ASSESSMENT_PARAM,
@@ -1068,7 +1397,7 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
     "mail__mailbox_close",
     {
       description: "Close the currently open mailbox.",
-      inputSchema: z.object({ assessment: ASSESSMENT_PARAM, clarification: CLARIFICATION_PARAM }),
+      inputSchema: z.object({ bus_id: BUS_ID_PARAM, assessment: ASSESSMENT_PARAM, clarification: CLARIFICATION_PARAM }),
     },
     async (args) => {
       logToolCall("mail__mailbox_close", args);
@@ -1096,6 +1425,7 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
     {
       description: "Create a new mailbox.",
       inputSchema: z.object({
+        bus_id: BUS_ID_PARAM,
         path: z.string(),
         assessment: ASSESSMENT_PARAM,
         clarification: CLARIFICATION_PARAM,
@@ -1130,6 +1460,7 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
     {
       description: "Rename a mailbox.",
       inputSchema: z.object({
+        bus_id: BUS_ID_PARAM,
         oldPath: z.string(),
         newPath: z.string(),
         assessment: ASSESSMENT_PARAM,
@@ -1164,6 +1495,7 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
     {
       description: "Delete a mailbox and all its messages.",
       inputSchema: z.object({
+        bus_id: BUS_ID_PARAM,
         path: z.string(),
         assessment: ASSESSMENT_PARAM,
         clarification: CLARIFICATION_PARAM,
@@ -1197,6 +1529,7 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
     {
       description: "Subscribe to a mailbox.",
       inputSchema: z.object({
+        bus_id: BUS_ID_PARAM,
         path: z.string(),
         assessment: ASSESSMENT_PARAM,
         clarification: CLARIFICATION_PARAM,
@@ -1230,6 +1563,7 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
     {
       description: "Unsubscribe from a mailbox.",
       inputSchema: z.object({
+        bus_id: BUS_ID_PARAM,
         path: z.string(),
         assessment: ASSESSMENT_PARAM,
         clarification: CLARIFICATION_PARAM,
@@ -1263,6 +1597,7 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
     {
       description: "Get mailbox status without selecting. query JSON: {messages, unseen, uidNext, uidValidity, recent, highestModseq}.",
       inputSchema: z.object({
+        bus_id: BUS_ID_PARAM,
         path: z.string(),
         query: z.string().describe("JSON e.g. {\"messages\":true,\"unseen\":true}"),
         assessment: ASSESSMENT_PARAM,
@@ -1298,6 +1633,7 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
     {
       description: "Get quota for a mailbox.",
       inputSchema: z.object({
+        bus_id: BUS_ID_PARAM,
         path: z.string(),
         assessment: ASSESSMENT_PARAM,
         clarification: CLARIFICATION_PARAM,
@@ -1332,6 +1668,7 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
     {
       description: "Fetch messages. range: '1:*', '1:10', etc. query JSON: {envelope, flags, source, bodyStructure}. mailbox optional if already open.",
       inputSchema: z.object({
+        bus_id: BUS_ID_PARAM,
         range: z.string(),
         query: z.string().default("{\"envelope\":true,\"flags\":true}"),
         uid: z.boolean().optional().default(true),
@@ -1370,6 +1707,7 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
     {
       description: "Fetch a single message. seq: '*' for latest, or number. query JSON. mailbox optional.",
       inputSchema: z.object({
+        bus_id: BUS_ID_PARAM,
         seq: z.string(),
         query: z.string().default("{\"envelope\":true,\"flags\":true,\"source\":true}"),
         uid: z.boolean().optional().default(true),
@@ -1408,6 +1746,7 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
     {
       description: "Download message or body part. Saves to ~/Downloads. part: body part ID (e.g. '1', '2') or omit for full message.",
       inputSchema: z.object({
+        bus_id: BUS_ID_PARAM,
         range: z.string(),
         part: z.string().optional().default(""),
         uid: z.boolean().optional().default(true),
@@ -1444,6 +1783,7 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
     {
       description: "Search messages. query JSON: {seen:false}, {from:'x'}, {or:[{a:1},{b:2}]}, {gmraw:'...'} for Gmail. Returns UIDs.",
       inputSchema: z.object({
+        bus_id: BUS_ID_PARAM,
         query: z.string(),
         uid: z.boolean().optional().default(true),
         mailbox: z.string().optional(),
@@ -1481,6 +1821,7 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
     {
       description: "Delete messages. mailbox optional if already open.",
       inputSchema: z.object({
+        bus_id: BUS_ID_PARAM,
         range: z.string(),
         uid: z.boolean().optional().default(true),
         mailbox: z.string().optional(),
@@ -1517,6 +1858,7 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
     {
       description: "Copy messages to another mailbox.",
       inputSchema: z.object({
+        bus_id: BUS_ID_PARAM,
         range: z.string(),
         destination: z.string(),
         uid: z.boolean().optional().default(true),
@@ -1555,6 +1897,7 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
     {
       description: "Move messages to another mailbox.",
       inputSchema: z.object({
+        bus_id: BUS_ID_PARAM,
         range: z.string(),
         destination: z.string(),
         uid: z.boolean().optional().default(true),
@@ -1592,6 +1935,7 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
     {
       description: "Add flags to messages. flags: ['\\\\Seen'], ['\\\\Flagged'], etc.",
       inputSchema: z.object({
+        bus_id: BUS_ID_PARAM,
         range: z.string(),
         flags: z.string().describe("JSON array e.g. [\"\\\\Seen\"]"),
         uid: z.boolean().optional().default(true),
@@ -1629,6 +1973,7 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
     {
       description: "Remove flags from messages.",
       inputSchema: z.object({
+        bus_id: BUS_ID_PARAM,
         range: z.string(),
         flags: z.string(),
         uid: z.boolean().optional().default(true),
@@ -1666,6 +2011,7 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
     {
       description: "Set exact flags for messages (replaces existing).",
       inputSchema: z.object({
+        bus_id: BUS_ID_PARAM,
         range: z.string(),
         flags: z.string(),
         uid: z.boolean().optional().default(true),
@@ -1703,6 +2049,7 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
     {
       description: "Set flag color. color: red, orange, yellow, green, blue, purple.",
       inputSchema: z.object({
+        bus_id: BUS_ID_PARAM,
         range: z.string(),
         color: z.string(),
         uid: z.boolean().optional().default(true),
@@ -1740,6 +2087,7 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
     {
       description: "Add Gmail labels to messages.",
       inputSchema: z.object({
+        bus_id: BUS_ID_PARAM,
         range: z.string(),
         labels: z.string(),
         uid: z.boolean().optional().default(true),
@@ -1777,6 +2125,7 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
     {
       description: "Remove Gmail labels from messages.",
       inputSchema: z.object({
+        bus_id: BUS_ID_PARAM,
         range: z.string(),
         labels: z.string(),
         uid: z.boolean().optional().default(true),
@@ -1814,6 +2163,7 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
     {
       description: "Set exact Gmail labels for messages.",
       inputSchema: z.object({
+        bus_id: BUS_ID_PARAM,
         range: z.string(),
         labels: z.string(),
         uid: z.boolean().optional().default(true),
@@ -1851,6 +2201,7 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
     {
       description: "Append a message to a mailbox. content: RFC822 format. flags optional.",
       inputSchema: z.object({
+        bus_id: BUS_ID_PARAM,
         path: z.string(),
         content: z.string(),
         flags: z.string().optional(),

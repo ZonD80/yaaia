@@ -8,6 +8,9 @@ export interface McpConfig {
   claudeModel: string;
   openrouterApiKey: string;
   openrouterModel: string;
+  telegramAppId: string;
+  telegramApiHash: string;
+  userName: string;
 }
 
 try {
@@ -15,8 +18,8 @@ try {
     getConfig: () => ipcRenderer.invoke("get-config"),
     startChat: (config: McpConfig) => ipcRenderer.invoke("start-chat", config),
     stopChat: () => ipcRenderer.invoke("stop-chat"),
-    agentSendMessage: (message: string, history?: { role: "user" | "assistant"; content: string }[]) =>
-      ipcRenderer.invoke("agent-send-message", message, history ?? []),
+    agentSendMessage: (message: string, history?: { role: "user" | "assistant"; content: string }[], busId?: string) =>
+      ipcRenderer.invoke("agent-send-message", message, history ?? [], busId),
     agentAbort: () => ipcRenderer.invoke("agent-abort"),
     askUserReply: (reply: string) => ipcRenderer.invoke("ask-user-reply", reply),
     askUserCancel: () => ipcRenderer.invoke("ask-user-cancel"),
@@ -41,6 +44,12 @@ try {
       ipcRenderer.invoke("agent-config-set", args),
     agentConfigDelete: (id: string) => ipcRenderer.invoke("agent-config-delete", id),
     wipeConfigs: () => ipcRenderer.invoke("wipe-configs"),
+    messageBusList: () => ipcRenderer.invoke("message-bus-list"),
+    messageBusSetDescription: (busId: string, description: string) =>
+      ipcRenderer.invoke("message-bus-set-description", busId, description),
+    messageBusDelete: (busId: string) => ipcRenderer.invoke("message-bus-delete", busId),
+    messageBusGetHistory: (busId: string) => ipcRenderer.invoke("message-bus-get-history", busId),
+    messageBusWipeRoot: () => ipcRenderer.invoke("message-bus-wipe-root"),
     kbList: (path?: string, recursive?: boolean) => ipcRenderer.invoke("kb-list", path ?? ".", recursive ?? true),
     kbRead: (path: string) => ipcRenderer.invoke("kb-read", path),
     kbWrite: (path: string, content: string) => ipcRenderer.invoke("kb-write", path, content),
@@ -86,6 +95,22 @@ try {
       ipcRenderer.on("startup-progress-reset", fn);
       return () => ipcRenderer.removeListener("startup-progress-reset", fn);
     },
+    onAgentMessage: (callback: (content: string) => void) => {
+      const fn = (_: unknown, content: string) => callback(content);
+      ipcRenderer.on("agent-message", fn);
+      return () => ipcRenderer.removeListener("agent-message", fn);
+    },
+    onTelegramMessage: (callback: (payload: { bus_id: string; user_id: number; user_name: string; content: string }) => void) => {
+      const fn = (_: unknown, payload: { bus_id: string; user_id: number; user_name: string; content: string }) => callback(payload);
+      ipcRenderer.on("telegram-message", fn);
+      return () => ipcRenderer.removeListener("telegram-message", fn);
+    },
+    onTelegramLoginRequest: (callback: (info: { step: "phone" | "code" | "password" }) => void) => {
+      const fn = (_: unknown, info: { step: "phone" | "code" | "password" }) => callback(info);
+      ipcRenderer.on("telegram-login-request", fn);
+      return () => ipcRenderer.removeListener("telegram-login-request", fn);
+    },
+    telegramLoginReply: (value: string) => ipcRenderer.invoke("telegram-login-reply", value),
   });
 } catch (err) {
   console.error("[YAAIA preload] Failed to expose electronAPI:", err);

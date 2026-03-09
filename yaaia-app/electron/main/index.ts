@@ -11,8 +11,17 @@ import { platform } from "node:os";
 import { randomBytes } from "node:crypto";
 import type { Server } from "node:http";
 import { startMcpServer, getMcpServerPort, stopChromeMcp, stopKbMcp, stopMailClient } from "./mcp-server/index.js";
-import { startAgent, stopAgent, sendMessage, requestAgentAbort, setPendingInjectMessage } from "./ai-agent/index.js";
-import { deliverUserReply } from "./ask-user-bridge.js";
+import {
+  telegramConnect,
+  telegramDisconnect,
+  setOnTelegramMessage,
+  telegramSendText,
+  telegramSendTyping,
+  telegramResolvePeer,
+  isTelegramConnected,
+} from "./telegram-client.js";
+import { startAgent, stopAgent, sendMessage, requestAgentAbort, setPendingInjectMessage, setOnAssessmentClarification } from "./ai-agent/index.js";
+import { deliverUserReply, isWaitingForAskUser, getWaitingAskUserBusId } from "./ask-user-bridge.js";
 import {
   secretsWipe,
   secretsListFull,
@@ -29,6 +38,18 @@ import {
 } from "./agent-config-store.js";
 import * as recipeStore from "./recipe-store.js";
 import { kbList, kbRead, kbWrite, kbDelete, runQmdCli } from "./mcp-server/kb-client.js";
+import {
+  appendToBusHistory,
+  ensureBus,
+  getBusHistory,
+  getBusHistorySlice,
+  listBuses,
+  setBusProperties,
+  getBusTrustLevel,
+  deleteBus,
+  wipeRootHistory,
+  ROOT_BUS_ID,
+} from "./message-bus-store.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -38,6 +59,13 @@ const AGENT_DATA_DIR = join(YAAIA_DIR, "agentData");
 const CONFIG_PATH = join(APP_DATA_DIR, "config.json");
 
 const AGENT_BROWSER_DEBUG_PORT = 9222;
+
+/** Buses we've delivered to the agent since root was wiped. Cleared on wipe. */
+const busesDeliveredSinceRootWipe = new Set<string>();
+
+/** Track if agent sent to target bus during current run (for Telegram fallback). */
+let sentToTargetBusDuringRun = false;
+let currentTargetBusIdForRun: string | null = null;
 
 /** Bring main window to front. Uses app.focus({ steal: true }) on macOS to reclaim focus from Chrome. */
 function refocusMainWindow(): void {
@@ -67,6 +95,9 @@ export interface McpConfig {
   claudeModel: string;
   openrouterApiKey: string;
   openrouterModel: string;
+  telegramAppId: string;
+  telegramApiHash: string;
+  userName: string;
 }
 
 const DEFAULT_CONFIG: McpConfig = {
@@ -75,6 +106,9 @@ const DEFAULT_CONFIG: McpConfig = {
   claudeModel: "claude-sonnet-4-6",
   openrouterApiKey: "",
   openrouterModel: "google/gemini-2.5-flash",
+  telegramAppId: "",
+  telegramApiHash: "",
+  userName: "",
 };
 
 function loadConfig(): McpConfig {
@@ -437,6 +471,46 @@ ipcMain.handle("start-chat", async (_event, config: McpConfig) => {
     recipeStore.clearPendingFinalize();
     mainWindow?.webContents?.send("startup-progress-reset");
     mainWindow?.webContents?.send("startup-progress", "Starting MCP server...");
+    setOnTelegramMessage((payload) => {
+      try {
+        if (isWaitingForAskUser() && getWaitingAskUserBusId() === payload.bus_id) {
+          deliverUserReply(payload.content, payload.bus_id);
+          return;
+        }
+        ensureBus(payload.bus_id, `Telegram: ${payload.user_name}`);
+        const busMsg = {
+          role: "user" as const,
+          content: payload.content,
+          user_id: payload.user_id,
+          user_name: payload.user_name,
+          bus_id: payload.bus_id,
+        };
+        appendToBusHistory(payload.bus_id, busMsg);
+        appendToBusHistory(ROOT_BUS_ID, busMsg);
+        const peerId = parseInt(payload.bus_id.replace("telegram-", ""), 10);
+        if (!isNaN(peerId) && isTelegramConnected()) {
+          telegramSendTyping(peerId).catch(() => { });
+        }
+        const isFirstFromBus = !busesDeliveredSinceRootWipe.has(payload.bus_id);
+        if (isFirstFromBus) busesDeliveredSinceRootWipe.add(payload.bus_id);
+        const busContext =
+          isFirstFromBus
+            ? (() => {
+                const last10 = getBusHistorySlice(payload.bus_id, 10, 0);
+                const ctx = last10.length
+                  ? `Recent history for ${payload.bus_id}:\n${last10.map((m) => `${m.role}: ${m.content}`).join("\n")}`
+                  : "";
+                return ctx ? `${ctx}\n\n` : "";
+              })()
+            : "";
+        const instruction = `${busContext}If you need more context for this bus, call get_bus_history(bus_id="${payload.bus_id}", assessment="...", clarification="...", limit=50, offset=0) for last 50, or use negative offset for earlier messages.`;
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send("telegram-message", { ...payload, instruction });
+        }
+      } catch (err) {
+        console.error("[YAAIA] Telegram callback error:", err);
+      }
+    });
     mcpHttpServer = await startMcpServer({
       onAskUserRequest: (info) => {
         refocusMainWindow();
@@ -450,6 +524,62 @@ ipcMain.handle("start-chat", async (_event, config: McpConfig) => {
       },
       onRefocusMainWindow: refocusMainWindow,
       onStartupProgress: (step) => mainWindow?.webContents?.send("startup-progress", step),
+      onSendMessageToRoot: (content) => mainWindow?.webContents?.send("agent-message", content),
+      onSendMessage: (busId) => {
+        if (currentTargetBusIdForRun && busId === currentTargetBusIdForRun) sentToTargetBusDuringRun = true;
+      },
+      onSendMessageToTelegram: async (busId, content) => {
+        const peerId = parseInt(busId.replace("telegram-", ""), 10);
+        if (!isNaN(peerId)) await telegramSendText(peerId, content);
+      },
+      onTelegramSearch: async (username) => {
+        if (!isTelegramConnected()) {
+          throw new Error("Telegram not connected. Call telegram_connect first.");
+        }
+        return telegramResolvePeer(username);
+      },
+      onTelegramConnect: async (phone) => {
+        if (isTelegramConnected()) {
+          const buses = listBuses().filter((b) => b.bus_id.startsWith("telegram-"));
+          const instruction =
+            "If you need more context for a bus, call get_bus_history(bus_id, assessment, clarification, limit, offset). offset=0 = last N; offset<0 = from end.";
+          return { ok: true, buses, instruction };
+        }
+        const apiId = parseInt(loadConfig().telegramAppId ?? "0", 10);
+        const apiHash = loadConfig().telegramApiHash?.trim();
+        if (!apiId || !apiHash) {
+          return { ok: false, error: "Telegram App ID and API Hash must be configured first." };
+        }
+        try {
+          await telegramConnect({
+            apiId,
+            apiHash,
+            phone: phone.trim(),
+            getLoginInput: async (step) => {
+              return new Promise<string>((resolve) => {
+                pendingTelegramLoginResolve = resolve;
+                mainWindow?.webContents?.send("telegram-login-request", { step });
+              });
+            },
+          });
+          const buses = listBuses().filter((b) => b.bus_id.startsWith("telegram-"));
+          const instruction =
+            "If you need more context for a bus, call get_bus_history(bus_id, assessment, clarification, limit, offset). offset=0 = last N; offset<0 = from end.";
+          return {
+            ok: true,
+            buses,
+            instruction,
+          };
+        } catch (err) {
+          return {
+            ok: false,
+            error: err instanceof Error ? err.message : String(err),
+          };
+        }
+      },
+      appConfig: {
+        userName: config.userName ?? "",
+      },
     });
 
     const mcpPort = getMcpServerPort(mcpHttpServer);
@@ -465,6 +595,17 @@ ipcMain.handle("start-chat", async (_event, config: McpConfig) => {
       claudeModel: config.claudeModel,
       openrouterApiKey: config.openrouterApiKey,
       openrouterModel: config.openrouterModel,
+    });
+    setOnAssessmentClarification((busId, assessment, clarification) => {
+      if (recipeStore.getTaskBusId() !== busId) return;
+      if (getBusTrustLevel(busId) !== "root") return;
+      if (!busId.startsWith("telegram-")) return;
+      const parts: string[] = [];
+      if (assessment) parts.push(`**Assessment:** ${assessment}`);
+      if (clarification) parts.push(`**Clarification:** ${clarification}`);
+      if (parts.length === 0) return;
+      const peerId = parseInt(busId.replace("telegram-", ""), 10);
+      if (!isNaN(peerId)) telegramSendText(peerId, parts.join("\n\n")).catch((err) => console.warn("[YAAIA] Forward assessment/clarification failed:", err));
     });
     mainWindow?.webContents?.send("startup-progress", "Agent ready");
 
@@ -489,29 +630,103 @@ ipcMain.handle("stop-chat", async () => {
   await stopChromeMcp();
   await stopKbMcp();
   await stopMailClient();
+  await telegramDisconnect();
+  setOnTelegramMessage(null);
+  setOnAssessmentClarification(null);
   recipeStore.clearSessionTag();
   return safeForIPC({ ok: true });
 });
 
-ipcMain.handle("agent-send-message", async (event, message: string, history: { role: "user" | "assistant"; content: string }[] = []) => {
-  recipeStore.setInitialPrompt(message);
-  try {
-    const result = await sendMessage(
-      message,
-      (chunk) => event.sender.send("agent-stream-chunk", String(chunk ?? "")),
-      history ?? []
-    );
-    const finalizeInfo = recipeStore.completeFinalizeWithReport(result.text ?? "");
-    if (finalizeInfo) {
-      refocusMainWindow();
-      mainWindow?.webContents?.send("finalize-task-popup", finalizeInfo);
+ipcMain.handle(
+  "agent-send-message",
+  async (
+    event,
+    message: string,
+    _history: { role: "user" | "assistant"; content: string }[] = [],
+    busId?: string
+  ) => {
+    const cfg = loadConfig();
+    const targetBusId = busId ?? ROOT_BUS_ID;
+    if (targetBusId === ROOT_BUS_ID) {
+      appendToBusHistory(ROOT_BUS_ID, {
+        role: "user",
+        content: typeof message === "string" && message.startsWith("{") ? JSON.parse(message).content : message,
+        user_id: 0,
+        user_name: cfg.userName ?? "",
+      });
     }
-    return safeForIPC(String(result.text ?? ""));
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    throw new Error(msg);
-  }
-});
+    const userMsg =
+      typeof message === "string" && message.startsWith("{")
+        ? message
+        : JSON.stringify({
+          bus_id: ROOT_BUS_ID,
+          user_id: 0,
+          user_name: cfg.userName ?? "",
+          content: message,
+        });
+    const tag = recipeStore.getSessionTag();
+    const busHistory = getBusHistory(ROOT_BUS_ID);
+    const history: { role: "user" | "assistant"; content: string; wrap?: boolean }[] = busHistory.map((m) => {
+      const busId = m.bus_id ?? ROOT_BUS_ID;
+      const wrap = getBusTrustLevel(busId) === "root" && !!tag;
+      if (m.role === "user") {
+        return {
+          role: "user" as const,
+          content: JSON.stringify({
+            bus_id: busId,
+            user_id: m.user_id ?? 0,
+            user_name: m.user_name ?? "",
+            content: m.content,
+          }),
+          wrap,
+        };
+      }
+      return { role: "assistant" as const, content: m.content, wrap };
+    });
+    recipeStore.setInitialPrompt(message);
+    if (targetBusId !== ROOT_BUS_ID) {
+      currentTargetBusIdForRun = targetBusId;
+      sentToTargetBusDuringRun = false;
+    } else {
+      currentTargetBusIdForRun = null;
+    }
+    try {
+      const result = await sendMessage(
+        userMsg,
+        (chunk) => event.sender.send("agent-stream-chunk", String(chunk ?? "")),
+        history,
+        targetBusId
+      );
+      const finalizeInfo = recipeStore.completeFinalizeWithReport(result.text ?? "");
+      if (finalizeInfo) {
+        refocusMainWindow();
+        mainWindow?.webContents?.send("finalize-task-popup", finalizeInfo);
+      }
+      const fallbackText = result.text?.trim();
+      if (
+        targetBusId !== ROOT_BUS_ID &&
+        !sentToTargetBusDuringRun &&
+        fallbackText &&
+        fallbackText !== "Done." &&
+        fallbackText !== "Stopped by user."
+      ) {
+        const peerId = parseInt(targetBusId.replace("telegram-", ""), 10);
+        if (!isNaN(peerId)) {
+          try {
+            await telegramSendText(peerId, fallbackText);
+            appendToBusHistory(targetBusId, { role: "assistant", content: fallbackText });
+            appendToBusHistory(ROOT_BUS_ID, { role: "assistant", content: fallbackText, bus_id: targetBusId });
+          } catch (err) {
+            console.warn("[YAAIA] Fallback send to Telegram failed:", err);
+          }
+        }
+      }
+      return safeForIPC(String(result.text ?? ""));
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new Error(msg);
+    }
+  });
 
 ipcMain.handle("agent-abort", () => {
   requestAgentAbort();
@@ -534,6 +749,15 @@ ipcMain.handle("finalize-task-reply", (_, isSuccess: boolean) => {
 });
 
 ipcMain.handle("get-config", () => safeForIPC(loadConfig()));
+
+let pendingTelegramLoginResolve: ((value: string) => void) | null = null;
+ipcMain.handle("telegram-login-reply", (_event, value: string) => {
+  if (pendingTelegramLoginResolve) {
+    pendingTelegramLoginResolve(String(value ?? "").trim());
+    pendingTelegramLoginResolve = null;
+  }
+  return undefined;
+});
 
 ipcMain.handle("open-external", async (_event, url: string) => {
   if (typeof url === "string" && /^(https?|mailto):/i.test(url)) {
@@ -604,6 +828,22 @@ ipcMain.handle("agent-config-delete", (_, id: string) => {
 });
 ipcMain.handle("wipe-configs", () => {
   agentConfigWipe();
+  return undefined;
+});
+
+ipcMain.handle("message-bus-list", () => safeForIPC(listBuses()));
+ipcMain.handle("message-bus-set-description", (_, busId: string, description: string) => {
+  setBusProperties(busId, { description });
+  return undefined;
+});
+ipcMain.handle("message-bus-delete", (_, busId: string) => {
+  deleteBus(busId);
+  return undefined;
+});
+ipcMain.handle("message-bus-get-history", (_, busId: string) => safeForIPC(getBusHistory(busId)));
+ipcMain.handle("message-bus-wipe-root", () => {
+  wipeRootHistory();
+  busesDeliveredSinceRootWipe.clear();
   return undefined;
 });
 

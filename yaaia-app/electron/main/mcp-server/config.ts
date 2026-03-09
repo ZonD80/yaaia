@@ -20,4 +20,21 @@ export interface McpServerConfig {
   onRefocusMainWindow?: () => void;
   /** Called during startup with progress steps (e.g. "Connecting Chrome MCP..."). */
   onStartupProgress?: (step: string) => void;
+  /** Called when agent sends message to root bus. Display in chat UI. */
+  onSendMessageToRoot?: (content: string) => void;
+  /** Called when agent sends message to any bus (for tracking). */
+  onSendMessage?: (busId: string) => void;
+  /** Called when agent sends message to a Telegram bus. Send via telegram client. */
+  onSendMessageToTelegram?: (busId: string, content: string) => void | Promise<void>;
+  /** Called when agent wants to connect Telegram. phone is mandatory from the tool. Returns buses + instruction on success. */
+  onTelegramConnect?: (phone: string) => Promise<{
+    ok: boolean;
+    buses?: Array<{ bus_id: string; description: string }>;
+    instruction?: string;
+    error?: string;
+  }>;
+  /** Resolve Telegram username to bus_id. Requires Telegram to be connected. */
+  onTelegramSearch?: (username: string) => Promise<{ bus_id: string; display_name?: string }>;
+  /** App config for root bus (userName). Telegram credentials are read from config, not passed here. */
+  appConfig?: { userName: string };
 }

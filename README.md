@@ -22,7 +22,7 @@ An Electron app that runs an AI agent (Claude, or whatever OpenRouter throws at 
 ## The vibe
 
 - **Assessment & clarification** — Every tool call asks the agent: "What do you think happened?" and "Why are you doing this?" No silent button-mashing. It has to explain itself.
-- **ask_user** — When it's stuck, it pops up and asks you. You have 60 seconds. It can ask up to 3 times. Then it's on its own.
+- **send_message(wait_for_answer=true)** — When it needs input, it sends a message and waits for your reply. You have 60 seconds. Then it's on its own.
 - **start_task / finalize_task** — Tasks have a beginning and an end. Did it succeed? It has to say so. No ghosting.
 
 ---

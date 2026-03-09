@@ -9,10 +9,13 @@ interface ElectronAPI {
     claudeModel: string;
     openrouterApiKey: string;
     openrouterModel: string;
+    telegramAppId: string;
+    telegramApiHash: string;
+    userName: string;
   }>;
   startChat: (config: unknown) => Promise<{ ok: boolean; agentReady?: boolean; message: string }>;
   stopChat: () => Promise<{ ok: boolean }>;
-  agentSendMessage: (message: string, history?: { role: string; content: string }[]) => Promise<string>;
+  agentSendMessage: (message: string, history?: { role: string; content: string }[], busId?: string) => Promise<string>;
   agentAbort: () => Promise<void>;
   askUserReply: (reply: string) => Promise<void>;
   askUserCancel: () => Promise<void>;
@@ -28,6 +31,11 @@ interface ElectronAPI {
   agentConfigSet: (args: unknown) => Promise<string>;
   agentConfigDelete: (id: string) => Promise<void>;
   wipeConfigs: () => Promise<void>;
+  messageBusList: () => Promise<Array<{ bus_id: string; description: string }>>;
+  messageBusSetDescription: (busId: string, description: string) => Promise<void>;
+  messageBusDelete: (busId: string) => Promise<void>;
+  messageBusGetHistory: (busId: string) => Promise<Array<{ role: string; content: string }>>;
+  messageBusWipeRoot: () => Promise<void>;
   kbList: (path?: string, recursive?: boolean) => Promise<string[]>;
   kbRead: (path: string) => Promise<string>;
   kbWrite: (path: string, content: string) => Promise<void>;
@@ -41,6 +49,10 @@ interface ElectronAPI {
   onAgentBrowserError: (callback: (message: string) => void) => () => void;
   onStartupProgress: (callback: (step: string) => void) => () => void;
   onStartupProgressReset: (callback: () => void) => () => void;
+  onAgentMessage: (callback: (content: string) => void) => () => void;
+  onTelegramMessage: (callback: (payload: { bus_id: string; user_id: number; user_name: string; content: string }) => void) => () => void;
+  onTelegramLoginRequest: (callback: (info: { step: "phone" | "code" | "password" }) => void) => () => void;
+  telegramLoginReply: (value: string) => Promise<void>;
 }
 
 declare global {

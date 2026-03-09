@@ -35,6 +35,18 @@
           <label>OpenRouter Model</label>
           <input v-model="config.openrouterModel" placeholder="google/gemini-2.5-flash" />
         </div>
+        <div class="field">
+          <label>Telegram App ID</label>
+          <input v-model="config.telegramAppId" placeholder="e.g. 12345678" />
+        </div>
+        <div class="field">
+          <label>Telegram API Hash</label>
+          <input type="password" v-model="config.telegramApiHash" placeholder="e.g. abc123..." />
+        </div>
+        <div class="field">
+          <label>Your name (root bus)</label>
+          <input v-model="config.userName" placeholder="e.g. Alice" />
+        </div>
         <ul v-if="startupSteps.length" class="startup-progress">
           <li v-for="(step, i) in startupSteps" :key="i" :class="{ done: i < startupSteps.length - 1 || startupMilestones.includes(step) }">
             <span class="check">{{ (i < startupSteps.length - 1 || startupMilestones.includes(step)) ? "✓" : "" }}</span>
@@ -56,11 +68,11 @@
             <template v-else>
               <div v-if="msg.isError" class="msg-error">{{ msg.content }}</div>
               <template v-else-if="msg.type === 'assessment'">
-                <span class="msg-type-label">Assessment</span>
+                <span class="msg-type-label">{{ msg.bus_id ? `Remote bus (${msg.bus_id}) assessment` : 'Assessment' }}</span>
                 <div class="msg-markdown" v-html="renderMarkdown(msg.content)"></div>
               </template>
               <template v-else-if="msg.type === 'clarification'">
-                <span class="msg-type-label">Clarification</span>
+                <span class="msg-type-label">{{ msg.bus_id ? `Remote bus (${msg.bus_id}) clarification` : 'Clarification' }}</span>
                 <div class="msg-markdown" v-html="renderMarkdown(msg.content)"></div>
               </template>
               <template v-else-if="msg.type === 'tool_running'">
@@ -85,11 +97,11 @@
                 <span class="msg-text">{{ p.content }}</span>
               </template>
               <template v-else-if="p.type === 'assessment'">
-                <span class="msg-type-label">Assessment</span>
+                <span class="msg-type-label">{{ p.bus_id ? `Remote bus (${p.bus_id}) assessment` : 'Assessment' }}</span>
                 <div class="msg-markdown" v-html="renderMarkdown(p.content)"></div>
               </template>
               <template v-else-if="p.type === 'clarification'">
-                <span class="msg-type-label">Clarification</span>
+                <span class="msg-type-label">{{ p.bus_id ? `Remote bus (${p.bus_id}) clarification` : 'Clarification' }}</span>
                 <div class="msg-markdown" v-html="renderMarkdown(p.content)"></div>
               </template>
               <template v-else-if="p.type === 'tool_running'">
@@ -128,6 +140,7 @@
       <aside class="sidebar">
         <button class="btn secondary" @click="openSecretsEditor">Secrets Editor</button>
         <button class="btn secondary" @click="openConfigsEditor">Configs Editor</button>
+        <button class="btn secondary" @click="openMessageBusEditor">Message Buses</button>
         <button class="btn secondary" @click="openKbEditor">KB Editor</button>
         <button class="btn secondary" @click="viewRecipe">View recipe</button>
         <button class="btn secondary" @click="saveRecipe">Save recipe</button>
@@ -135,6 +148,22 @@
         <button class="btn secondary" @click="exitChat">Exit chat</button>
       </aside>
     </main>
+    <div v-if="telegramLoginStep" class="ask-user-overlay">
+      <div class="ask-user-modal">
+        <h3>Telegram login</h3>
+        <p class="ask-user-clarification">{{ telegramLoginLabel }}</p>
+        <input
+          v-model="telegramLoginValue"
+          :type="telegramLoginStep === 'phone' ? 'tel' : 'password'"
+          :placeholder="telegramLoginPlaceholder"
+          class="editor-input"
+          @keydown.enter="submitTelegramLogin"
+        />
+        <div class="ask-user-actions">
+          <button class="btn primary" @click="submitTelegramLogin">Submit</button>
+        </div>
+      </div>
+    </div>
     <div v-if="askUserInfo" class="ask-user-overlay">
       <div class="ask-user-modal">
         <h3>Agent needs your input</h3>
@@ -198,6 +227,49 @@
           <button class="btn secondary" @click="startAddSecret">Add new</button>
           <button class="btn secondary" @click="showSecretsEditor = false">Close</button>
         </div>
+      </div>
+    </div>
+    <div v-if="showMessageBusEditor" class="ask-user-overlay editor-overlay" @click.self="showMessageBusEditor = false">
+      <div class="ask-user-modal editor-modal">
+        <h3>Message Buses</h3>
+        <p v-if="messageBusError" class="editor-error">{{ messageBusError }}</p>
+        <div class="editor-form" v-if="messageBusEditingId">
+          <input v-model="messageBusForm.description" type="text" placeholder="Description" class="editor-input" />
+          <div class="editor-form-actions">
+            <button class="btn primary" @click="saveMessageBusDescription">Save</button>
+            <button class="btn secondary" @click="messageBusEditingId = null">Cancel</button>
+          </div>
+        </div>
+        <div class="editor-list">
+          <div v-for="item in messageBusItems" :key="item.bus_id" class="editor-row">
+            <div class="editor-row-fields">
+              <span class="editor-row-desc">{{ item.bus_id }}</span>
+              <span class="editor-row-value">{{ item.description || "(no description)" }}</span>
+            </div>
+            <div class="editor-row-actions">
+              <button class="btn secondary small" @click="startEditMessageBus(item)">Edit description</button>
+              <button class="btn secondary small" @click="viewMessageBusHistory(item.bus_id)">View history</button>
+              <button v-if="item.bus_id !== 'root'" class="btn secondary small" @click="deleteMessageBus(item.bus_id)">Delete</button>
+            </div>
+          </div>
+        </div>
+        <div class="editor-modal-actions">
+          <button class="btn secondary" @click="wipeRootHistory">Wipe root history</button>
+          <button class="btn secondary" @click="refreshMessageBusList">Refresh</button>
+          <button class="btn secondary" @click="showMessageBusEditor = false">Close</button>
+        </div>
+      </div>
+    </div>
+    <div v-if="showMessageBusHistory" class="ask-user-overlay editor-overlay" @click.self="showMessageBusHistory = false">
+      <div class="ask-user-modal editor-modal">
+        <h3>History: {{ messageBusHistoryBusId }}</h3>
+        <div class="editor-list" style="max-height: 300px; overflow-y: auto;">
+          <div v-for="(m, i) in messageBusHistory" :key="i" class="editor-row">
+            <span class="editor-row-desc">{{ m.role }}</span>
+            <span class="editor-row-value">{{ m.content?.slice(0, 100) }}{{ (m.content?.length ?? 0) > 100 ? '...' : '' }}</span>
+          </div>
+        </div>
+        <button class="btn secondary" @click="showMessageBusHistory = false">Close</button>
       </div>
     </div>
     <div v-if="showConfigsEditor" class="ask-user-overlay editor-overlay" @click.self="showConfigsEditor = false">
@@ -280,10 +352,12 @@ type ChatMessage = {
   injected?: boolean;
   isError?: boolean;
   isReport?: boolean;
+  isTelegram?: boolean;
   type?: "assessment" | "clarification" | "tool_running" | "tool_call" | "content";
   name?: string;
   accordion?: string;
   wait_seconds?: number;
+  bus_id?: string;
 };
 
 const MSG_START = "<<<MSG>>>";
@@ -310,7 +384,7 @@ function parseStream(raw: string): { parts: ChatMessage[]; tail: string } {
     const jsonStr = after.slice(0, endIdx);
     remaining = after.slice(endIdx + MSG_END.length);
     try {
-      const msg = JSON.parse(jsonStr) as { type?: string; content?: string; name?: string; accordion?: string; wait_seconds?: number };
+      const msg = JSON.parse(jsonStr) as { type?: string; content?: string; name?: string; accordion?: string; wait_seconds?: number; bus_id?: string };
       if (contentBuffer.trim()) {
         parts.push({ role: "assistant", content: contentBuffer.trim(), type: "content" });
         contentBuffer = "";
@@ -318,15 +392,17 @@ function parseStream(raw: string): { parts: ChatMessage[]; tail: string } {
       if (msg.type === "content_end") {
         /* flush handled above */
       } else if (msg.type === "assessment" && typeof msg.content === "string") {
-        parts.push({ role: "assistant", content: msg.content, type: "assessment" });
+        parts.push({ role: "assistant", content: msg.content, type: "assessment", bus_id: msg.bus_id });
       } else if (msg.type === "clarification" && typeof msg.content === "string") {
-        parts.push({ role: "assistant", content: msg.content, type: "clarification" });
+        parts.push({ role: "assistant", content: msg.content, type: "clarification", bus_id: msg.bus_id });
       } else if (msg.type === "tool_running" && msg.name) {
         parts.push({ role: "assistant", type: "tool_running", name: msg.name, content: "", wait_seconds: msg.wait_seconds });
       } else if (msg.type === "tool_call" && msg.name && msg.accordion) {
         const last = parts[parts.length - 1];
         if (last?.type === "tool_running" && last.name === msg.name) parts.pop();
         parts.push({ role: "assistant", type: "tool_call", name: msg.name, accordion: msg.accordion, content: "", wait_seconds: msg.wait_seconds });
+      } else if (msg.type === "send_message" && typeof msg.content === "string") {
+        parts.push({ role: "assistant", content: msg.content, type: "content" });
       } else if (msg.type === "user_injected" && typeof msg.content === "string") {
         parts.push({ role: "user", content: msg.content, injected: true });
       }
@@ -422,6 +498,13 @@ function dismissFloatingTask() {
   taskSuccess.value = true;
   taskElapsedSeconds.value = 0;
   stopTaskTimer();
+}
+
+function submitTelegramLogin() {
+  const v = telegramLoginValue.value.trim();
+  window.electronAPI?.telegramLoginReply?.(v || "");
+  telegramLoginStep.value = null;
+  telegramLoginValue.value = "";
 }
 
 function dismissAskUser() {
@@ -524,6 +607,74 @@ async function openConfigsEditor() {
   showConfigsEditor.value = true;
   configsError.value = "";
   await refreshConfigsList();
+}
+
+async function openMessageBusEditor() {
+  showMessageBusEditor.value = true;
+  messageBusError.value = "";
+  await refreshMessageBusList();
+}
+
+async function refreshMessageBusList() {
+  try {
+    const list = (await window.electronAPI?.messageBusList?.()) ?? [];
+    messageBusItems.value = list as Array<{ bus_id: string; description: string }>;
+  } catch (err) {
+    messageBusItems.value = [];
+    messageBusError.value = err instanceof Error ? err.message : "Failed to load";
+  }
+}
+
+function startEditMessageBus(item: { bus_id: string; description: string }) {
+  messageBusEditingId.value = item.bus_id;
+  messageBusForm.value = { description: item.description };
+}
+
+async function saveMessageBusDescription() {
+  if (!messageBusEditingId.value) return;
+  messageBusError.value = "";
+  try {
+    await window.electronAPI?.messageBusSetDescription?.(messageBusEditingId.value, messageBusForm.value.description);
+    await refreshMessageBusList();
+    messageBusEditingId.value = null;
+  } catch (err) {
+    messageBusError.value = err instanceof Error ? err.message : "Failed to save";
+  }
+}
+
+async function deleteMessageBus(busId: string) {
+  if (!confirm(`Delete bus ${busId} and its history?`)) return;
+  messageBusError.value = "";
+  try {
+    await window.electronAPI?.messageBusDelete?.(busId);
+    await refreshMessageBusList();
+    if (messageBusEditingId.value === busId) messageBusEditingId.value = null;
+  } catch (err) {
+    messageBusError.value = err instanceof Error ? err.message : "Failed to delete";
+  }
+}
+
+async function wipeRootHistory() {
+  if (!confirm("Wipe root chat history? This cannot be undone.")) return;
+  messageBusError.value = "";
+  try {
+    await window.electronAPI?.messageBusWipeRoot?.();
+    await refreshMessageBusList();
+    messages.value = [];
+  } catch (err) {
+    messageBusError.value = err instanceof Error ? err.message : "Failed to wipe";
+  }
+}
+
+async function viewMessageBusHistory(busId: string) {
+  try {
+    const hist = (await window.electronAPI?.messageBusGetHistory?.(busId)) ?? [];
+    messageBusHistory.value = hist as Array<{ role: string; content: string }>;
+    messageBusHistoryBusId.value = busId;
+    showMessageBusHistory.value = true;
+  } catch (err) {
+    messageBusError.value = err instanceof Error ? err.message : "Failed to load history";
+  }
 }
 
 async function openKbEditor() {
@@ -657,6 +808,9 @@ const config = ref({
   claudeModel: "claude-sonnet-4-6",
   openrouterApiKey: "",
   openrouterModel: "google/gemini-2.5-flash",
+  telegramAppId: "",
+  telegramApiHash: "",
+  userName: "",
 });
 
 const agentReady = ref(false);
@@ -695,6 +849,20 @@ function scrollToBottomAlways() {
 }
 const askUserInfo = ref<{ clarification: string; assessment: string; attempt: number } | null>(null);
 const askUserReply = ref("");
+const telegramLoginStep = ref<"phone" | "code" | "password" | null>(null);
+const telegramLoginValue = ref("");
+const telegramLoginLabel = computed(() => {
+  if (telegramLoginStep.value === "phone") return "Enter your phone number (e.g. +1234567890):";
+  if (telegramLoginStep.value === "code") return "Enter the verification code sent to your phone:";
+  if (telegramLoginStep.value === "password") return "Enter your 2FA password:";
+  return "";
+});
+const telegramLoginPlaceholder = computed(() => {
+  if (telegramLoginStep.value === "phone") return "+1234567890";
+  if (telegramLoginStep.value === "code") return "12345";
+  if (telegramLoginStep.value === "password") return "Password";
+  return "";
+});
 const showFinalizePopup = ref(false);
 const finalizeInfo = ref<{ assessment: string; clarification: string; is_successful: boolean; detailed_report: string } | null>(null);
 const pendingReportForNextMessage = ref(false);
@@ -730,6 +898,16 @@ const configsError = ref("");
 const configsEditingId = ref<string | null>(null);
 const configsForm = ref({ detailed_description: "", value: "" });
 
+// Message Bus Editor
+const showMessageBusEditor = ref(false);
+const showMessageBusHistory = ref(false);
+const messageBusItems = ref<Array<{ bus_id: string; description: string }>>([]);
+const messageBusError = ref("");
+const messageBusEditingId = ref<string | null>(null);
+const messageBusForm = ref({ description: "" });
+const messageBusHistory = ref<Array<{ role: string; content: string }>>([]);
+const messageBusHistoryBusId = ref("");
+
 // KB Editor
 const showKbEditor = ref(false);
 const kbEditorPreview = ref(false);
@@ -750,6 +928,9 @@ let finalizeUnsub: (() => void) | undefined;
 let agentBrowserErrorUnsub: (() => void) | undefined;
 let startupProgressUnsub: (() => void) | undefined;
 let startupProgressResetUnsub: (() => void) | undefined;
+let agentMessageUnsub: (() => void) | undefined;
+let telegramMessageUnsub: (() => void) | undefined;
+let telegramLoginUnsub: (() => void) | undefined;
 
 const streamingParsed = computed(() => parseStream(streamBuffer.value));
 
@@ -759,7 +940,6 @@ async function startChat() {
     const plainConfig = JSON.parse(JSON.stringify(config.value));
     const result = await window.electronAPI?.startChat?.(plainConfig);
     if (result?.ok) {
-      messages.value = [];
       streamBuffer.value = "";
       stopTaskTimer();
       taskSummary.value = "";
@@ -772,6 +952,12 @@ async function startChat() {
       pendingReportForNextMessage.value = false;
       agentReady.value = true;
       agentBrowserError.value = "";
+      const rootHistory = (await window.electronAPI?.messageBusGetHistory?.("root")) ?? [];
+      messages.value = rootHistory.map((m: { role: string; content: string }) => ({
+        role: m.role as "user" | "assistant",
+        content: m.content,
+        type: m.role === "assistant" ? "content" : undefined,
+      }));
     } else {
       alert(result?.message ?? "Failed to start");
     }
@@ -904,6 +1090,47 @@ onMounted(async () => {
     scrollToBottomIfFollowing();
   });
 
+  agentMessageUnsub = window.electronAPI?.onAgentMessage?.((content) => {
+    messages.value.push({ role: "assistant", content, type: "content" });
+    scrollToBottomAlways();
+  });
+
+  telegramLoginUnsub = window.electronAPI?.onTelegramLoginRequest?.((info) => {
+    telegramLoginStep.value = info.step;
+    telegramLoginValue.value = "";
+  });
+
+  telegramMessageUnsub = window.electronAPI?.onTelegramMessage?.((payload) => {
+    const msg = JSON.stringify(payload);
+    const incomingLabel = `📱 **Telegram** (${payload.user_name}): ${payload.content}`;
+    messages.value.push({ role: "user", content: incomingLabel, isTelegram: true });
+    scrollToBottomAlways();
+    if (sending.value) {
+      window.electronAPI?.agentInjectMessage?.(msg, false);
+    } else {
+      sending.value = true;
+      streaming.value = true;
+      streamBuffer.value = "";
+      window.electronAPI
+        ?.agentSendMessage?.(msg, [], payload.bus_id)
+        ?.then(() => {
+          // Reply was sent to Telegram via send_message; no need to push to desktop chat
+        })
+        ?.catch((err) => {
+          const { parts, tail } = parseStream(streamBuffer.value);
+          for (const p of parts) messages.value.push(p);
+          const content = tail.trim() ? `${tail.trim()}\n\n**Error:** ${err}` : `Error: ${err}`;
+          messages.value.push({ role: "assistant", content, isError: true });
+        })
+        ?.finally(() => {
+          sending.value = false;
+          streaming.value = false;
+          streamBuffer.value = "";
+          scrollToBottomAlways();
+        });
+    }
+  });
+
   askUserUnsub = window.electronAPI?.onAskUserPopup?.((info) => {
     playNotificationSound();
     askUserInfo.value = info;
@@ -971,6 +1198,9 @@ onUnmounted(() => {
   agentBrowserErrorUnsub?.();
   startupProgressUnsub?.();
   startupProgressResetUnsub?.();
+  agentMessageUnsub?.();
+  telegramMessageUnsub?.();
+  telegramLoginUnsub?.();
   stopAskUserCountdown();
   stopTaskTimer();
 });

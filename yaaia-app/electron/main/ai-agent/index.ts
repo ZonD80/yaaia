@@ -5,8 +5,23 @@ import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { getSessionTag } from "../recipe-store.js";
+import { appendToBusHistory, getBusTrustLevel, ROOT_BUS_ID } from "../message-bus-store.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+
+const TOOL_OUTPUT_MAX_LEN = 4000;
+
+function persistToolOutputToRoot(toolName: string, resultText: string): void {
+  if (toolName === "send_message") return; // MCP handler already appends
+  const truncated =
+    resultText.length > TOOL_OUTPUT_MAX_LEN
+      ? resultText.slice(0, TOOL_OUTPUT_MAX_LEN) + "\n... (truncated)"
+      : resultText;
+  appendToBusHistory(ROOT_BUS_ID, {
+    role: "assistant",
+    content: `[Tool: ${toolName}]\n${truncated}`,
+  });
+}
 const SYSTEM_PROMPT_PATH = join(__dirname, "../../SYSTEM_PROMPT.md");
 
 function loadSystemPrompt(): string {
@@ -34,7 +49,28 @@ function wrapUserContent(content: string, tag: string): string {
   return `[${tag}]${content}[/${tag}]`;
 }
 
-type JsonSchema = { type?: string; properties?: Record<string, unknown>; required?: string[] };
+type JsonSchema = { type?: string; properties?: Record<string, unknown>; required?: string[]; items?: unknown };
+
+/** Recursively fix schema for Gemini/OpenRouter: array types must have items. */
+function fixSchemaForGemini(schema: unknown): unknown {
+  if (schema == null || typeof schema !== "object") return schema;
+  const s = schema as Record<string, unknown>;
+  const type = s.type;
+  if (type === "array") {
+    if (!s.items) s.items = { type: "string" };
+    else fixSchemaForGemini(s.items);
+    return s;
+  }
+  if (type === "object" || !type) {
+    const props = s.properties as Record<string, unknown> | undefined;
+    if (props && typeof props === "object") {
+      for (const key of Object.keys(props)) {
+        props[key] = fixSchemaForGemini(props[key]);
+      }
+    }
+  }
+  return s;
+}
 
 function mcpToolToAnthropic(tool: { name: string; description?: string; inputSchema?: unknown }) {
   const schema = (tool.inputSchema as JsonSchema) ?? { type: "object", properties: {}, required: [] };
@@ -54,15 +90,16 @@ function mcpToolToAnthropic(tool: { name: string; description?: string; inputSch
 
 function mcpToolToOpenAI(tool: { name: string; description?: string; inputSchema?: unknown }) {
   const schema = (tool.inputSchema as JsonSchema) ?? { type: "object", properties: {}, required: [] };
+  const fixed = fixSchemaForGemini(JSON.parse(JSON.stringify(schema))) as JsonSchema;
   return {
     type: "function" as const,
     function: {
       name: tool.name,
       description: tool.description ?? `Tool: ${tool.name}`,
       parameters: {
-        type: schema.type ?? "object",
-        properties: schema.properties ?? {},
-        required: schema.required ?? [],
+        type: fixed.type ?? "object",
+        properties: fixed.properties ?? {},
+        required: fixed.required ?? [],
       },
     },
   };
@@ -86,12 +123,23 @@ function emitStructured(emitChunk: (chunk: string) => void, payload: Record<stri
   emitChunk(MSG_START + JSON.stringify(payload) + MSG_END);
 }
 
+let onAssessmentClarification: ((busId: string, assessment: string, clarification: string) => void) | null = null;
+
+export function setOnAssessmentClarification(cb: ((busId: string, assessment: string, clarification: string) => void) | null): void {
+  onAssessmentClarification = cb;
+}
+
 function emitToolBlockStart(toolName: string, args: Record<string, unknown>, emitChunk: (chunk: string) => void): void {
   const assessment = typeof args?.assessment === "string" ? args.assessment.trim() : "";
   const clarification = typeof args?.clarification === "string" ? args.clarification.trim() : "";
-  if (assessment) emitStructured(emitChunk, { type: "assessment", content: assessment });
-  if (clarification) emitStructured(emitChunk, { type: "clarification", content: clarification });
-  emitStructured(emitChunk, { type: "tool_running", name: toolName });
+  const busId = typeof args?.bus_id === "string" ? args.bus_id.trim() : "";
+  const isRemote = busId && busId !== "root";
+  if (assessment) emitStructured(emitChunk, { type: "assessment", content: assessment, ...(isRemote && { bus_id: busId }) });
+  if (clarification) emitStructured(emitChunk, { type: "clarification", content: clarification, ...(isRemote && { bus_id: busId }) });
+  if (onAssessmentClarification && busId && (assessment || clarification)) {
+    onAssessmentClarification(busId, assessment, clarification);
+  }
+  if (toolName !== "send_message") emitStructured(emitChunk, { type: "tool_running", name: toolName });
 }
 
 function emitToolBlockResult(
@@ -100,6 +148,12 @@ function emitToolBlockResult(
   resultText: string,
   emitChunk: (chunk: string) => void
 ): void {
+  if (toolName === "send_message") {
+    if (resultText.startsWith("[root] ")) {
+      emitStructured(emitChunk, { type: "send_message", content: resultText.slice(7) });
+    }
+    return;
+  }
   const escaped = resultText
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
@@ -188,7 +242,7 @@ export function stopAgent(): void {
 }
 
 export type StreamChunkCallback = (chunk: string) => void;
-export type HistoryMessage = { role: "user" | "assistant"; content: string };
+export type HistoryMessage = { role: "user" | "assistant"; content: string; wrap?: boolean };
 
 const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
 
@@ -200,17 +254,22 @@ type OpenAIMessage =
 function buildUserMessagesWithTag(
   userMessage: string,
   history: HistoryMessage[],
-  tag: string | null
+  tag: string | null,
+  targetBusId?: string
 ): OpenAIMessage[] {
-  const wrap = (s: string) => (tag ? wrapUserContent(s, tag) : s);
+  const wrapContent = (s: string) => (tag ? wrapUserContent(s, tag) : s);
   const messages: OpenAIMessage[] = [];
   if (history.length > 0) {
     const historyBlock = history
-      .map((h) => `${h.role === "user" ? "User" : "Assistant"}: ${h.content}`)
+      .map((h) => {
+        const content = h.wrap && tag ? wrapContent(h.content) : h.content;
+        return `${h.role === "user" ? "User" : "Assistant"}: ${content}`;
+      })
       .join("\n");
-    messages.push({ role: "user" as const, content: wrap(`Conversation history:\n${historyBlock}`) });
+    messages.push({ role: "user" as const, content: `Conversation history:\n${historyBlock}` });
   }
-  messages.push({ role: "user" as const, content: wrap(userMessage) });
+  const wrapUser = targetBusId && getBusTrustLevel(targetBusId) === "root" && tag;
+  messages.push({ role: "user" as const, content: wrapUser ? wrapContent(userMessage) : userMessage });
   return messages;
 }
 
@@ -218,17 +277,16 @@ async function runOpenRouterSendMessage(
   mcpTools: { name: string; description?: string; inputSchema?: unknown }[],
   userMessage: string,
   onChunk?: StreamChunkCallback,
-  history: HistoryMessage[] = []
+  history: HistoryMessage[] = [],
+  targetBusId?: string
 ): Promise<{ text: string }> {
   const apiKey = agentConfig!.openrouterApiKey.trim();
   const openAITools = mcpTools.map(mcpToolToOpenAI);
   const tag = getSessionTag();
-  const messages: OpenAIMessage[] = buildUserMessagesWithTag(userMessage, history, tag);
+  const messages: OpenAIMessage[] = buildUserMessagesWithTag(userMessage, history, tag, targetBusId);
   const emitChunk = (chunk: string) => {
     if (chunk && onChunk) onChunk(chunk);
   };
-  let finalizeTaskCalled = false;
-  let hasExecutedActionTool = false;
 
   while (true) {
     if (agentAbortRequested) return { text: "Stopped by user." };
@@ -268,19 +326,13 @@ async function runOpenRouterSendMessage(
         if (onChunk) emitStructured(emitChunk, { type: "user_injected", content: injected });
         continue;
       }
-      const missingFinalize = hasExecutedActionTool && !finalizeTaskCalled;
-      if (missingFinalize) {
-        messages.push({ role: "user" as const, content: "[System: You must call finalize_task to complete the task. Call it now.]" });
-        continue;
-      }
-      return { text: text.trim() || "Done." };
+      const result = text.trim();
+      return { text: result === "Done." ? "" : result || "" };
     }
 
     emitStructured(emitChunk, { type: "content_end" });
     const toolResults: OpenAIMessage[] = [];
     for (const tc of choice.tool_calls) {
-      if (tc.function.name === "finalize_task") finalizeTaskCalled = true;
-      else hasExecutedActionTool = true;
       const args = JSON.parse(tc.function.arguments || "{}") as Record<string, unknown>;
       console.log("[YAAIA Agent] Tool call:", tc.function.name, JSON.stringify(args));
       emitToolBlockStart(tc.function.name, args, emitChunk);
@@ -293,6 +345,7 @@ async function runOpenRouterSendMessage(
       }
       resultText = maybeInjectUserMessage(resultText, tc.function.name, onChunk ? emitChunk : undefined);
       emitToolBlockResult(tc.function.name, args, resultText, emitChunk);
+      persistToolOutputToRoot(tc.function.name, resultText);
       toolResults.push({ role: "tool", content: resultText, tool_call_id: tc.id });
     }
     messages.push({ role: "assistant", content: null, tool_calls: choice.tool_calls });
@@ -303,7 +356,8 @@ async function runOpenRouterSendMessage(
 export async function sendMessage(
   userMessage: string,
   onChunk?: StreamChunkCallback,
-  history: HistoryMessage[] = []
+  history: HistoryMessage[] = [],
+  targetBusId?: string
 ): Promise<{ text: string }> {
   if (!mcpClient || !mcpTransport || !agentConfig) {
     throw new Error("Agent not started. Add API key and click Start chat.");
@@ -313,7 +367,7 @@ export async function sendMessage(
   const { tools: mcpTools } = await mcpClient.listTools();
 
   if (agentConfig.aiProvider === "openrouter") {
-    return runOpenRouterSendMessage(mcpTools, userMessage, onChunk, history);
+    return runOpenRouterSendMessage(mcpTools, userMessage, onChunk, history, targetBusId);
   }
 
   const anthropicTools = mcpTools.map(mcpToolToAnthropic);
@@ -325,13 +379,12 @@ export async function sendMessage(
   const messages: Anthropic.MessageParam[] = buildUserMessagesWithTag(
     userMessage,
     history,
-    tag
+    tag,
+    targetBusId
   ) as Anthropic.MessageParam[];
   const emitChunk = (chunk: string) => {
     if (chunk && onChunk) onChunk(chunk);
   };
-  let finalizeTaskCalled = false;
-  let hasExecutedActionTool = false;
 
   while (true) {
     if (agentAbortRequested) return { text: "Stopped by user." };
@@ -366,19 +419,13 @@ export async function sendMessage(
         if (onChunk) emitStructured(emitChunk, { type: "user_injected", content: injected });
         continue;
       }
-      const missingFinalize = hasExecutedActionTool && !finalizeTaskCalled;
-      if (missingFinalize) {
-        messages.push({ role: "user", content: "[System: You must call finalize_task to complete the task. Call it now.]" });
-        continue;
-      }
-      return { text: text.trim() || "Done." };
+      const result = text.trim();
+      return { text: result === "Done." ? "" : result || "" };
     }
 
     emitStructured(emitChunk, { type: "content_end" });
     const toolResults: Anthropic.ToolResultBlockParam[] = [];
     for (const toolUse of toolUseBlocks) {
-      if (toolUse.name === "finalize_task") finalizeTaskCalled = true;
-      else hasExecutedActionTool = true;
       const args = (toolUse.input as Record<string, unknown>) ?? {};
       console.log("[YAAIA Agent] Tool call:", toolUse.name, JSON.stringify(args));
       emitToolBlockStart(toolUse.name, args, emitChunk);
@@ -391,6 +438,7 @@ export async function sendMessage(
       }
       resultText = maybeInjectUserMessage(resultText, toolUse.name, emitChunk);
       emitToolBlockResult(toolUse.name, args, resultText, emitChunk);
+      persistToolOutputToRoot(toolUse.name, resultText);
       toolResults.push({ type: "tool_result", tool_use_id: toolUse.id, content: resultText });
     }
     messages.push({ role: "assistant", content: response.content });

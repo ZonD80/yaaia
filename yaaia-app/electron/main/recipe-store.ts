@@ -69,6 +69,16 @@ export interface FinalizeTaskPopupInfo {
 }
 
 let pendingFinalizeInfo: { assessment: string; clarification: string; is_successful: boolean } | null = null;
+let taskBusId: string | null = null;
+
+export function setTaskBusId(busId: string | null): void {
+  taskBusId = busId;
+}
+
+export function getTaskBusId(): string | null {
+  return taskBusId;
+}
+let pendingReportFromSendMessage: string | null = null;
 
 export function setInitialPrompt(msg: string): void {
   pendingInitialPrompt = String(msg ?? "").trim();
@@ -93,8 +103,9 @@ function ensureRecipe(summary = "Task"): void {
   }
 }
 
-export function initFromStartTask(summary: string, assessment?: string): void {
+export function initFromStartTask(summary: string, assessment?: string, busId?: string): void {
   pendingFinalizeInfo = null;
+  taskBusId = (busId && busId !== "root") ? busId : null;
   recipe = {
     taskSummary: String(summary ?? "").trim(),
     initialPrompt: pendingInitialPrompt,
@@ -148,6 +159,7 @@ export function appendUserInjection(text: string, placeAfterNextStep = false): v
 }
 
 export function finalize(isSuccess: boolean, assessment = "", clarification = ""): void {
+  taskBusId = null;
   ensureRecipe();
   if (!recipe) return;
   recipe.finalizedAt = Date.now();
@@ -162,13 +174,24 @@ export function finalize(isSuccess: boolean, assessment = "", clarification = ""
 
 export function clearPendingFinalize(): void {
   pendingFinalizeInfo = null;
+  pendingReportFromSendMessage = null;
+}
+
+/** When send_message to root is called after finalize_task, store content as the report */
+export function setPendingReportFromSendMessage(content: string): void {
+  if (pendingFinalizeInfo) pendingReportFromSendMessage = String(content ?? "").trim();
 }
 
 export function completeFinalizeWithReport(report: string): FinalizeTaskPopupInfo | null {
   const info = pendingFinalizeInfo;
   pendingFinalizeInfo = null;
+  const fromSendMessage = pendingReportFromSendMessage;
+  pendingReportFromSendMessage = null;
   if (!info || !recipe) return null;
-  const detailedReport = (typeof report === "string" ? report : "")?.trim() ?? "";
+  const detailedReport =
+    (fromSendMessage && fromSendMessage.length > 0 ? fromSendMessage : null) ??
+    (typeof report === "string" ? report : "")?.trim() ??
+    "";
   recipe.detailedReport = detailedReport || undefined;
   return {
     assessment: info.assessment,
