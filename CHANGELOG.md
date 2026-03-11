@@ -5,6 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.8] - 2025-03-11
+
+### Added
+
+- **delete_scheduled_task** — MCP tool to cancel a scheduled task by id (from list_tasks)
+
+### Changed
+
+- **Unified history format** — All message bus data in KB: `kb/history/{mb_id}/{date}/{seq}.md` for messages, `kb/history/{mb_id}/properties.md` for bus metadata
+- **Startup task** — Now includes resume instructions for due scheduled tasks. Default instructions mention resuming tasks that were due while the app was closed
+- **Startup prompt** — When due schedules exist, they are merged into the startup message instead of being sent separately
+- **Telegram** — Missed messages use correct message timestamps for history (no longer wrong date folder)
+- **Telegram** — delete_bus now deletes the chat from Telegram via mtcute (requires Telegram connected)
+- **KB/QMD get** — Logging now correctly shows content when QMD returns `resource` type (was showing "(empty)")
+
+### Removed
+
+- **yaaia/mb** — Bus metadata moved to KB. Run `npm run migrate:history` once when upgrading
+- **Message Buses editor** — Removed from UI; buses managed via KB and MCP tools
+
+### Fixed
+
+- **Telegram missed messages** — Filter out duplicate (last message) when minDate is inclusive; timestamp now advances correctly
+- **Telegram history** — Messages stored under correct date path using message timestamp
+
+### Migration
+
+- **migrate:history** — Script migrates old `kb/history/YYYY-MM-DD/{bus_id}/` and `yaaia/mb/` to new `kb/history/{mb_id}/{date}/` format. Run `npm run migrate:history` once.
+
 ## [0.2.0] - 2025-03-04
 
 ### Added
