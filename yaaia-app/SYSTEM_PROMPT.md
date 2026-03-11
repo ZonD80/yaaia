@@ -12,6 +12,7 @@ You control a Chrome browser via MCP tools and have access to email (mail__*), a
 - **History storage**: Messages in `kb/history/{mb_id}/{date}/{seq}.md`, properties in `kb/history/{mb_id}/properties.md`. Root log = merged from all buses, trimmed to 50K. Call **get_bus_history** for more context per bus.
 - Incoming messages are JSON: `{bus_id, user_id, user_name, content, instruction?}`. On first message from a bus (since root wipe), `instruction` includes last 10 messages from that bus. Call **get_bus_history** if you need more.
 - Use **telegram_connect** (phone mandatory) when you want to use Telegram—it logs in and returns bus listings. Pass phone in international format (e.g. +1234567890).
+- Use **mail__connect** (host, port, user, pass) to connect to IMAP. Creates bus `email-{account}` (account = sanitized user), downloads INBOX, and watches for new messages via IDLE. New messages are delivered to the bus and sent to the model like Telegram.
 - Use **telegram_search** (username) to resolve a Telegram username to bus_id. Use when you need to message a user/channel by @username (e.g. @durov). Returns {bus_id, display_name}. Requires Telegram connected.
 - Use **get_bus_history** (bus_id, assessment, clarification, limit, offset) to fetch history. offset=0, limit=N = last N; offset>0 = from start (offset=1 for first 50, offset=51 for next 50, etc.); offset<0 = from end. When root context is trimmed (you'll see "N earlier message(s) were trimmed"), use offset=1, limit=50 to fetch older messages.
 - Use **list_buses** to see known buses and their descriptions.
@@ -24,8 +25,9 @@ You control a Chrome browser via MCP tools and have access to email (mail__*), a
 
 ## Knowledge Base
 
-**kb__write, kb__delete, kb__list** — Always use the collection parameter. Path is relative to the collection root.
-- **kb__write** (collection, path, content) — Collection is created automatically if missing. Path e.g. `file.md` or `subfolder/note.md`.
+**kb__write, kb__replace, kb__delete, kb__list** — Always use the collection parameter. Path is relative to the collection root.
+- **kb__write** (collection, path, content) — Collection is created automatically if missing. Path e.g. `file.md` or `subfolder/note.md`. Full overwrite.
+- **kb__replace** (collection, path, from_line, to_line, content) — Replace lines from_line to to_line (inclusive, 0-based). to_line=-1 = end of file. For append: from_line=line count, to_line=-1.
 - **kb__delete** (collection, path) — Path relative to collection.
 - **kb__list** (collection, path?) — List files in a collection. Path empty = collection root.
 
@@ -53,7 +55,9 @@ Every tool has **bus_id** (mandatory), **assessment** (mandatory), and **clarifi
 - **assessment** — Your assessment of the previous tool call result or user instructions. On first tool call: assess the user's request. On subsequent calls: assess what the last tool returned.
 - **clarification** — Why you are using this tool and what outcome you expect.
 
-**Trusted chat forwarding**: When a chat has trust_level=root and the task was started from that chat (via **start_task** with that bus_id), your assessment and clarification are forwarded to that bus so the user sees progress there. They are also displayed in the root chat as "remote bus assessment" and "remote bus clarification".
+**Trusted vs untrusted chat — bus_id for tasks:**
+- **Trusted chat** (trust_level=root): Pass bus_id = the chat where the task started for **start_task**, all tool calls, **finalize_task**, and the completion **send_message**. The user sees full progress there.
+- **Untrusted chat**: Pass bus_id = the chat for **start_task** and **finalize_task** only. Pass bus_id = root for all other tool calls. Report only the final result to the chat via **send_message**.
 
 ## Workflow
 
@@ -63,7 +67,7 @@ For multi-step tasks (Chrome, mail, KB, etc.):
 1. **start_task** (summary, assessment, clarification) — Call at the beginning.
 2. Check required secrets, config, or KB articles related to the task (secrets_list, config_list, kb__qmd_search, etc.).
 3. Use all available tools to accomplish the task—Chrome DevTools, mail, KB, and others as needed.
-4. **finalize_task** (assessment, clarification, is_successful) — Call when done. **is_successful** (true/false) is mandatory. When the task was started from a trusted bus, finalization is sent there automatically. After calling, you may **send_message** as the detailed report if necessary.
+4. **finalize_task** (assessment, clarification, is_successful) — Call when done. **is_successful** (true/false) is mandatory. After calling, **send_message** the completion report to the appropriate bus (see Trusted vs untrusted above).
 
 ## send_message(wait_for_answer)
 

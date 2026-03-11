@@ -21,6 +21,7 @@ import {
   telegramFetchMissedMessages,
   isTelegramConnected,
 } from "./telegram-client.js";
+import { setOnMailMessage } from "./mail-client.js";
 import { startAgent, stopAgent, sendMessage, requestAgentAbort, setPendingInjectMessage, setOnAssessmentClarification } from "./ai-agent/index.js";
 import { deliverUserReply, isWaitingForAskUser, getWaitingAskUserBusId } from "./ask-user-bridge.js";
 import {
@@ -587,6 +588,39 @@ ipcMain.handle("start-chat", async (_event, config: McpConfig) => {
         console.error("[YAAIA] Telegram callback error:", err);
       }
     });
+    setOnMailMessage((payload, opts) => {
+      try {
+        if (isBusBanned(payload.bus_id)) return;
+        ensureBus(payload.bus_id, `Email: ${payload.user_name}`);
+        const busMsg = {
+          role: "user" as const,
+          content: payload.content,
+          user_id: payload.user_id,
+          user_name: payload.user_name,
+          bus_id: payload.bus_id,
+          timestamp: payload.timestamp,
+          mail_uid: payload.mail_uid,
+        };
+        appendToBusHistory(payload.bus_id, busMsg);
+        if (opts?.deliverToModel && mainWindow && !mainWindow.isDestroyed()) {
+          const isFirstFromBus = !busesDeliveredSinceRootWipe.has(payload.bus_id);
+          if (isFirstFromBus) busesDeliveredSinceRootWipe.add(payload.bus_id);
+          const busContext =
+            isFirstFromBus
+              ? (() => {
+                  const last10 = getBusHistorySlice(payload.bus_id, 10, 0);
+                  return last10.length
+                    ? `Recent history for ${payload.bus_id}:\n${last10.map((m) => `${m.role}: ${m.content}`).join("\n")}\n\n`
+                    : "";
+                })()
+              : "";
+          const instruction = `${busContext}If you need more context for this bus, call get_bus_history(bus_id="${payload.bus_id}", assessment="...", clarification="...", limit=50, offset=0).`;
+          mainWindow.webContents.send("email-message", { ...payload, instruction });
+        }
+      } catch (err) {
+        console.error("[YAAIA] Mail callback error:", err);
+      }
+    });
     mcpHttpServer = await startMcpServer({
       onAskUserRequest: (info) => {
         refocusMainWindow();
@@ -720,6 +754,7 @@ ipcMain.handle("stop-chat", async () => {
   await stopMailClient();
   await telegramDisconnect();
   setOnTelegramMessage(null);
+  setOnMailMessage(null);
   setOnAssessmentClarification(null);
   recipeStore.clearSessionTag();
   return safeForIPC({ ok: true });

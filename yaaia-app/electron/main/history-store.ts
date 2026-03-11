@@ -17,6 +17,8 @@ export type HistoryMessage = {
   user_name?: string;
   bus_id?: string;
   timestamp: string;
+  /** IMAP UID for email bus cleanup (delete from mailbox) */
+  mail_uid?: number;
 };
 
 export type BusProperties = {
@@ -46,7 +48,7 @@ function parseYamlBlock(block: string): Record<string, string | number> {
       if ((trimmed.startsWith('"') && trimmed.endsWith('"')) || (trimmed.startsWith("'") && trimmed.endsWith("'"))) {
         trimmed = trimmed.slice(1, -1).replace(/\\"/g, '"');
       }
-      if (key === "user_id" && /^\d+$/.test(trimmed)) {
+      if ((key === "user_id" || key === "mail_uid") && /^\d+$/.test(trimmed)) {
         out[key] = parseInt(trimmed, 10);
       } else {
         out[key] = trimmed;
@@ -66,6 +68,7 @@ function messageToBlock(m: HistoryMessage): string {
   ];
   if (m.user_id !== undefined) lines.push(`user_id: ${m.user_id}`);
   if (m.user_name !== undefined) lines.push(`user_name: ${m.user_name}`);
+  if (m.mail_uid !== undefined) lines.push(`mail_uid: ${m.mail_uid}`);
   lines.push("---", "", m.content, "");
   return lines.join("\n");
 }
@@ -92,6 +95,7 @@ function parseHistoryFile(content: string, busId: string): HistoryMessage[] {
       user_name: typeof meta.user_name === "string" ? meta.user_name : undefined,
       bus_id: typeof meta.bus_id === "string" ? meta.bus_id : busId,
       timestamp,
+      mail_uid: typeof meta.mail_uid === "number" ? meta.mail_uid : undefined,
     });
     i += 2;
   }
@@ -349,6 +353,7 @@ export function toBusMessage(m: HistoryMessage): {
   user_name?: string;
   bus_id?: string;
   timestamp?: string;
+  mail_uid?: number;
 } {
   return {
     role: m.role,
@@ -357,12 +362,38 @@ export function toBusMessage(m: HistoryMessage): {
     user_name: m.user_name,
     bus_id: m.bus_id,
     timestamp: m.timestamp,
+    mail_uid: m.mail_uid,
   };
 }
 
 /** Wipe root bus history (delete all root message files, keep properties) */
 export function wipeRootHistory(): void {
   deleteBusHistory("root");
+}
+
+/** Remove messages with given mail_uids from bus history. Used when deleting mail messages from mailbox. */
+export function removeMessagesFromBusHistoryByMailUids(busId: string, uids: number[]): void {
+  if (uids.length === 0) return;
+  const uidSet = new Set(uids);
+  const dates = listDateDirs(busId);
+  for (const date of dates) {
+    const files = listBusFiles(busId, date);
+    for (const f of files) {
+      try {
+        const content = kbRead(f);
+        const messages = parseHistoryFile(content, busId);
+        const remaining = messages.filter((m) => !(m.mail_uid !== undefined && uidSet.has(m.mail_uid)));
+        if (remaining.length === 0) {
+          kbDelete(f);
+        } else {
+          const newContent = remaining.map((m) => messageToBlock(m)).join("\n");
+          kbWrite(f, newContent);
+        }
+      } catch {
+        /* skip */
+      }
+    }
+  }
 }
 
 /** Delete all history and properties for a bus */

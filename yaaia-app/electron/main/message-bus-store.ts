@@ -20,6 +20,7 @@ import {
   ensureMbDir,
 } from "./history-store.js";
 import { isTelegramConnected, telegramDeleteChatHistory } from "./telegram-client.js";
+import { isMailConnected, mailDeleteMessagesByUids } from "./mail-client.js";
 
 export type RootLogForModel = { messages: BusMessage[]; trimmedCount: number };
 
@@ -33,6 +34,8 @@ export type BusMessage = {
   bus_id?: string;
   /** ISO timestamp; when set, used for history file path (YYYY-MM-DD). Included in get_bus_history for ordering/display. */
   timestamp?: string;
+  /** IMAP UID for email bus cleanup (delete from mailbox) */
+  mail_uid?: number;
 };
 
 export type BusTrustLevel = "normal" | "root";
@@ -126,6 +129,16 @@ export async function deleteBus(busId: string): Promise<void> {
       await telegramDeleteChatHistory(peerId);
     }
   }
+  if (busId.startsWith("email-")) {
+    if (!isMailConnected()) {
+      throw new Error("Mail not connected. Connect mail before deleting an email bus.");
+    }
+    const history = getHistory(busId);
+    const uids = history.map((m) => m.mail_uid).filter((u): u is number => typeof u === "number" && u > 0);
+    if (uids.length > 0) {
+      await mailDeleteMessagesByUids(uids);
+    }
+  }
   deleteBusHistory(busId);
 }
 
@@ -178,5 +191,6 @@ export function appendToBusHistory(busId: string, message: BusMessage): void {
     user_name: message.user_name,
     bus_id: message.bus_id ?? busId,
     timestamp: message.timestamp,
+    mail_uid: message.mail_uid,
   });
 }

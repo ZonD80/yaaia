@@ -57,6 +57,7 @@ interface ElectronAPI {
   onStartupProgressReset: (callback: () => void) => () => void;
   onAgentMessage: (callback: (content: string) => void) => () => void;
   onTelegramMessage: (callback: (payload: { bus_id: string; user_id: number; user_name: string; content: string }) => void) => () => void;
+  onEmailMessage: (callback: (payload: { bus_id: string; user_id: number; user_name: string; content: string; instruction?: string }) => void) => () => void;
   onScheduleTrigger: (callback: (message: string) => void) => () => void;
   onTelegramLoginRequest: (callback: (info: { step: "phone" | "code" | "password" }) => void) => () => void;
   telegramLoginReply: (value: string) => Promise<void>;

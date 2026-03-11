@@ -26,6 +26,7 @@
     "chrome-devtools-mcp": "^0.18.1",
     "express": "^4.21.0",
     "imapflow": "^1.2.11",
+    "mailparser": "^3.9.4",
     "marked": "^17.0.2",
     "otplib": "^13.3.0",
     "vue": "^3.4.0",
@@ -37,6 +38,7 @@
   },
   "devDependencies": {
     "@types/express": "^5.0.6",
+    "@types/mailparser": "^3.4.6",
     "@types/ws": "^8.18.1",
     "@vitejs/plugin-vue": "^5.0.0",
     "electron": "^40.6.0",

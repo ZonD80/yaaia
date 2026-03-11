@@ -991,6 +991,7 @@ let startupProgressResetUnsub: (() => void) | undefined;
 let agentMessageUnsub: (() => void) | undefined;
 let scheduleTriggerUnsub: (() => void) | undefined;
 let telegramMessageUnsub: (() => void) | undefined;
+let emailMessageUnsub: (() => void) | undefined;
 let telegramLoginUnsub: (() => void) | undefined;
 
 /** Queued messages when agent is busy; drained and sent together when agent finishes. */
@@ -1304,6 +1305,38 @@ onMounted(async () => {
     }
   });
 
+  emailMessageUnsub = window.electronAPI?.onEmailMessage?.((payload) => {
+    const msg = JSON.stringify(payload);
+    const preview = payload.content.length > 300 ? payload.content.slice(0, 300) + "…" : payload.content;
+    const incomingLabel = `📧 **Email** (${payload.user_name}): ${preview}`;
+    messages.value.push({ role: "user", content: incomingLabel, isTelegram: true });
+    scrollToBottomAlways();
+    if (sending.value) {
+      queueMessage(msg, payload.bus_id);
+    } else {
+      sending.value = true;
+      streaming.value = true;
+      streamBuffer.value = "";
+      window.electronAPI
+        ?.agentSendMessage?.(msg, [], payload.bus_id)
+        ?.then(() => {})
+        ?.catch((err) => {
+          const { parts, tail } = parseStream(streamBuffer.value);
+          for (const p of parts) messages.value.push(p);
+          const content = tail.trim() ? `${tail.trim()}\n\n**Error:** ${err}` : `Error: ${err}`;
+          messages.value.push({ role: "assistant", content, isError: true });
+        })
+        ?.finally(async () => {
+          sending.value = false;
+          streaming.value = false;
+          streamBuffer.value = "";
+          await refreshMessagesFromRoot();
+          scrollToBottomAlways();
+          await drainQueueAndSend();
+        });
+    }
+  });
+
   askUserUnsub = window.electronAPI?.onAskUserPopup?.((info) => {
     playNotificationSound();
     askUserInfo.value = info;
@@ -1374,6 +1407,7 @@ onUnmounted(() => {
   agentMessageUnsub?.();
   scheduleTriggerUnsub?.();
   telegramMessageUnsub?.();
+  emailMessageUnsub?.();
   telegramLoginUnsub?.();
   stopAskUserCountdown();
   stopTaskTimer();

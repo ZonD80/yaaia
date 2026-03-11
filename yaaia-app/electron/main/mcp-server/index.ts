@@ -35,6 +35,7 @@ import {
   callKbTool,
   runQmdCli,
   kbWrite,
+  kbReplace,
   kbDelete,
   kbList,
   kbCollectionAdd,
@@ -46,6 +47,7 @@ import {
 } from "./kb-client.js";
 import {
   mailConnect,
+  mailInitInboxAndWatch,
   mailDisconnect,
   mailList,
   mailListTree,
@@ -86,8 +88,28 @@ import {
   getBusTrustLevel,
   ROOT_BUS_ID,
 } from "../message-bus-store.js";
+import { removeMessagesFromBusHistoryByMailUids } from "../history-store.js";
 
 const BROWSER_URL = "http://127.0.0.1:9222";
+
+/** Parse IMAP range (e.g. "123", "123,124", "123:125") into UID list. */
+function parseUidRange(range: string): number[] {
+  const uids: number[] = [];
+  for (const part of range.split(",").map((s) => s.trim())) {
+    const colon = part.indexOf(":");
+    if (colon >= 0) {
+      const lo = parseInt(part.slice(0, colon), 10);
+      const hi = parseInt(part.slice(colon + 1), 10);
+      if (!isNaN(lo) && !isNaN(hi) && lo <= hi) {
+        for (let i = lo; i <= hi; i++) uids.push(i);
+      }
+    } else {
+      const n = parseInt(part, 10);
+      if (!isNaN(n)) uids.push(n);
+    }
+  }
+  return uids;
+}
 
 const BUS_ID_PARAM = z
   .string()
@@ -443,6 +465,47 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         recipeStore.appendToolCall("kb__delete", args, msg);
+        return toolResult(`Error: ${msg}`);
+      }
+    }
+  );
+
+  server.registerTool(
+    "kb__replace",
+    {
+      description: "Replace a range of lines (from_line to to_line inclusive, 0-based) in a .md or .qmd file. to_line=-1 means end of file. For append: from_line=line count (one past last), to_line=-1.",
+      inputSchema: z.object({
+        bus_id: BUS_ID_PARAM,
+        collection: z.string().describe("Collection name (e.g. lessons_learned, identity)"),
+        path: z.string().describe("Path relative to collection e.g. file.md or subfolder/note.md"),
+        from_line: z.number().describe("0-based start line (inclusive)"),
+        to_line: z.number().describe("0-based end line (inclusive). -1 = end of file."),
+        content: z.string().describe("Replacement content (newline-separated for multiple lines)"),
+        assessment: ASSESSMENT_PARAM,
+        clarification: CLARIFICATION_PARAM,
+      }),
+    },
+    async (args) => {
+      logToolCall("kb__replace", args);
+      const allowed = new Set([...KB_BASE, "collection", "path", "from_line", "to_line", "content"]);
+      const unknownMsg = validateUnknownParams("kb__replace", args, allowed);
+      if (unknownMsg) {
+        recipeStore.appendToolCall("kb__replace", args, unknownMsg);
+        return toolResult(unknownMsg);
+      }
+      const { collection, path: p, from_line, to_line, content } = args as { collection: string; path: string; from_line: number; to_line: number; content: string };
+      logClarification("kb__replace", args);
+      logAssessment("kb__replace", args);
+      try {
+        const fullPath = buildKbPathFromCollection(collection, p);
+        kbReplace(fullPath, from_line, to_line, content);
+        await runQmdCli(["update"]);
+        await runQmdCli(["embed"]);
+        recipeStore.appendToolCall("kb__replace", args, "Replaced.");
+        return toolResult(`Replaced lines ${from_line}-${to_line} in ${collection}/${p}. Index updated.`);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        recipeStore.appendToolCall("kb__replace", args, msg);
         return toolResult(`Error: ${msg}`);
       }
     }
@@ -1134,19 +1197,7 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
             : true;
       logClarification("finalize_task", args);
       logAssessment("finalize_task", args);
-      const taskBusId = recipeStore.getTaskBusId();
       recipeStore.finalize(is_successful, assessment, clarification);
-      if (taskBusId && taskBusId.startsWith("telegram-") && getBusTrustLevel(taskBusId) === "root") {
-        const status = is_successful ? "✅ Task completed successfully" : "❌ Task did not complete successfully";
-        const parts: string[] = [status];
-        if (assessment) parts.push(`**Assessment:** ${assessment}`);
-        if (clarification) parts.push(`**Clarification:** ${clarification}`);
-        try {
-          await config.onSendMessageToTelegram?.(taskBusId, parts.join("\n\n"));
-        } catch (err) {
-          console.warn("[YAAIA] Forward finalize to trusted bus failed:", err);
-        }
-      }
       return toolResult("Task finalized. Write \"Done.\"");
     }
   );
@@ -1391,8 +1442,9 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
       logAssessment("mail__connect", args);
       try {
         await mailConnect({ host: a.host, port: a.port, user: a.user, pass: a.pass, secure: a.secure });
+        const { busId, messageCount } = await mailInitInboxAndWatch(a.user);
         recipeStore.appendToolCall("mail__connect", args, "Connected.");
-        return toolResult("Connected.");
+        return toolResult(`Connected. Bus ${busId} created. ${messageCount} message(s) loaded.`);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         recipeStore.appendToolCall("mail__connect", args, msg);
@@ -1966,12 +2018,18 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
         recipeStore.appendToolCall("mail__message_delete", args, unknownMsg);
         return toolResult(unknownMsg);
       }
-      const a = args as { range: string; uid?: boolean; mailbox?: string };
+      const a = args as { bus_id: string; range: string; uid?: boolean; mailbox?: string };
       logClarification("mail__message_delete", args);
       logAssessment("mail__message_delete", args);
       try {
         if (a.mailbox) await mailMailboxOpen(a.mailbox);
         await mailMessageDelete(a.range, a.uid ?? true);
+        if (a.bus_id.startsWith("email-")) {
+          const uids = parseUidRange(a.range);
+          if (uids.length > 0) {
+            removeMessagesFromBusHistoryByMailUids(a.bus_id, uids);
+          }
+        }
         recipeStore.appendToolCall("mail__message_delete", args, "Deleted.");
         return toolResult("Deleted.");
       } catch (err) {

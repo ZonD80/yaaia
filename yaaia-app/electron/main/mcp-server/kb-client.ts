@@ -281,6 +281,30 @@ export function kbWrite(relativePath: string, content: string): void {
   writeFileSync(full, content, "utf-8");
 }
 
+/**
+ * Replace lines from_line to to_line (inclusive, 0-based) with content.
+ * to_line=-1 means end of file. Use from_line=last line index, to_line=-1 to append.
+ */
+export function kbReplace(relativePath: string, fromLine: number, toLine: number, content: string): void {
+  const full = resolveKbPath(relativePath);
+  if (!existsSync(full)) {
+    throw new Error(`File not found: ${relativePath}`);
+  }
+  ensureAllowedExt(relativePath);
+  const existing = readFileSync(full, "utf-8");
+  const lines = existing.split("\n");
+  const to = toLine < 0 ? lines.length - 1 : Math.min(toLine, lines.length - 1);
+  const from = Math.max(0, fromLine);
+  const newLines = content.split("\n");
+  let result: string[];
+  if (from > to) {
+    result = [...lines.slice(0, from), ...newLines, ...lines.slice(from)];
+  } else {
+    result = [...lines.slice(0, from), ...newLines, ...lines.slice(to + 1)];
+  }
+  writeFileSync(full, result.join("\n"), "utf-8");
+}
+
 export function kbDelete(relativePath: string): void {
   const full = resolveKbPath(relativePath);
   if (!existsSync(full)) {

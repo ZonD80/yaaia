@@ -114,6 +114,11 @@ try {
       ipcRenderer.on("telegram-message", fn);
       return () => ipcRenderer.removeListener("telegram-message", fn);
     },
+    onEmailMessage: (callback: (payload: { bus_id: string; user_id: number; user_name: string; content: string; instruction?: string }) => void) => {
+      const fn = (_: unknown, payload: { bus_id: string; user_id: number; user_name: string; content: string; instruction?: string }) => callback(payload);
+      ipcRenderer.on("email-message", fn);
+      return () => ipcRenderer.removeListener("email-message", fn);
+    },
     onScheduleTrigger: (callback: (message: string) => void) => {
       const fn = (_: unknown, message: string) => callback(message);
       ipcRenderer.on("schedule-trigger", fn);
