@@ -5,7 +5,7 @@
 
 import { mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import { TelegramClient } from "@mtcute/node";
-import { sendText, sendTyping, readHistory, iterDialogs, searchMessages } from "@mtcute/core/methods.js";
+import { sendText, sendTyping, readHistory, iterDialogs, searchMessages, deleteHistory } from "@mtcute/core/methods.js";
 import { md } from "@mtcute/markdown-parser";
 import { getPeer } from "@mtcute/core/methods.js";
 import { homedir } from "node:os";
@@ -18,7 +18,7 @@ const YAAIA_DIR = join(homedir(), "yaaia");
 const TELEGRAM_STORAGE = join(YAAIA_DIR, "telegram-session");
 const TELEGRAM_LAST_SEEN_PATH = join(YAAIA_DIR, "telegram-last-seen.json");
 
-export type MissedMessagePayload = { bus_id: string; user_id: number; user_name: string; content: string };
+export type MissedMessagePayload = { bus_id: string; user_id: number; user_name: string; content: string; timestamp?: string };
 
 function loadLastReceivedTimestamp(): number {
   try {
@@ -55,6 +55,8 @@ export type OnTelegramMessageCallback = (payload: {
   user_id: number;
   user_name: string;
   content: string;
+  /** ISO timestamp of the message; used for history file path */
+  timestamp?: string;
 }) => void;
 
 let onMessageCallback: OnTelegramMessageCallback | null = null;
@@ -124,12 +126,14 @@ async function handleNewMessage(msg: Message): Promise<void> {
   const userId = sender.type === "user" ? sender.id : 0;
   const userName = sender.type === "user" ? (sender.username ?? sender.displayName ?? String(userId)) : "unknown";
   const content = msg.text.trim();
+  const timestamp = msg.date instanceof Date ? msg.date.toISOString() : undefined;
   console.log("[YAAIA Telegram] Delivering message to bus:", busId, "from", userName);
   onMessageCallback?.({
     bus_id: busId,
     user_id: userId,
     user_name: userName,
     content,
+    timestamp,
   });
   if (client) {
     try {
@@ -180,6 +184,7 @@ export async function telegramFetchMissedMessages(): Promise<MissedMessagePayloa
   const delivered: MissedMessagePayload[] = [];
   let maxDate = since;
   for (const { msg, date } of all) {
+    if (date <= since) continue; /* skip last message we already received (minDate is inclusive) */
     const chat = msg.chat;
     const sender = msg.sender;
     const chatId = chat.id;
@@ -187,8 +192,9 @@ export async function telegramFetchMissedMessages(): Promise<MissedMessagePayloa
     const userId = sender.type === "user" ? sender.id : 0;
     const userName = sender.type === "user" ? (sender.username ?? sender.displayName ?? String(userId)) : "unknown";
     const content = msg.text?.trim() ?? "";
-    delivered.push({ bus_id: busId, user_id: userId, user_name: userName, content });
-    onMessageCallback?.({ bus_id: busId, user_id: userId, user_name: userName, content });
+    const timestamp = msg.date instanceof Date ? msg.date.toISOString() : undefined;
+    delivered.push({ bus_id: busId, user_id: userId, user_name: userName, content, timestamp });
+    onMessageCallback?.({ bus_id: busId, user_id: userId, user_name: userName, content, timestamp });
     if (date > maxDate) maxDate = date;
   }
   if (maxDate > since) saveLastReceivedTimestamp(maxDate);
@@ -230,6 +236,12 @@ export async function telegramSendTyping(peerId: number): Promise<void> {
   } catch (err) {
     console.warn("[YAAIA Telegram] sendTyping failed:", err);
   }
+}
+
+/** Delete chat history from Telegram (for private chats and legacy groups). Requires Telegram to be connected. */
+export async function telegramDeleteChatHistory(peerId: number): Promise<void> {
+  const tg = getClient();
+  await deleteHistory(tg, peerId, { mode: "delete" });
 }
 
 export async function telegramDisconnect(): Promise<void> {

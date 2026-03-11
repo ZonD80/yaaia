@@ -1117,6 +1117,34 @@ let telegramLoginUnsub: (() => void) | undefined;
 
 const streamingParsed = computed(() => parseStream(streamBuffer.value));
 
+type RootHistoryMessage = { role: string; content: string; user_id?: number; user_name?: string; bus_id?: string };
+
+function rootHistoryToMessages(hist: RootHistoryMessage[]): ChatMessage[] {
+  return hist.map((m) => {
+    const role = m.role as "user" | "assistant";
+    const busId = m.bus_id;
+    const userName = m.user_name ?? "";
+    let content = m.content;
+    if (role === "user" && busId) {
+      content = `📱 **${busId}** (${userName}): ${content}`;
+      return { role, content, type: undefined, isTelegram: true };
+    }
+    if (role === "assistant" && busId) {
+      content = `[${busId}] ${content}`;
+    }
+    return { role, content, type: role === "assistant" ? "content" : undefined };
+  });
+}
+
+async function refreshMessagesFromRoot(): Promise<void> {
+  try {
+    const rootHistory = ((await window.electronAPI?.messageBusGetHistory?.("root")) ?? []) as RootHistoryMessage[];
+    messages.value = rootHistoryToMessages(rootHistory);
+  } catch {
+    /* ignore */
+  }
+}
+
 async function startChat() {
   starting.value = true;
   try {
@@ -1135,12 +1163,7 @@ async function startChat() {
       pendingReportForNextMessage.value = false;
       agentReady.value = true;
       agentBrowserError.value = "";
-      const rootHistory = (await window.electronAPI?.messageBusGetHistory?.("root")) ?? [];
-      messages.value = rootHistory.map((m: { role: string; content: string }) => ({
-        role: m.role as "user" | "assistant",
-        content: m.content,
-        type: m.role === "assistant" ? "content" : undefined,
-      }));
+      await refreshMessagesFromRoot();
     } else {
       alert(result?.message ?? "Failed to start");
     }
@@ -1226,6 +1249,7 @@ async function send() {
     sending.value = false;
     streaming.value = false;
     streamBuffer.value = "";
+    await refreshMessagesFromRoot();
     scrollToBottomAlways();
   }
 }
@@ -1310,10 +1334,11 @@ onMounted(async () => {
           const content = tail.trim() ? `${tail.trim()}\n\n**Error:** ${err}` : `Error: ${err}`;
           messages.value.push({ role: "assistant", content, isError: true });
         })
-        ?.finally(() => {
+        ?.finally(async () => {
           sending.value = false;
           streaming.value = false;
           streamBuffer.value = "";
+          await refreshMessagesFromRoot();
           scrollToBottomAlways();
         });
     }
@@ -1332,19 +1357,18 @@ onMounted(async () => {
       streamBuffer.value = "";
       window.electronAPI
         ?.agentSendMessage?.(msg, [], payload.bus_id)
-        ?.then(() => {
-          // Reply was sent to Telegram via send_message; no need to push to desktop chat
-        })
+        ?.then(() => {})
         ?.catch((err) => {
           const { parts, tail } = parseStream(streamBuffer.value);
           for (const p of parts) messages.value.push(p);
           const content = tail.trim() ? `${tail.trim()}\n\n**Error:** ${err}` : `Error: ${err}`;
           messages.value.push({ role: "assistant", content, isError: true });
         })
-        ?.finally(() => {
+        ?.finally(async () => {
           sending.value = false;
           streaming.value = false;
           streamBuffer.value = "";
+          await refreshMessagesFromRoot();
           scrollToBottomAlways();
         });
     }

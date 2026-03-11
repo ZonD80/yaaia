@@ -108,6 +108,7 @@ export async function connectKbMcp(
   console.log(`${QMD_LOG_PREFIX} MCP connected`);
 
   onProgress?.("Indexing knowledge base...");
+  await kbEnsureCollection("history");
   console.log(`${QMD_LOG_PREFIX} Running qmd update...`);
   await runQmdCli(["update"], onProgress);
   console.log(`${QMD_LOG_PREFIX} Running qmd embed...`);
@@ -149,12 +150,15 @@ export async function callKbTool(
   if (!kbClient) throw new Error("KB MCP not connected");
   console.log(`${QMD_LOG_PREFIX} callTool: ${name}`, JSON.stringify(args));
   const result = await kbClient.callTool({ name, arguments: args });
-  const text = (result as { content?: { type: string; text?: string }[] }).content
-    ?.filter((c) => c.type === "text" && c.text)
-    .map((c) => (c as { text: string }).text)
-    .join("\n")
-    .slice(0, 200);
-  console.log(`${QMD_LOG_PREFIX} callTool ${name} result:`, text ? `"${text}${(text?.length ?? 0) >= 200 ? "..." : ""}"` : "(empty)");
+  const content = (result as { content?: { type: string; text?: string; resource?: { text?: string } }[] }).content ?? [];
+  const parts: string[] = [];
+  for (const c of content) {
+    if (c.type === "text" && typeof c.text === "string") parts.push(c.text);
+    else if (c.type === "resource" && c.resource && typeof c.resource.text === "string") parts.push(c.resource.text);
+  }
+  const fullText = parts.join("\n").trim();
+  const text = fullText.slice(0, 200);
+  console.log(`${QMD_LOG_PREFIX} callTool ${name} result:`, text ? `"${text}${fullText.length >= 200 ? "..." : ""}"` : "(empty)");
   return result as { content: { type: string; text?: string }[] };
 }
 

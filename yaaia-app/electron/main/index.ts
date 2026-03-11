@@ -54,6 +54,7 @@ import {
   ensureBus,
   getBusHistory,
   getBusHistorySlice,
+  getRootLogForModel,
   isBusBanned,
   listBuses,
   setBusProperties,
@@ -62,6 +63,7 @@ import {
   wipeRootHistory,
   ROOT_BUS_ID,
 } from "./message-bus-store.js";
+import { ensureHistoryCollection } from "./history-store.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -552,9 +554,9 @@ ipcMain.handle("start-chat", async (_event, config: McpConfig) => {
           user_id: payload.user_id,
           user_name: payload.user_name,
           bus_id: payload.bus_id,
+          timestamp: payload.timestamp,
         };
         appendToBusHistory(payload.bus_id, busMsg);
-        appendToBusHistory(ROOT_BUS_ID, busMsg);
         const peerId = parseInt(payload.bus_id.replace("telegram-", ""), 10);
         if (!isNaN(peerId) && isTelegramConnected()) {
           telegramSendTyping(peerId).catch(() => { });
@@ -728,11 +730,24 @@ ipcMain.handle(
     const cfg = loadConfig();
     const targetBusId = busId ?? ROOT_BUS_ID;
     if (targetBusId === ROOT_BUS_ID) {
+      let parsed: { content?: string; user_id?: number; user_name?: string; bus_id?: string } | null = null;
+      if (typeof message === "string" && message.startsWith("{")) {
+        try {
+          parsed = JSON.parse(message);
+        } catch {
+          /* fall through */
+        }
+      }
+      const content = parsed?.content ?? message;
+      const user_name = parsed?.user_name ?? cfg.userName ?? "";
+      const user_id = parsed?.user_id ?? 0;
+      const bus_id = parsed?.bus_id && parsed.bus_id !== ROOT_BUS_ID ? parsed.bus_id : undefined;
       appendToBusHistory(ROOT_BUS_ID, {
         role: "user",
-        content: typeof message === "string" && message.startsWith("{") ? JSON.parse(message).content : message,
-        user_id: 0,
-        user_name: cfg.userName ?? "",
+        content,
+        user_id,
+        user_name,
+        ...(bus_id && { bus_id }),
       });
     }
     const userMsg =
@@ -745,7 +760,7 @@ ipcMain.handle(
           content: message,
         });
     const tag = recipeStore.getSessionTag();
-    const busHistory = getBusHistory(ROOT_BUS_ID);
+    const { messages: busHistory, trimmedCount } = getRootLogForModel();
     const history: { role: "user" | "assistant"; content: string; wrap?: boolean }[] = busHistory.map((m) => {
       const busId = m.bus_id ?? ROOT_BUS_ID;
       const wrap = getBusTrustLevel(busId) === "root" && !!tag;
@@ -775,7 +790,8 @@ ipcMain.handle(
         userMsg,
         (chunk) => event.sender.send("agent-stream-chunk", String(chunk ?? "")),
         history,
-        targetBusId
+        targetBusId,
+        trimmedCount
       );
       const finalizeInfo = recipeStore.completeFinalizeWithReport(result.text ?? "");
       if (finalizeInfo) {
@@ -795,12 +811,15 @@ ipcMain.handle(
           try {
             await telegramSendText(peerId, fallbackText);
             appendToBusHistory(targetBusId, { role: "assistant", content: fallbackText });
-            appendToBusHistory(ROOT_BUS_ID, { role: "assistant", content: fallbackText, bus_id: targetBusId });
           } catch (err) {
             console.warn("[YAAIA] Fallback send to Telegram failed:", err);
           }
         }
       }
+      ensureHistoryCollection()
+        .then(() => runQmdCli(["update"]))
+        .then(() => runQmdCli(["embed"]))
+        .catch((err) => console.warn("[YAAIA] History index update failed:", err));
       return safeForIPC(String(result.text ?? ""));
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -916,8 +935,8 @@ ipcMain.handle("message-bus-set-description", (_, busId: string, description: st
   setBusProperties(busId, { description });
   return undefined;
 });
-ipcMain.handle("message-bus-delete", (_, busId: string) => {
-  deleteBus(busId);
+ipcMain.handle("message-bus-delete", async (_, busId: string) => {
+  await deleteBus(busId);
   return undefined;
 });
 ipcMain.handle("message-bus-get-history", (_, busId: string) => safeForIPC(getBusHistory(busId)));
@@ -1057,6 +1076,28 @@ ipcMain.handle("recipe-load", async () => {
 ipcMain.handle("agent-inject-message", (_, msg: string, placeAfterAskUser?: boolean) => {
   recipeStore.appendUserInjection(msg, placeAfterAskUser ?? false);
   setPendingInjectMessage(msg);
+  let parsed: { content?: string; user_id?: number; user_name?: string; bus_id?: string } | null = null;
+  if (typeof msg === "string" && msg.startsWith("{")) {
+    try {
+      parsed = JSON.parse(msg);
+    } catch {
+      /* ignore */
+    }
+  }
+  const busId = parsed?.bus_id;
+  if (busId?.startsWith("telegram-")) {
+    return undefined;
+  }
+  const content = parsed?.content ?? msg;
+  const user_name = parsed?.user_name ?? loadConfig().userName ?? "";
+  const user_id = parsed?.user_id ?? 0;
+  appendToBusHistory(busId === "root" || !busId ? ROOT_BUS_ID : busId, {
+    role: "user",
+    content,
+    user_id,
+    user_name,
+    ...(busId && busId !== "root" && { bus_id: busId }),
+  });
   return undefined;
 });
 

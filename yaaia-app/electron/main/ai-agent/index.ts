@@ -255,18 +255,26 @@ function buildUserMessagesWithTag(
   userMessage: string,
   history: HistoryMessage[],
   tag: string | null,
-  targetBusId?: string
+  targetBusId?: string,
+  trimmedCount?: number
 ): OpenAIMessage[] {
   const wrapContent = (s: string) => (tag ? wrapUserContent(s, tag) : s);
   const messages: OpenAIMessage[] = [];
-  if (history.length > 0) {
-    const historyBlock = history
-      .map((h) => {
-        const content = h.wrap && tag ? wrapContent(h.content) : h.content;
-        return `${h.role === "user" ? "User" : "Assistant"}: ${content}`;
-      })
-      .join("\n");
-    messages.push({ role: "user" as const, content: `Conversation history:\n${historyBlock}` });
+  if (history.length > 0 || (trimmedCount !== undefined && trimmedCount > 0)) {
+    const trimmedNote =
+      trimmedCount !== undefined && trimmedCount > 0
+        ? `Note: ${trimmedCount} earlier message(s) were trimmed to fit 50K chars. Use get_bus_history(bus_id="root", offset=1, limit=50) to fetch older messages (offset=1 for first 50, offset=51 for next 50, etc.).\n\n`
+        : "";
+    const historyBlock =
+      history.length > 0
+        ? history
+            .map((h) => {
+              const content = h.wrap && tag ? wrapContent(h.content) : h.content;
+              return `${h.role === "user" ? "User" : "Assistant"}: ${content}`;
+            })
+            .join("\n")
+        : "";
+    messages.push({ role: "user" as const, content: `${trimmedNote}Conversation history:\n${historyBlock}` });
   }
   const wrapUser = targetBusId && getBusTrustLevel(targetBusId) === "root" && tag;
   messages.push({ role: "user" as const, content: wrapUser ? wrapContent(userMessage) : userMessage });
@@ -278,12 +286,13 @@ async function runOpenRouterSendMessage(
   userMessage: string,
   onChunk?: StreamChunkCallback,
   history: HistoryMessage[] = [],
-  targetBusId?: string
+  targetBusId?: string,
+  trimmedCount?: number
 ): Promise<{ text: string }> {
   const apiKey = agentConfig!.openrouterApiKey.trim();
   const openAITools = mcpTools.map(mcpToolToOpenAI);
   const tag = getSessionTag();
-  const messages: OpenAIMessage[] = buildUserMessagesWithTag(userMessage, history, tag, targetBusId);
+  const messages: OpenAIMessage[] = buildUserMessagesWithTag(userMessage, history, tag, targetBusId, trimmedCount);
   const emitChunk = (chunk: string) => {
     if (chunk && onChunk) onChunk(chunk);
   };
@@ -357,7 +366,8 @@ export async function sendMessage(
   userMessage: string,
   onChunk?: StreamChunkCallback,
   history: HistoryMessage[] = [],
-  targetBusId?: string
+  targetBusId?: string,
+  trimmedCount?: number
 ): Promise<{ text: string }> {
   if (!mcpClient || !mcpTransport || !agentConfig) {
     throw new Error("Agent not started. Add API key and click Start chat.");
@@ -367,7 +377,7 @@ export async function sendMessage(
   const { tools: mcpTools } = await mcpClient.listTools();
 
   if (agentConfig.aiProvider === "openrouter") {
-    return runOpenRouterSendMessage(mcpTools, userMessage, onChunk, history, targetBusId);
+    return runOpenRouterSendMessage(mcpTools, userMessage, onChunk, history, targetBusId, trimmedCount);
   }
 
   const anthropicTools = mcpTools.map(mcpToolToAnthropic);
@@ -380,7 +390,8 @@ export async function sendMessage(
     userMessage,
     history,
     tag,
-    targetBusId
+    targetBusId,
+    trimmedCount
   ) as Anthropic.MessageParam[];
   const emitChunk = (chunk: string) => {
     if (chunk && onChunk) onChunk(chunk);

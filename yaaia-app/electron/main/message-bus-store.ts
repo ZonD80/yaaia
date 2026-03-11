@@ -1,12 +1,26 @@
 /**
- * Message bus store: buses with descriptions and per-bus history.
- * Each bus saved to yaaia/mb/{bus_id}.json
+ * Message bus store: bus metadata in yaaia/mb/{bus_id}.json,
+ * message history in kb/history/YYYY-MM-DD/{bus_id}/{seq}.md
  * Root bus (bus_id="root") always exists and cannot be deleted by agent.
  */
 
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync, unlinkSync } from "node:fs";
+import {
+  appendToHistory,
+  deleteBusHistory,
+  getActiveBuses,
+  getBusHistory as getHistory,
+  getBusHistorySlice as getHistorySlice,
+  getRootLog,
+  getRootLogFull,
+  toBusMessage,
+  wipeRootHistory as wipeHistory,
+} from "./history-store.js";
+import { isTelegramConnected, telegramDeleteChatHistory } from "./telegram-client.js";
+
+export type RootLogForModel = { messages: BusMessage[]; trimmedCount: number };
 
 export const ROOT_BUS_ID = "root";
 
@@ -17,11 +31,11 @@ const LEGACY_PATH = join(YAAIA_DIR, "agentData", "message-buses.json");
 export type BusMessage = {
   role: "user" | "assistant";
   content: string;
-  /** For user messages: user_id, user_name from the bus */
   user_id?: number;
   user_name?: string;
-  /** bus_id when message is from a non-root bus (e.g. telegram-123) */
   bus_id?: string;
+  /** ISO timestamp; when set, used for history file path (YYYY-MM-DD) */
+  timestamp?: string;
 };
 
 export type BusTrustLevel = "normal" | "root";
@@ -33,15 +47,13 @@ export type BusEntry = {
   is_banned?: boolean;
 };
 
-type BusFile = {
+type BusMeta = {
   bus_id: string;
   description: string;
   trust_level?: BusTrustLevel;
   is_banned?: boolean;
-  messages: BusMessage[];
 };
 
-/** Sanitize bus_id for use as filename (replace / and \ with safe chars) */
 function busIdToFilename(busId: string): string {
   return busId.replace(/\//g, "__f__").replace(/\\/g, "__b__") + ".json";
 }
@@ -54,7 +66,7 @@ function getBusFilePath(busId: string): string {
   return join(MB_DIR, busIdToFilename(busId));
 }
 
-function loadBusFile(busId: string): BusFile | null {
+function loadBusMeta(busId: string): BusMeta | null {
   const path = getBusFilePath(busId);
   try {
     if (existsSync(path)) {
@@ -65,7 +77,6 @@ function loadBusFile(busId: string): BusFile | null {
           description: String(raw.description ?? ""),
           trust_level: raw.trust_level === "root" ? "root" : "normal",
           is_banned: Boolean(raw.is_banned),
-          messages: Array.isArray(raw.messages) ? raw.messages : [],
         };
       }
     }
@@ -75,10 +86,9 @@ function loadBusFile(busId: string): BusFile | null {
   return null;
 }
 
-function saveBusFile(data: BusFile): void {
+function saveBusMeta(data: BusMeta): void {
   mkdirSync(MB_DIR, { recursive: true });
-  const path = getBusFilePath(data.bus_id);
-  writeFileSync(path, JSON.stringify(data, null, 2), "utf-8");
+  writeFileSync(getBusFilePath(data.bus_id), JSON.stringify(data, null, 2), "utf-8");
 }
 
 function migrateFromLegacy(): void {
@@ -86,11 +96,13 @@ function migrateFromLegacy(): void {
     if (!existsSync(LEGACY_PATH)) return;
     const raw = JSON.parse(readFileSync(LEGACY_PATH, "utf-8"));
     const buses: Array<{ bus_id: string; description: string }> = raw?.buses ?? [];
-    const history: Record<string, BusMessage[]> = raw?.history ?? {};
     mkdirSync(MB_DIR, { recursive: true });
     for (const b of buses) {
-      const messages = history[b.bus_id] ?? [];
-      saveBusFile({ bus_id: b.bus_id, description: b.description, trust_level: "normal", messages });
+      saveBusMeta({
+        bus_id: b.bus_id,
+        description: b.description,
+        trust_level: "normal",
+      });
     }
     unlinkSync(LEGACY_PATH);
     console.log("[YAAIA] Migrated message buses to mb/");
@@ -100,13 +112,12 @@ function migrateFromLegacy(): void {
 }
 
 function ensureRootBus(): void {
-  const existing = loadBusFile(ROOT_BUS_ID);
+  const existing = loadBusMeta(ROOT_BUS_ID);
   if (!existing) {
-    saveBusFile({
+    saveBusMeta({
       bus_id: ROOT_BUS_ID,
       description: "Desktop chat (root)",
       trust_level: "normal",
-      messages: [],
     });
   }
 }
@@ -114,21 +125,30 @@ function ensureRootBus(): void {
 export function listBuses(): BusEntry[] {
   migrateFromLegacy();
   ensureRootBus();
+  const seen = new Set<string>();
   const out: BusEntry[] = [];
   try {
-    if (!existsSync(MB_DIR)) return out;
-    const files = readdirSync(MB_DIR);
-    for (const f of files) {
-      if (!f.endsWith(".json")) continue;
-      const busId = filenameToBusId(f);
-      const data = loadBusFile(busId);
-      if (data) {
-        out.push({
-          bus_id: data.bus_id,
-          description: data.description,
-          trust_level: data.trust_level ?? "normal",
-          is_banned: data.is_banned ?? false,
-        });
+    if (existsSync(MB_DIR)) {
+      const files = readdirSync(MB_DIR);
+      for (const f of files) {
+        if (!f.endsWith(".json")) continue;
+        const busId = filenameToBusId(f);
+        const data = loadBusMeta(busId);
+        if (data) {
+          seen.add(busId);
+          out.push({
+            bus_id: data.bus_id,
+            description: data.description,
+            trust_level: data.trust_level ?? "normal",
+            is_banned: data.is_banned ?? false,
+          });
+        }
+      }
+    }
+    for (const busId of getActiveBuses()) {
+      if (!seen.has(busId)) {
+        seen.add(busId);
+        out.push({ bus_id: busId, description: "", trust_level: "normal", is_banned: false });
       }
     }
   } catch (err) {
@@ -138,18 +158,18 @@ export function listBuses(): BusEntry[] {
 }
 
 export function getBusDescription(busId: string): string {
-  const data = loadBusFile(busId);
+  const data = loadBusMeta(busId);
   return data?.description ?? "";
 }
 
 export function getBusTrustLevel(busId: string): BusTrustLevel {
-  const data = loadBusFile(busId);
+  const data = loadBusMeta(busId);
   return data?.trust_level === "root" ? "root" : "normal";
 }
 
 export function isBusBanned(busId: string): boolean {
   if (busId === ROOT_BUS_ID) return false;
-  const data = loadBusFile(busId);
+  const data = loadBusMeta(busId);
   return Boolean(data?.is_banned);
 }
 
@@ -158,11 +178,10 @@ export function setBusProperties(
   props: { description?: string; trust_level?: BusTrustLevel; is_banned?: boolean }
 ): void {
   ensureRootBus();
-  const data = loadBusFile(busId) ?? {
+  const data = loadBusMeta(busId) ?? {
     bus_id: busId,
     description: "",
     trust_level: "normal" as BusTrustLevel,
-    messages: [],
   };
   data.bus_id = busId;
   if (props.description !== undefined) data.description = props.description;
@@ -171,72 +190,89 @@ export function setBusProperties(
     if (busId === ROOT_BUS_ID) throw new Error("Root bus cannot be banned");
     data.is_banned = props.is_banned;
   }
-  saveBusFile(data);
+  saveBusMeta(data);
 }
 
 export function ensureBus(busId: string, description?: string): void {
   ensureRootBus();
-  const data = loadBusFile(busId);
+  const data = loadBusMeta(busId);
   if (!data) {
-    saveBusFile({
+    saveBusMeta({
       bus_id: busId,
       description: description ?? "",
       trust_level: "normal",
-      messages: [],
     });
   } else if (description !== undefined) {
     data.description = description;
-    saveBusFile(data);
+    saveBusMeta(data);
   }
 }
 
-export function deleteBus(busId: string): void {
+export async function deleteBus(busId: string): Promise<void> {
   if (busId === ROOT_BUS_ID) {
     throw new Error("Root bus cannot be deleted");
   }
+  if (busId.startsWith("telegram-")) {
+    if (!isTelegramConnected()) {
+      throw new Error("Telegram not connected. Connect Telegram before deleting a Telegram bus.");
+    }
+    const peerId = parseInt(busId.replace("telegram-", ""), 10);
+    if (!isNaN(peerId)) {
+      await telegramDeleteChatHistory(peerId);
+    }
+  }
+  deleteBusHistory(busId);
   const path = getBusFilePath(busId);
   if (existsSync(path)) unlinkSync(path);
 }
 
 export function wipeRootHistory(): void {
-  const data = loadBusFile(ROOT_BUS_ID);
-  if (data) {
-    data.messages = [];
-    saveBusFile(data);
-  }
+  wipeHistory();
 }
 
+/** Root log: merged from all active buses, trimmed to 50K. Use this for model context. */
 export function getBusHistory(busId: string): BusMessage[] {
-  const data = loadBusFile(busId);
-  return data?.messages ?? [];
+  if (busId === ROOT_BUS_ID) {
+    return getRootLog(50_000).messages.map(toBusMessage);
+  }
+  return getHistory(busId).map(toBusMessage);
 }
 
-/** Get a slice of bus history. offset=0, limit=N = last N (default). offset>0 = from start. offset<0 = from end. */
+/** Root log for model: messages + trimmedCount. Use when building context for the model. */
+export function getRootLogForModel(): RootLogForModel {
+  const { messages, trimmedCount } = getRootLog(50_000);
+  return { messages: messages.map(toBusMessage), trimmedCount };
+}
+
 export function getBusHistorySlice(
   busId: string,
   limit: number = 50,
   offset: number = 0
 ): BusMessage[] {
-  const full = getBusHistory(busId);
-  if (offset === 0) {
-    return full.slice(-limit);
+  if (busId === ROOT_BUS_ID) {
+    if (offset === 0) {
+      const { messages } = getRootLog(50_000);
+      return messages.slice(-limit).map(toBusMessage);
+    }
+    const full = getRootLogFull().map(toBusMessage);
+    if (offset > 0) {
+      const from = Math.max(0, offset - 1);
+      return full.slice(from, from + limit);
+    }
+    const from = Math.max(0, full.length + offset);
+    return full.slice(from, from + limit);
   }
-  if (offset > 0) {
-    return full.slice(offset, offset + limit);
-  }
-  const from = Math.max(0, full.length + offset);
-  return full.slice(from, from + limit);
+  return getHistorySlice(busId, limit, offset).map(toBusMessage);
 }
 
 export function appendToBusHistory(busId: string, message: BusMessage): void {
   ensureRootBus();
-  const data = loadBusFile(busId) ?? {
-    bus_id: busId,
-    description: "",
-    trust_level: "normal" as BusTrustLevel,
-    messages: [],
-  };
-  data.bus_id = busId;
-  data.messages.push(message);
-  saveBusFile(data);
+  appendToHistory(busId, {
+    role: message.role,
+    content: message.content,
+    user_id: message.user_id,
+    user_name: message.user_name,
+    bus_id: message.bus_id ?? busId,
+    timestamp: message.timestamp,
+  });
 }

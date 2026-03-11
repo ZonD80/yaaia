@@ -671,9 +671,6 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
       }
       ensureBus(busId);
       appendToBusHistory(busId, { role: "assistant", content });
-      if (busId !== ROOT_BUS_ID) {
-        appendToBusHistory(ROOT_BUS_ID, { role: "assistant", content, bus_id: busId });
-      }
       const displayText = `[${busId}] ${content}`;
       config.onSendMessage?.(busId);
       if (busId === ROOT_BUS_ID) {
@@ -950,7 +947,7 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
       logClarification("delete_bus", args);
       logAssessment("delete_bus", args);
       try {
-        deleteBus(mbId);
+        await deleteBus(mbId);
         recipeStore.appendToolCall("delete_bus", args, `Bus ${mbId} deleted`);
         return toolResult(`Bus ${mbId} deleted.`);
       } catch (err) {
