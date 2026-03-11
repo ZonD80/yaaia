@@ -103,7 +103,13 @@ function buildScheduleMessage(schedules: { at: string; title: string; instructio
 
 function runStartupTask(): void {
   const task = getStartupTask();
-  const content = `[Startup task]\n\nTitle: ${task.title}\nInstructions: ${task.instructions}`;
+  const due = getDueSchedules();
+  let content = `[Startup task]\n\nTitle: ${task.title}\nInstructions: ${task.instructions}`;
+  if (due.length > 0) {
+    const ids = due.map((s) => s.id);
+    deleteSchedules(ids);
+    content += `\n\n--- Resume: complete these scheduled tasks (were due while app was closed) ---\n\n${buildScheduleMessage(due)}`;
+  }
   const msg = JSON.stringify({
     bus_id: ROOT_BUS_ID,
     user_id: 0,

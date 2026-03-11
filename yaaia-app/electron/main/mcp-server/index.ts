@@ -74,7 +74,7 @@ import {
   mailMessageLabelsSet,
   mailAppend,
 } from "../mail-client.js";
-import { addSchedule, listSchedules, getStartupTask } from "../schedule-store.js";
+import { addSchedule, listSchedules, getStartupTask, deleteSchedule } from "../schedule-store.js";
 import {
   listBuses,
   setBusProperties,
@@ -737,7 +737,7 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
     "get_bus_history",
     {
       description:
-        "Get conversation history for a bus. Use limit and offset for slices. offset=0, limit=N = last N; offset>0 = from start; offset<0 = from end. Call when you need more context.",
+        "Get conversation history for a bus from kb/history (KB storage). Use limit and offset for slices. offset=0, limit=N = last N; offset>0 = from start; offset<0 = from end. Call when you need more context.",
       inputSchema: z.object({
         bus_id: BUS_ID_PARAM,
         assessment: ASSESSMENT_PARAM,
@@ -923,7 +923,7 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
   server.registerTool(
     "delete_bus",
     {
-      description: "Delete a message bus and its history. Root bus cannot be deleted.",
+      description: "Delete a message bus and its history (kb/history). Root bus cannot be deleted.",
       inputSchema: z.object({
         bus_id: BUS_ID_PARAM,
         mb_id: z.string().describe("Message bus id to delete"),
@@ -1037,6 +1037,42 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
       const result = JSON.stringify({ startup_task: startup, scheduled }, null, 2);
       recipeStore.appendToolCall("list_tasks", args, result);
       return toolResult(result);
+    }
+  );
+
+  server.registerTool(
+    "delete_scheduled_task",
+    {
+      description: "Delete a scheduled task by id. Use list_tasks to get task ids.",
+      inputSchema: z.object({
+        bus_id: BUS_ID_PARAM,
+        task_id: z.string().describe("Task id from list_tasks (scheduled[].id)"),
+        assessment: ASSESSMENT_PARAM,
+        clarification: CLARIFICATION_PARAM,
+      }),
+    },
+    async (args) => {
+      const a = args as { task_id?: string };
+      logToolCall("delete_scheduled_task", args);
+      const unknownMsg = validateUnknownParams("delete_scheduled_task", args, new Set(["bus_id", "task_id", "assessment", "clarification"]));
+      if (unknownMsg) {
+        recipeStore.appendToolCall("delete_scheduled_task", args, unknownMsg);
+        return toolResult(unknownMsg);
+      }
+      const taskId = String(a.task_id ?? "").trim();
+      if (!taskId) {
+        recipeStore.appendToolCall("delete_scheduled_task", args, "task_id is required");
+        return toolResult("Error: task_id is required");
+      }
+      logClarification("delete_scheduled_task", args);
+      logAssessment("delete_scheduled_task", args);
+      const deleted = deleteSchedule(taskId);
+      if (deleted) {
+        recipeStore.appendToolCall("delete_scheduled_task", args, `Deleted task ${taskId}`);
+        return toolResult(`Deleted scheduled task ${taskId}.`);
+      }
+      recipeStore.appendToolCall("delete_scheduled_task", args, "Task not found");
+      return toolResult(`Error: Task ${taskId} not found.`);
     }
   );
 

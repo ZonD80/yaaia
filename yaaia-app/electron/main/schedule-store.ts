@@ -21,7 +21,7 @@ export type ScheduleEntry = {
 
 export const DEFAULT_STARTUP_TASK = {
   title: "On duty",
-  instructions: "Get my identity, connect to telegram, check new mail, report to user that i'm on duty",
+  instructions: "Get my identity, connect to telegram, check new mail, report to user that i'm on duty. If any scheduled tasks were due while the app was closed, resume and complete them first.",
 };
 
 export type StartupTask = { title: string; instructions: string };

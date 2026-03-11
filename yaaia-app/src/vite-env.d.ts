@@ -34,7 +34,7 @@ interface ElectronAPI {
   messageBusList: () => Promise<Array<{ bus_id: string; description: string }>>;
   messageBusSetDescription: (busId: string, description: string) => Promise<void>;
   messageBusDelete: (busId: string) => Promise<void>;
-  messageBusGetHistory: (busId: string) => Promise<Array<{ role: string; content: string }>>;
+  messageBusGetHistory: (busId: string) => Promise<Array<{ role: string; content: string; user_name?: string; timestamp?: string }>>;
   messageBusWipeRoot: () => Promise<void>;
   kbList: (path?: string, recursive?: boolean) => Promise<string[]>;
   kbRead: (path: string) => Promise<string>;

@@ -142,7 +142,6 @@
       <aside class="sidebar">
         <button class="btn secondary" @click="openSecretsEditor">Secrets Editor</button>
         <button class="btn secondary" @click="openConfigsEditor">Configs Editor</button>
-        <button class="btn secondary" @click="openMessageBusEditor">Message Buses</button>
         <button class="btn secondary" @click="openKbEditor">KB Editor</button>
         <button class="btn secondary" @click="openScheduleEditor">Schedules</button>
         <button class="btn secondary" @click="viewRecipe">View recipe</button>
@@ -230,49 +229,6 @@
           <button class="btn secondary" @click="startAddSecret">Add new</button>
           <button class="btn secondary" @click="showSecretsEditor = false">Close</button>
         </div>
-      </div>
-    </div>
-    <div v-if="showMessageBusEditor" class="ask-user-overlay editor-overlay" @click.self="showMessageBusEditor = false">
-      <div class="ask-user-modal editor-modal">
-        <h3>Message Buses</h3>
-        <p v-if="messageBusError" class="editor-error">{{ messageBusError }}</p>
-        <div class="editor-form" v-if="messageBusEditingId">
-          <input v-model="messageBusForm.description" type="text" placeholder="Description" class="editor-input" />
-          <div class="editor-form-actions">
-            <button class="btn primary" @click="saveMessageBusDescription">Save</button>
-            <button class="btn secondary" @click="messageBusEditingId = null">Cancel</button>
-          </div>
-        </div>
-        <div class="editor-list">
-          <div v-for="item in messageBusItems" :key="item.bus_id" class="editor-row">
-            <div class="editor-row-fields">
-              <span class="editor-row-desc">{{ item.bus_id }}</span>
-              <span class="editor-row-value">{{ item.description || "(no description)" }}</span>
-            </div>
-            <div class="editor-row-actions">
-              <button class="btn secondary small" @click="startEditMessageBus(item)">Edit description</button>
-              <button class="btn secondary small" @click="viewMessageBusHistory(item.bus_id)">View history</button>
-              <button v-if="item.bus_id !== 'root'" class="btn secondary small" @click="deleteMessageBus(item.bus_id)">Delete</button>
-            </div>
-          </div>
-        </div>
-        <div class="editor-modal-actions">
-          <button class="btn secondary" @click="wipeRootHistory">Wipe root history</button>
-          <button class="btn secondary" @click="refreshMessageBusList">Refresh</button>
-          <button class="btn secondary" @click="showMessageBusEditor = false">Close</button>
-        </div>
-      </div>
-    </div>
-    <div v-if="showMessageBusHistory" class="ask-user-overlay editor-overlay" @click.self="showMessageBusHistory = false">
-      <div class="ask-user-modal editor-modal">
-        <h3>History: {{ messageBusHistoryBusId }}</h3>
-        <div class="editor-list" style="max-height: 300px; overflow-y: auto;">
-          <div v-for="(m, i) in messageBusHistory" :key="i" class="editor-row">
-            <span class="editor-row-desc">{{ m.role }}</span>
-            <span class="editor-row-value">{{ m.content?.slice(0, 100) }}{{ (m.content?.length ?? 0) > 100 ? '...' : '' }}</span>
-          </div>
-        </div>
-        <button class="btn secondary" @click="showMessageBusHistory = false">Close</button>
       </div>
     </div>
     <div v-if="showConfigsEditor" class="ask-user-overlay editor-overlay" @click.self="showConfigsEditor = false">
@@ -643,74 +599,6 @@ async function openConfigsEditor() {
   await refreshConfigsList();
 }
 
-async function openMessageBusEditor() {
-  showMessageBusEditor.value = true;
-  messageBusError.value = "";
-  await refreshMessageBusList();
-}
-
-async function refreshMessageBusList() {
-  try {
-    const list = (await window.electronAPI?.messageBusList?.()) ?? [];
-    messageBusItems.value = list as Array<{ bus_id: string; description: string }>;
-  } catch (err) {
-    messageBusItems.value = [];
-    messageBusError.value = err instanceof Error ? err.message : "Failed to load";
-  }
-}
-
-function startEditMessageBus(item: { bus_id: string; description: string }) {
-  messageBusEditingId.value = item.bus_id;
-  messageBusForm.value = { description: item.description };
-}
-
-async function saveMessageBusDescription() {
-  if (!messageBusEditingId.value) return;
-  messageBusError.value = "";
-  try {
-    await window.electronAPI?.messageBusSetDescription?.(messageBusEditingId.value, messageBusForm.value.description);
-    await refreshMessageBusList();
-    messageBusEditingId.value = null;
-  } catch (err) {
-    messageBusError.value = err instanceof Error ? err.message : "Failed to save";
-  }
-}
-
-async function deleteMessageBus(busId: string) {
-  if (!confirm(`Delete bus ${busId} and its history?`)) return;
-  messageBusError.value = "";
-  try {
-    await window.electronAPI?.messageBusDelete?.(busId);
-    await refreshMessageBusList();
-    if (messageBusEditingId.value === busId) messageBusEditingId.value = null;
-  } catch (err) {
-    messageBusError.value = err instanceof Error ? err.message : "Failed to delete";
-  }
-}
-
-async function wipeRootHistory() {
-  if (!confirm("Wipe root chat history? This cannot be undone.")) return;
-  messageBusError.value = "";
-  try {
-    await window.electronAPI?.messageBusWipeRoot?.();
-    await refreshMessageBusList();
-    messages.value = [];
-  } catch (err) {
-    messageBusError.value = err instanceof Error ? err.message : "Failed to wipe";
-  }
-}
-
-async function viewMessageBusHistory(busId: string) {
-  try {
-    const hist = (await window.electronAPI?.messageBusGetHistory?.(busId)) ?? [];
-    messageBusHistory.value = hist as Array<{ role: string; content: string }>;
-    messageBusHistoryBusId.value = busId;
-    showMessageBusHistory.value = true;
-  } catch (err) {
-    messageBusError.value = err instanceof Error ? err.message : "Failed to load history";
-  }
-}
-
 async function openKbEditor() {
   showKbEditor.value = true;
   kbError.value = "";
@@ -1061,16 +949,6 @@ const configsItems = ref<Array<{ id: string; detailed_description: string; value
 const configsError = ref("");
 const configsEditingId = ref<string | null>(null);
 const configsForm = ref({ detailed_description: "", value: "" });
-
-// Message Bus Editor
-const showMessageBusEditor = ref(false);
-const showMessageBusHistory = ref(false);
-const messageBusItems = ref<Array<{ bus_id: string; description: string }>>([]);
-const messageBusError = ref("");
-const messageBusEditingId = ref<string | null>(null);
-const messageBusForm = ref({ description: "" });
-const messageBusHistory = ref<Array<{ role: string; content: string }>>([]);
-const messageBusHistoryBusId = ref("");
 
 // KB Editor
 const showKbEditor = ref(false);
@@ -1781,6 +1659,11 @@ onUnmounted(() => {
   color: #f85149;
   font-size: 0.9rem;
   margin: 0 0 0.75rem;
+}
+.editor-hint {
+  color: #8b949e;
+  font-size: 0.85rem;
+  margin: 0 0 0.5rem;
 }
 .editor-form {
   display: flex;

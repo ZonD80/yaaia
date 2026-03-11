@@ -1,12 +1,13 @@
 /**
- * Message bus history stored in kb/history/YYYY-MM-DD/{bus_id}/{seq}.md
+ * Message bus history stored in kb/history/{mb_id}/{date}/{seq}.md
+ * Bus properties in kb/history/{mb_id}/properties.md
  * Format: YAML frontmatter + content per message. 50K char limit per file.
  */
 
 import { kbList, kbRead, kbWrite, kbDelete, kbEnsureCollection } from "./mcp-server/kb-client.js";
 
 const HISTORY_BASE = "history";
-
+const PROPERTIES_FILE = "properties.md";
 const MAX_FILE_CHARS = 50_000;
 
 export type HistoryMessage = {
@@ -16,6 +17,13 @@ export type HistoryMessage = {
   user_name?: string;
   bus_id?: string;
   timestamp: string;
+};
+
+export type BusProperties = {
+  bus_id: string;
+  description: string;
+  trust_level?: "normal" | "root";
+  is_banned?: boolean;
 };
 
 /** Sanitize bus_id for use in path (replace / and \ with safe chars) */
@@ -34,7 +42,10 @@ function parseYamlBlock(block: string): Record<string, string | number> {
     const m = line.match(/^([a-z_]+):\s*(.*)$/);
     if (m) {
       const [, key, val] = m;
-      const trimmed = val.trim();
+      let trimmed = val.trim();
+      if ((trimmed.startsWith('"') && trimmed.endsWith('"')) || (trimmed.startsWith("'") && trimmed.endsWith("'"))) {
+        trimmed = trimmed.slice(1, -1).replace(/\\"/g, '"');
+      }
       if (key === "user_id" && /^\d+$/.test(trimmed)) {
         out[key] = parseInt(trimmed, 10);
       } else {
@@ -92,16 +103,45 @@ function today(): string {
   return new Date().toISOString().slice(0, 10);
 }
 
-/** List .md files in history/YYYY-MM-DD/bus_id/ sorted by seq */
-function listBusFiles(busId: string, date?: string): string[] {
-  const segment = busIdToPathSegment(busId);
-  const base = date ? `${HISTORY_BASE}/${date}/${segment}` : HISTORY_BASE;
+/** Path to mb dir: history/{mb_id} */
+function mbDirPath(mbId: string): string {
+  return `${HISTORY_BASE}/${busIdToPathSegment(mbId)}`;
+}
+
+/** Path to properties: history/{mb_id}/properties.md */
+function propertiesPath(mbId: string): string {
+  return `${mbDirPath(mbId)}/${PROPERTIES_FILE}`;
+}
+
+/** Path to date dir: history/{mb_id}/{date} */
+function dateDirPath(mbId: string, date: string): string {
+  return `${mbDirPath(mbId)}/${date}`;
+}
+
+/** List .md files in history/{mb_id}/{date}/ sorted by seq */
+function listBusFiles(mbId: string, date?: string): string[] {
+  const segment = busIdToPathSegment(mbId);
+  const base = date ? `${HISTORY_BASE}/${segment}/${date}` : HISTORY_BASE;
   try {
     const all = kbList(base, true);
-    const filtered = date
-      ? all.filter((p) => p.startsWith(`${HISTORY_BASE}/${date}/${segment}/`) && p.endsWith(".md"))
-      : all.filter((p) => p.includes(`/${segment}/`) && p.endsWith(".md"));
+    const prefix = date ? `${HISTORY_BASE}/${segment}/${date}/` : `${HISTORY_BASE}/${segment}/`;
+    const filtered = all.filter((p) => p.startsWith(prefix) && p.endsWith(".md") && !p.endsWith(`/${PROPERTIES_FILE}`));
     return filtered.sort();
+  } catch {
+    return [];
+  }
+}
+
+/** List date dirs (YYYY-MM-DD) for an mb */
+function listDateDirs(mbId: string): string[] {
+  const segment = busIdToPathSegment(mbId);
+  const base = `${HISTORY_BASE}/${segment}`;
+  try {
+    const entries = kbList(base, false);
+    return entries
+      .map((e) => (e.endsWith("/") ? e.slice(0, -1) : e).split("/").pop() ?? "")
+      .filter((d) => /^\d{4}-\d{2}-\d{2}$/.test(d))
+      .sort();
   } catch {
     return [];
   }
@@ -113,12 +153,62 @@ export async function ensureHistoryCollection(): Promise<void> {
 }
 
 /** Get next sequence number for a bus on a given date */
-function getNextSeq(busId: string, date: string): number {
-  const files = listBusFiles(busId, date);
+function getNextSeq(mbId: string, date: string): number {
+  const files = listBusFiles(mbId, date);
   if (files.length === 0) return 1;
   const last = files[files.length - 1];
   const match = last.match(/(\d+)\.md$/);
   return match ? parseInt(match[1], 10) + 1 : 1;
+}
+
+/** Load bus properties from history/{mb_id}/properties.md */
+export function loadBusProperties(mbId: string): BusProperties | null {
+  const path = propertiesPath(mbId);
+  try {
+    const content = kbRead(path);
+    const meta = parseYamlBlock(content.split("---")[1]?.trim() ?? "");
+    if (meta.bus_id) {
+      return {
+        bus_id: String(meta.bus_id),
+        description: String(meta.description ?? ""),
+        trust_level: meta.trust_level === "root" ? "root" : "normal",
+        is_banned: meta.is_banned === true || meta.is_banned === "true",
+      };
+    }
+  } catch {
+    /* no properties */
+  }
+  return null;
+}
+
+/** Save bus properties to history/{mb_id}/properties.md */
+export function saveBusProperties(props: BusProperties): void {
+  const path = propertiesPath(props.bus_id);
+  const desc = (props.description ?? "").replace(/"/g, '\\"');
+  const lines = [
+    "---",
+    `bus_id: ${props.bus_id}`,
+    `description: "${desc}"`,
+    `trust_level: ${props.trust_level ?? "normal"}`,
+    `is_banned: ${props.is_banned ?? false}`,
+    "---",
+  ];
+  kbWrite(path, lines.join("\n"));
+}
+
+/** Ensure mb dir exists (creates properties.md if missing) */
+function ensureMbDir(mbId: string, props?: Partial<BusProperties>): void {
+  const existing = loadBusProperties(mbId);
+  if (!existing) {
+    saveBusProperties({
+      bus_id: mbId,
+      description: props?.description ?? "",
+      trust_level: props?.trust_level ?? "normal",
+      is_banned: props?.is_banned ?? false,
+    });
+  } else if (props && Object.keys(props).length > 0) {
+    saveBusProperties({ ...existing, ...props });
+  }
 }
 
 /** Append message to bus history. Creates new file if current exceeds 50K. Uses message.timestamp for path when provided. */
@@ -129,8 +219,7 @@ export function appendToHistory(busId: string, message: Omit<HistoryMessage, "ti
     timestamp: ts,
   };
   const date = message.timestamp ? ts.slice(0, 10) : today();
-  const segment = busIdToPathSegment(busId);
-  const dir = `${HISTORY_BASE}/${date}/${segment}`;
+  const dir = dateDirPath(busId, date);
 
   const files = listBusFiles(busId, date);
   let targetPath: string;
@@ -167,25 +256,17 @@ export function appendToHistory(busId: string, message: Omit<HistoryMessage, "ti
 /** Get all messages for a bus, chronologically */
 export function getBusHistory(busId: string): HistoryMessage[] {
   const all: HistoryMessage[] = [];
-  try {
-    const entries = kbList(HISTORY_BASE, false);
-    const dates = entries
-      .map((p) => p.replace(`${HISTORY_BASE}/`, "").replace(/\/$/, "").split("/")[0])
-      .filter((d) => /^\d{4}-\d{2}-\d{2}$/.test(d));
-    const uniqueDates = [...new Set(dates)].sort();
-    for (const date of uniqueDates) {
-      const files = listBusFiles(busId, date);
-      for (const f of files) {
-        try {
-          const content = kbRead(f);
-          all.push(...parseHistoryFile(content, busId));
-        } catch {
-          /* skip */
-        }
+  const dates = listDateDirs(busId);
+  for (const date of dates) {
+    const files = listBusFiles(busId, date);
+    for (const f of files) {
+      try {
+        const content = kbRead(f);
+        all.push(...parseHistoryFile(content, busId));
+      } catch {
+        /* skip */
       }
     }
-  } catch {
-    /* no history yet */
   }
   all.sort((a, b) => a.timestamp.localeCompare(b.timestamp));
   return all;
@@ -204,25 +285,15 @@ export function getBusHistorySlice(
   return full.slice(from, from + limit);
 }
 
-/** Get list of bus_ids that have at least one message in history */
+/** Get list of mb_ids (buses) from history/ subdirs */
 export function getActiveBuses(): string[] {
   const buses = new Set<string>();
   try {
     const entries = kbList(HISTORY_BASE, false);
-    const dates = entries
-      .map((p) => p.replace(`${HISTORY_BASE}/`, "").replace(/\/$/, "").split("/")[0])
-      .filter((d) => /^\d{4}-\d{2}-\d{2}$/.test(d));
-    const uniqueDates = [...new Set(dates)];
-    for (const date of uniqueDates) {
-      const datePath = `${HISTORY_BASE}/${date}`;
-      try {
-        const dirs = kbList(datePath, false);
-        for (const dir of dirs) {
-          const segment = (dir.endsWith("/") ? dir.slice(0, -1) : dir).split("/").pop() ?? "";
-          if (segment && !segment.includes(".")) buses.add(pathSegmentToBusId(segment));
-        }
-      } catch {
-        /* skip */
+    for (const e of entries) {
+      const segment = (e.endsWith("/") ? e.slice(0, -1) : e).split("/").pop() ?? "";
+      if (segment && !segment.includes(".")) {
+        buses.add(pathSegmentToBusId(segment));
       }
     }
   } catch {
@@ -277,6 +348,7 @@ export function toBusMessage(m: HistoryMessage): {
   user_id?: number;
   user_name?: string;
   bus_id?: string;
+  timestamp?: string;
 } {
   return {
     role: m.role,
@@ -284,32 +356,31 @@ export function toBusMessage(m: HistoryMessage): {
     user_id: m.user_id,
     user_name: m.user_name,
     bus_id: m.bus_id,
+    timestamp: m.timestamp,
   };
 }
 
-/** Wipe root bus history (delete all root .md files) */
+/** Wipe root bus history (delete all root message files, keep properties) */
 export function wipeRootHistory(): void {
   deleteBusHistory("root");
 }
 
-/** Delete all history files for a bus */
+/** Delete all history and properties for a bus */
 export function deleteBusHistory(busId: string): void {
+  const segment = busIdToPathSegment(busId);
+  const base = `${HISTORY_BASE}/${segment}`;
   try {
-    const entries = kbList(HISTORY_BASE, false);
-    const dates = entries
-      .map((p) => p.replace(`${HISTORY_BASE}/`, "").replace(/\/$/, "").split("/")[0])
-      .filter((d) => /^\d{4}-\d{2}-\d{2}$/.test(d));
-    for (const date of [...new Set(dates)]) {
-      const files = listBusFiles(busId, date);
-      for (const f of files) {
-        try {
-          kbDelete(f);
-        } catch {
-          /* skip */
-        }
+    const all = kbList(base, true);
+    for (const p of all) {
+      try {
+        kbDelete(p);
+      } catch {
+        /* skip */
       }
     }
   } catch {
     /* no history for this bus */
   }
 }
+
+export { ensureMbDir };
