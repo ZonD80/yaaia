@@ -54,6 +54,15 @@ try {
     kbRead: (path: string) => ipcRenderer.invoke("kb-read", path),
     kbWrite: (path: string, content: string) => ipcRenderer.invoke("kb-write", path, content),
     kbDelete: (path: string) => ipcRenderer.invoke("kb-delete", path),
+    scheduleList: () => ipcRenderer.invoke("schedule-list"),
+    scheduleGetStartup: () => ipcRenderer.invoke("schedule-get-startup"),
+    scheduleSetStartup: (task: { title: string; instructions: string }) =>
+      ipcRenderer.invoke("schedule-set-startup", task),
+    scheduleAdd: (at: string, title: string, instructions: string) =>
+      ipcRenderer.invoke("schedule-add", at, title, instructions),
+    scheduleUpdate: (id: string, props: { at?: string; title?: string; instructions?: string }) =>
+      ipcRenderer.invoke("schedule-update", id, props),
+    scheduleDelete: (id: string) => ipcRenderer.invoke("schedule-delete", id),
     openExternal: (url: string) => ipcRenderer.invoke("open-external", url),
     onAgentStreamChunk: (callback: (chunk: string) => void) => {
       const fn = (_: unknown, chunk: string) => callback(chunk);
@@ -104,6 +113,11 @@ try {
       const fn = (_: unknown, payload: { bus_id: string; user_id: number; user_name: string; content: string }) => callback(payload);
       ipcRenderer.on("telegram-message", fn);
       return () => ipcRenderer.removeListener("telegram-message", fn);
+    },
+    onScheduleTrigger: (callback: (message: string) => void) => {
+      const fn = (_: unknown, message: string) => callback(message);
+      ipcRenderer.on("schedule-trigger", fn);
+      return () => ipcRenderer.removeListener("schedule-trigger", fn);
     },
     onTelegramLoginRequest: (callback: (info: { step: "phone" | "code" | "password" }) => void) => {
       const fn = (_: unknown, info: { step: "phone" | "code" | "password" }) => callback(info);

@@ -3,8 +3,9 @@
  * Connects when chat starts, disconnects when chat stops.
  */
 
+import { mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import { TelegramClient } from "@mtcute/node";
-import { sendText, sendTyping } from "@mtcute/core/methods.js";
+import { sendText, sendTyping, readHistory, iterDialogs, searchMessages } from "@mtcute/core/methods.js";
 import { md } from "@mtcute/markdown-parser";
 import { getPeer } from "@mtcute/core/methods.js";
 import { homedir } from "node:os";
@@ -15,6 +16,31 @@ let client: TelegramClient | null = null;
 
 const YAAIA_DIR = join(homedir(), "yaaia");
 const TELEGRAM_STORAGE = join(YAAIA_DIR, "telegram-session");
+const TELEGRAM_LAST_SEEN_PATH = join(YAAIA_DIR, "telegram-last-seen.json");
+
+export type MissedMessagePayload = { bus_id: string; user_id: number; user_name: string; content: string };
+
+function loadLastReceivedTimestamp(): number {
+  try {
+    if (existsSync(TELEGRAM_LAST_SEEN_PATH)) {
+      const raw = JSON.parse(readFileSync(TELEGRAM_LAST_SEEN_PATH, "utf-8"));
+      const ts = typeof raw?.lastReceivedMessageDate === "number" ? raw.lastReceivedMessageDate : 0;
+      return ts > 0 ? ts : 0;
+    }
+  } catch (err) {
+    console.warn("[YAAIA Telegram] Failed to load last-seen:", err);
+  }
+  return 0;
+}
+
+function saveLastReceivedTimestamp(date: number): void {
+  try {
+    mkdirSync(YAAIA_DIR, { recursive: true });
+    writeFileSync(TELEGRAM_LAST_SEEN_PATH, JSON.stringify({ lastReceivedMessageDate: date }, null, 2), "utf-8");
+  } catch (err) {
+    console.warn("[YAAIA Telegram] Failed to save last-seen:", err);
+  }
+}
 
 export type TelegramConnectParams = {
   apiId: number;
@@ -105,6 +131,68 @@ async function handleNewMessage(msg: Message): Promise<void> {
     user_name: userName,
     content,
   });
+  if (client) {
+    try {
+      await readHistory(client, msg.chat.id, { maxId: msg.id });
+    } catch (err) {
+      console.warn("[YAAIA Telegram] readHistory failed:", err instanceof Error ? err.message : err);
+    }
+  }
+  const msgDate = msg.date instanceof Date ? Math.floor(msg.date.getTime() / 1000) : Math.floor(Date.now() / 1000);
+  saveLastReceivedTimestamp(msgDate);
+}
+
+/** Fetch messages since last received timestamp, deliver to callback, update timestamp. Returns list of delivered payloads. */
+export async function telegramFetchMissedMessages(): Promise<MissedMessagePayload[]> {
+  const tg = client;
+  if (!tg) return [];
+  const since = loadLastReceivedTimestamp();
+  if (since <= 0) return [];
+  const all: { msg: Message; date: number }[] = [];
+  try {
+    for await (const dialog of iterDialogs(tg, { limit: 50 })) {
+      const d = dialog as { peer?: { inputPeer?: unknown } };
+      if (!d.peer?.inputPeer) continue;
+      try {
+        const res = await searchMessages(tg, {
+          chatId: d.peer as Parameters<typeof searchMessages>[1] extends { chatId?: infer C } ? C : never,
+          minDate: since,
+          limit: 100,
+        });
+        const msgs = Array.isArray(res) ? res : [];
+        for (const m of msgs) {
+          const msg = m as Message;
+          if (msg.isOutgoing) continue;
+          const text = msg.text?.trim();
+          if (!text) continue;
+          const date = msg.date instanceof Date ? Math.floor(msg.date.getTime() / 1000) : 0;
+          all.push({ msg, date });
+        }
+      } catch (err) {
+        console.warn("[YAAIA Telegram] searchMessages for dialog failed:", err);
+      }
+    }
+  } catch (err) {
+    console.warn("[YAAIA Telegram] iterDialogs failed:", err);
+    return [];
+  }
+  all.sort((a, b) => a.date - b.date);
+  const delivered: MissedMessagePayload[] = [];
+  let maxDate = since;
+  for (const { msg, date } of all) {
+    const chat = msg.chat;
+    const sender = msg.sender;
+    const chatId = chat.id;
+    const busId = `telegram-${chatId}`;
+    const userId = sender.type === "user" ? sender.id : 0;
+    const userName = sender.type === "user" ? (sender.username ?? sender.displayName ?? String(userId)) : "unknown";
+    const content = msg.text?.trim() ?? "";
+    delivered.push({ bus_id: busId, user_id: userId, user_name: userName, content });
+    onMessageCallback?.({ bus_id: busId, user_id: userId, user_name: userName, content });
+    if (date > maxDate) maxDate = date;
+  }
+  if (maxDate > since) saveLastReceivedTimestamp(maxDate);
+  return delivered;
 }
 
 export async function telegramResolvePeer(username: string): Promise<{ bus_id: string; display_name?: string }> {

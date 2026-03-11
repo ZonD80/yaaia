@@ -1,6 +1,6 @@
 /**
  * IMAP client wrapper using imapflow. Single connection per session.
- * Disconnect on session end.
+ * Keep-alive poll every 60s when connected. Disconnect on session end.
  */
 
 import { ImapFlow } from "imapflow";
@@ -13,6 +13,9 @@ import { Readable } from "node:stream";
 let client: ImapFlow | null = null;
 let currentLock: { release: () => void } | null = null;
 let lastOpenedMailbox: string | null = null;
+let keepAliveIntervalHandle: ReturnType<typeof setInterval> | null = null;
+
+const KEEP_ALIVE_INTERVAL_MS = 60_000;
 
 const DOWNLOADS_DIR = join(homedir(), "Downloads");
 
@@ -41,6 +44,10 @@ export async function mailConnect(params: MailConnectParams): Promise<void> {
   // Prevent uncaught exceptions from socket timeout / connection errors
   client.on("error", (err: Error) => {
     console.error("[YAAIA Mail] IMAP error:", err.message);
+    if (keepAliveIntervalHandle) {
+      clearInterval(keepAliveIntervalHandle);
+      keepAliveIntervalHandle = null;
+    }
     if (client) {
       try {
         client.close();
@@ -54,9 +61,23 @@ export async function mailConnect(params: MailConnectParams): Promise<void> {
   });
   await client.connect();
   lastOpenedMailbox = null;
+
+  if (keepAliveIntervalHandle) clearInterval(keepAliveIntervalHandle);
+  keepAliveIntervalHandle = setInterval(async () => {
+    if (!client) return;
+    try {
+      await client.noop();
+    } catch (err) {
+      console.warn("[YAAIA Mail] Keep-alive noop failed:", err instanceof Error ? err.message : err);
+    }
+  }, KEEP_ALIVE_INTERVAL_MS);
 }
 
 export async function mailDisconnect(): Promise<void> {
+  if (keepAliveIntervalHandle) {
+    clearInterval(keepAliveIntervalHandle);
+    keepAliveIntervalHandle = null;
+  }
   if (currentLock) {
     try {
       currentLock.release();
@@ -207,6 +228,13 @@ export async function mailFetchAll(
   const lock = await c.getMailboxLock(mailbox);
   try {
     const messages = await c.fetchAll(range, query as object, { uid: options.uid });
+    if (query.source === true) {
+      const toMark = messages.filter((m) => !m.flags?.includes("\\Seen"));
+      if (toMark.length > 0) {
+        const range = toMark.map((m) => (options.uid ? m.uid : m.seq)).join(",");
+        await c.messageFlagsAdd(range, ["\\Seen"], { uid: options.uid });
+      }
+    }
     return messages.map((m) => ({
       uid: m.uid,
       seq: m.seq,
@@ -214,6 +242,7 @@ export async function mailFetchAll(
       flags: m.flags,
       internalDate: m.internalDate,
       size: m.size,
+      ...(m.source && { source: String(m.source).slice(0, 50000) }),
       ...(m.labels && { labels: m.labels }),
       ...(m.threadId && { threadId: m.threadId }),
     }));
@@ -234,6 +263,10 @@ export async function mailFetchOne(
   try {
     const msg = await c.fetchOne(seq, query as object, { uid: options.uid });
     if (!msg) return null;
+    if (query.source === true && !msg.flags?.includes("\\Seen")) {
+      const range = options.uid ? String(msg.uid) : String(msg.seq);
+      await c.messageFlagsAdd(range, ["\\Seen"], { uid: options.uid });
+    }
     return {
       uid: msg.uid,
       seq: msg.seq,

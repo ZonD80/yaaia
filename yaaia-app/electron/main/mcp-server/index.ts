@@ -74,6 +74,7 @@ import {
   mailMessageLabelsSet,
   mailAppend,
 } from "../mail-client.js";
+import { addSchedule, listSchedules, getStartupTask } from "../schedule-store.js";
 import {
   listBuses,
   setBusProperties,
@@ -638,11 +639,11 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
     "send_message",
     {
       description:
-        "Send a message to a bus. STRICTLY REQUIRED: Use this for every reply. Plain text output is forbidden—only send_message delivers messages. bus_id: root for desktop chat, telegram-{peer_id} for Telegram. wait_for_answer: if true, blocks until user replies (60s timeout). Use for approval, confirmation, or choices.",
+        "Send a message to a bus. STRICTLY REQUIRED: Use this for every reply. Plain text output is forbidden—only send_message delivers messages. bus_id: root for desktop chat, telegram-{peer_id} for Telegram. CRITICAL: If your message asks a question, approval, confirmation, or choice and you need the reply to proceed—you MUST set wait_for_answer=true. Without it you never receive the reply. wait_for_answer=true blocks until user replies (60s timeout).",
       inputSchema: z.object({
         bus_id: BUS_ID_PARAM,
         content: z.string().describe("Message content to send"),
-        wait_for_answer: z.boolean().optional().default(false).describe("If true, block until user replies (60s timeout). Use for approval/confirmation."),
+        wait_for_answer: z.boolean().optional().default(false).describe("REQUIRED when asking a question/approval/confirmation—set true or you never get the reply. Blocks until user replies (60s)."),
         assessment: ASSESSMENT_PARAM,
         clarification: CLARIFICATION_PARAM,
       }),
@@ -811,7 +812,14 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
         }
         const buses = result.buses ?? [];
         const instruction = result.instruction ?? "If you need conversation history for a bus, call get_bus_history(bus_id, assessment, clarification, limit).";
-        const out = `Connected. Buses: ${JSON.stringify(buses)}. ${instruction}`;
+        const missed = result.missedMessages ?? [];
+        let out: string;
+        if (missed.length === 0) {
+          out = `Connected. Buses: ${JSON.stringify(buses)}. ${instruction}`;
+        } else {
+          const missedStr = missed.map((m) => `[${m.bus_id}] ${m.user_name}: ${m.content}`).join("\n");
+          out = `Connected. Buses: ${JSON.stringify(buses)}. Missed messages (appended to buses):\n${missedStr}\n\n${instruction}`;
+        }
         recipeStore.appendToolCall("telegram_connect", args, "Connected");
         return toolResult(out);
       } catch (err) {
@@ -869,20 +877,21 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
   server.registerTool(
     "set_mb_properties",
     {
-      description: "Set or update properties for a message bus (description, trust_level). trust_level: normal (default) or root. Root-trusted bus messages are wrapped in session tag for model.",
+      description: "Set or update properties for a message bus (description, trust_level, is_banned). trust_level: normal (default) or root. is_banned: when true, messages to this bus get auto-reply 'I don't want to talk with you' without history. Root cannot be banned.",
       inputSchema: z.object({
         bus_id: BUS_ID_PARAM,
         mb_id: z.string().describe("Message bus id (same as bus_id)"),
         description: z.string().optional().describe("Description for the bus"),
         trust_level: z.enum(["normal", "root"]).optional().describe("Trust level: normal (default) or root. Root = wrap messages in session tag."),
+        is_banned: z.boolean().optional().describe("When true, auto-reply 'I don't want to talk with you' to messages. Root cannot be banned."),
         assessment: ASSESSMENT_PARAM,
         clarification: CLARIFICATION_PARAM,
       }),
     },
     async (args) => {
-      const a = args as { mb_id?: string; description?: string; trust_level?: "normal" | "root" };
+      const a = args as { bus_id?: string; mb_id?: string; description?: string; trust_level?: "normal" | "root"; is_banned?: boolean };
       logToolCall("set_mb_properties", args);
-      const unknownMsg = validateUnknownParams("set_mb_properties", args, new Set(["bus_id", "mb_id", "description", "trust_level", "assessment", "clarification"]));
+      const unknownMsg = validateUnknownParams("set_mb_properties", args, new Set(["bus_id", "mb_id", "description", "trust_level", "is_banned", "assessment", "clarification"]));
       if (unknownMsg) {
         recipeStore.appendToolCall("set_mb_properties", args, unknownMsg);
         return toolResult(unknownMsg);
@@ -892,12 +901,17 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
         recipeStore.appendToolCall("set_mb_properties", args, "mb_id is required");
         return toolResult("Error: mb_id is required");
       }
+      if (a.is_banned === true && mbId === ROOT_BUS_ID) {
+        recipeStore.appendToolCall("set_mb_properties", args, "Root bus cannot be banned");
+        return toolResult("Error: Root bus cannot be banned.");
+      }
       logClarification("set_mb_properties", args);
       logAssessment("set_mb_properties", args);
       try {
-        const props: { description?: string; trust_level?: "normal" | "root" } = {};
+        const props: { description?: string; trust_level?: "normal" | "root"; is_banned?: boolean } = {};
         if (a.description !== undefined) props.description = String(a.description).trim();
         if (a.trust_level !== undefined) props.trust_level = a.trust_level;
+        if (a.is_banned !== undefined) props.is_banned = a.is_banned;
         setBusProperties(mbId, props);
         recipeStore.appendToolCall("set_mb_properties", args, `Properties set for ${mbId}`);
         return toolResult(`Properties set for ${mbId}.`);
@@ -944,6 +958,88 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
         recipeStore.appendToolCall("delete_bus", args, msg);
         return toolResult(`Error: ${msg}`);
       }
+    }
+  );
+
+  server.registerTool(
+    "schedule_task",
+    {
+      description: "Schedule a one-time task to run at a specific time (RFC 3339, e.g. 2025-03-10T14:30:00Z). When the time arrives, the task is injected as a user message at root. For recurring tasks, schedule a new one after completing the current.",
+      inputSchema: z.object({
+        bus_id: BUS_ID_PARAM,
+        at: z.string().describe("When to run the task (RFC 3339 datetime, e.g. 2025-03-10T14:30:00Z)"),
+        title: z.string().describe("Short task title"),
+        instructions: z.string().describe("What the agent should do when the task runs"),
+        assessment: ASSESSMENT_PARAM,
+        clarification: CLARIFICATION_PARAM,
+      }),
+    },
+    async (args) => {
+      const a = args as { bus_id?: string; at?: string; title?: string; instructions?: string };
+      logToolCall("schedule_task", args);
+      const unknownMsg = validateUnknownParams("schedule_task", args, new Set(["bus_id", "at", "title", "instructions", "assessment", "clarification"]));
+      if (unknownMsg) {
+        recipeStore.appendToolCall("schedule_task", args, unknownMsg);
+        return toolResult(unknownMsg);
+      }
+      const at = String(a.at ?? "").trim();
+      const title = String(a.title ?? "").trim();
+      const instructions = String(a.instructions ?? "").trim();
+      if (!at) {
+        recipeStore.appendToolCall("schedule_task", args, "at is required");
+        return toolResult("Error: at is required (RFC 3339 datetime)");
+      }
+      if (!title) {
+        recipeStore.appendToolCall("schedule_task", args, "title is required");
+        return toolResult("Error: title is required");
+      }
+      const parsed = new Date(at);
+      if (isNaN(parsed.getTime())) {
+        recipeStore.appendToolCall("schedule_task", args, "at must be valid RFC 3339 datetime");
+        return toolResult("Error: at must be valid RFC 3339 datetime (e.g. 2025-03-10T14:30:00Z)");
+      }
+      if (parsed.getTime() <= Date.now()) {
+        recipeStore.appendToolCall("schedule_task", args, "at must be in the future");
+        return toolResult("Error: at must be in the future");
+      }
+      logClarification("schedule_task", args);
+      logAssessment("schedule_task", args);
+      try {
+        const entry = addSchedule(at, title, instructions);
+        recipeStore.appendToolCall("schedule_task", args, `Scheduled: ${title} at ${at}`);
+        return toolResult(`Scheduled task "${title}" for ${at} (id: ${entry.id}).`);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        recipeStore.appendToolCall("schedule_task", args, msg);
+        return toolResult(`Error: ${msg}`);
+      }
+    }
+  );
+
+  server.registerTool(
+    "list_tasks",
+    {
+      description: "List all tasks: the startup task (runs on app start) and scheduled tasks (run at specified times). Returns JSON with startup_task and scheduled.",
+      inputSchema: z.object({
+        bus_id: BUS_ID_PARAM,
+        assessment: ASSESSMENT_PARAM,
+        clarification: CLARIFICATION_PARAM,
+      }),
+    },
+    async (args) => {
+      logToolCall("list_tasks", args);
+      const unknownMsg = validateUnknownParams("list_tasks", args, new Set(["bus_id", "assessment", "clarification"]));
+      if (unknownMsg) {
+        recipeStore.appendToolCall("list_tasks", args, unknownMsg);
+        return toolResult(unknownMsg);
+      }
+      logClarification("list_tasks", args);
+      logAssessment("list_tasks", args);
+      const startup = getStartupTask();
+      const scheduled = listSchedules();
+      const result = JSON.stringify({ startup_task: startup, scheduled }, null, 2);
+      recipeStore.appendToolCall("list_tasks", args, result);
+      return toolResult(result);
     }
   );
 
@@ -1275,7 +1371,7 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
   server.registerTool(
     "mail__disconnect",
     {
-      description: "Disconnect from IMAP server.",
+      description: "Disconnect from IMAP server. Connection is kept alive automatically; prefer not to disconnect.",
       inputSchema: z.object({ bus_id: BUS_ID_PARAM, assessment: ASSESSMENT_PARAM, clarification: CLARIFICATION_PARAM }),
     },
     async (args) => {

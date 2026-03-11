@@ -397,6 +397,8 @@ export async function sendMessage(
         messages,
         tools: anthropicTools,
         tool_choice: { type: "auto" },
+        cache_control: { type: "ephemeral" },
+        thinking: { type: "adaptive" },
       },
       { headers: { "anthropic-beta": "context-1m-2025-08-07" } }
     );

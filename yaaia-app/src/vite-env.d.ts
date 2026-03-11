@@ -40,6 +40,12 @@ interface ElectronAPI {
   kbRead: (path: string) => Promise<string>;
   kbWrite: (path: string, content: string) => Promise<void>;
   kbDelete: (path: string) => Promise<void>;
+  scheduleList: () => Promise<Array<{ id: string; at: string; title: string; instructions: string; created_at: string }>>;
+  scheduleGetStartup: () => Promise<{ title: string; instructions: string }>;
+  scheduleSetStartup: (task: { title: string; instructions: string }) => Promise<void>;
+  scheduleAdd: (at: string, title: string, instructions: string) => Promise<{ id: string; at: string; title: string; instructions: string; created_at: string }>;
+  scheduleUpdate: (id: string, props: { at?: string; title?: string; instructions?: string }) => Promise<unknown>;
+  scheduleDelete: (id: string) => Promise<boolean>;
   openExternal: (url: string) => Promise<void>;
   onAgentStreamChunk: (callback: (chunk: string) => void) => () => void;
   onAskUserPopup: (callback: (info: { clarification: string; assessment: string; attempt: number }) => void) => () => void;
@@ -51,6 +57,7 @@ interface ElectronAPI {
   onStartupProgressReset: (callback: () => void) => () => void;
   onAgentMessage: (callback: (content: string) => void) => () => void;
   onTelegramMessage: (callback: (payload: { bus_id: string; user_id: number; user_name: string; content: string }) => void) => () => void;
+  onScheduleTrigger: (callback: (message: string) => void) => () => void;
   onTelegramLoginRequest: (callback: (info: { step: "phone" | "code" | "password" }) => void) => () => void;
   telegramLoginReply: (value: string) => Promise<void>;
 }

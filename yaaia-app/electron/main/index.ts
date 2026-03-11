@@ -18,6 +18,7 @@ import {
   telegramSendText,
   telegramSendTyping,
   telegramResolvePeer,
+  telegramFetchMissedMessages,
   isTelegramConnected,
 } from "./telegram-client.js";
 import { startAgent, stopAgent, sendMessage, requestAgentAbort, setPendingInjectMessage, setOnAssessmentClarification } from "./ai-agent/index.js";
@@ -39,10 +40,21 @@ import {
 import * as recipeStore from "./recipe-store.js";
 import { kbList, kbRead, kbWrite, kbDelete, runQmdCli } from "./mcp-server/kb-client.js";
 import {
+  listSchedules,
+  addSchedule,
+  updateSchedule,
+  deleteSchedule,
+  getDueSchedules,
+  deleteSchedules,
+  getStartupTask,
+  setStartupTask,
+} from "./schedule-store.js";
+import {
   appendToBusHistory,
   ensureBus,
   getBusHistory,
   getBusHistorySlice,
+  isBusBanned,
   listBuses,
   setBusProperties,
   getBusTrustLevel,
@@ -66,6 +78,57 @@ const busesDeliveredSinceRootWipe = new Set<string>();
 /** Track if agent sent to target bus during current run (for Telegram fallback). */
 let sentToTargetBusDuringRun = false;
 let currentTargetBusIdForRun: string | null = null;
+
+let scheduleIntervalHandle: ReturnType<typeof setInterval> | null = null;
+
+function buildScheduleMessage(schedules: { at: string; title: string; instructions: string }[]): string {
+  const now = new Date().toISOString();
+  if (schedules.length === 1) {
+    const s = schedules[0];
+    return `[Scheduled task]\n\nCurrent time: ${now}\nScheduled for: ${s.at}\n\nTitle: ${s.title}\nInstructions: ${s.instructions}`;
+  }
+  const lines: string[] = [
+    "[Scheduled tasks — missed while app was closed]",
+    "",
+    `Current time: ${now}`,
+    "",
+  ];
+  schedules.forEach((s, i) => {
+    lines.push(`--- Task ${i + 1} ---`, `Scheduled for: ${s.at}`, `Title: ${s.title}`, `Instructions: ${s.instructions}`, "");
+  });
+  return lines.join("\n").trimEnd();
+}
+
+function runStartupTask(): void {
+  const task = getStartupTask();
+  const content = `[Startup task]\n\nTitle: ${task.title}\nInstructions: ${task.instructions}`;
+  const msg = JSON.stringify({
+    bus_id: ROOT_BUS_ID,
+    user_id: 0,
+    user_name: "System",
+    content,
+  });
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send("schedule-trigger", msg);
+  }
+}
+
+function runDueSchedules(): void {
+  const due = getDueSchedules();
+  if (due.length === 0) return;
+  const ids = due.map((s) => s.id);
+  deleteSchedules(ids);
+  const content = buildScheduleMessage(due);
+  const msg = JSON.stringify({
+    bus_id: ROOT_BUS_ID,
+    user_id: 0,
+    user_name: "Scheduled",
+    content,
+  });
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send("schedule-trigger", msg);
+  }
+}
 
 /** Bring main window to front. Uses app.focus({ steal: true }) on macOS to reclaim focus from Chrome. */
 function refocusMainWindow(): void {
@@ -477,6 +540,11 @@ ipcMain.handle("start-chat", async (_event, config: McpConfig) => {
           deliverUserReply(payload.content, payload.bus_id);
           return;
         }
+        if (isBusBanned(payload.bus_id)) {
+          const peerId = parseInt(payload.bus_id.replace("telegram-", ""), 10);
+          if (!isNaN(peerId)) telegramSendText(peerId, "I don't want to talk with you").catch(() => {});
+          return;
+        }
         ensureBus(payload.bus_id, `Telegram: ${payload.user_name}`);
         const busMsg = {
           role: "user" as const,
@@ -543,7 +611,8 @@ ipcMain.handle("start-chat", async (_event, config: McpConfig) => {
           const buses = listBuses().filter((b) => b.bus_id.startsWith("telegram-"));
           const instruction =
             "If you need more context for a bus, call get_bus_history(bus_id, assessment, clarification, limit, offset). offset=0 = last N; offset<0 = from end.";
-          return { ok: true, buses, instruction };
+          const missed = await telegramFetchMissedMessages();
+          return { ok: true, buses, instruction, missedMessages: missed };
         }
         const apiId = parseInt(loadConfig().telegramAppId ?? "0", 10);
         const apiHash = loadConfig().telegramApiHash?.trim();
@@ -565,10 +634,12 @@ ipcMain.handle("start-chat", async (_event, config: McpConfig) => {
           const buses = listBuses().filter((b) => b.bus_id.startsWith("telegram-"));
           const instruction =
             "If you need more context for a bus, call get_bus_history(bus_id, assessment, clarification, limit, offset). offset=0 = last N; offset<0 = from end.";
+          const missed = await telegramFetchMissedMessages();
           return {
             ok: true,
             buses,
             instruction,
+            missedMessages: missed,
           };
         } catch (err) {
           return {
@@ -611,6 +682,11 @@ ipcMain.handle("start-chat", async (_event, config: McpConfig) => {
 
     recipeStore.setSessionTag(randomBytes(16).toString("hex"));
 
+    runStartupTask();
+    runDueSchedules();
+    if (scheduleIntervalHandle) clearInterval(scheduleIntervalHandle);
+    scheduleIntervalHandle = setInterval(runDueSchedules, 60_000);
+
     return safeForIPC({
       ok: true,
       agentReady: true,
@@ -626,6 +702,10 @@ ipcMain.handle("start-chat", async (_event, config: McpConfig) => {
 });
 
 ipcMain.handle("stop-chat", async () => {
+  if (scheduleIntervalHandle) {
+    clearInterval(scheduleIntervalHandle);
+    scheduleIntervalHandle = null;
+  }
   stopMcpServer();
   await stopChromeMcp();
   await stopKbMcp();
@@ -877,6 +957,22 @@ ipcMain.handle("kb-delete", async (_, path: string) => {
     throw err instanceof Error ? err : new Error(String(err));
   }
 });
+
+ipcMain.handle("schedule-list", () => safeForIPC(listSchedules()));
+ipcMain.handle("schedule-get-startup", () => safeForIPC(getStartupTask()));
+ipcMain.handle("schedule-set-startup", (_, task: { title: string; instructions: string }) => {
+  setStartupTask(task);
+  return undefined;
+});
+ipcMain.handle("schedule-add", (_, at: string, title: string, instructions: string) => {
+  const entry = addSchedule(at, title, instructions);
+  return safeForIPC(entry);
+});
+ipcMain.handle("schedule-update", (_, id: string, props: { at?: string; title?: string; instructions?: string }) => {
+  const updated = updateSchedule(id, props);
+  return safeForIPC(updated);
+});
+ipcMain.handle("schedule-delete", (_, id: string) => safeForIPC(deleteSchedule(id)));
 
 const RECIPE_PORT = 17892;
 let recipeServer: ReturnType<typeof createServer> | null = null;

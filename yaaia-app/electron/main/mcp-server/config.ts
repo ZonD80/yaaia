@@ -31,6 +31,7 @@ export interface McpServerConfig {
     ok: boolean;
     buses?: Array<{ bus_id: string; description: string }>;
     instruction?: string;
+    missedMessages?: Array<{ bus_id: string; user_id: number; user_name: string; content: string }>;
     error?: string;
   }>;
   /** Resolve Telegram username to bus_id. Requires Telegram to be connected. */

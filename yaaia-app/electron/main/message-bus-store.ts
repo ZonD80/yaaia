@@ -30,12 +30,14 @@ export type BusEntry = {
   bus_id: string;
   description: string;
   trust_level?: BusTrustLevel;
+  is_banned?: boolean;
 };
 
 type BusFile = {
   bus_id: string;
   description: string;
   trust_level?: BusTrustLevel;
+  is_banned?: boolean;
   messages: BusMessage[];
 };
 
@@ -62,6 +64,7 @@ function loadBusFile(busId: string): BusFile | null {
           bus_id: raw.bus_id,
           description: String(raw.description ?? ""),
           trust_level: raw.trust_level === "root" ? "root" : "normal",
+          is_banned: Boolean(raw.is_banned),
           messages: Array.isArray(raw.messages) ? raw.messages : [],
         };
       }
@@ -124,6 +127,7 @@ export function listBuses(): BusEntry[] {
           bus_id: data.bus_id,
           description: data.description,
           trust_level: data.trust_level ?? "normal",
+          is_banned: data.is_banned ?? false,
         });
       }
     }
@@ -143,9 +147,15 @@ export function getBusTrustLevel(busId: string): BusTrustLevel {
   return data?.trust_level === "root" ? "root" : "normal";
 }
 
+export function isBusBanned(busId: string): boolean {
+  if (busId === ROOT_BUS_ID) return false;
+  const data = loadBusFile(busId);
+  return Boolean(data?.is_banned);
+}
+
 export function setBusProperties(
   busId: string,
-  props: { description?: string; trust_level?: BusTrustLevel }
+  props: { description?: string; trust_level?: BusTrustLevel; is_banned?: boolean }
 ): void {
   ensureRootBus();
   const data = loadBusFile(busId) ?? {
@@ -157,6 +167,10 @@ export function setBusProperties(
   data.bus_id = busId;
   if (props.description !== undefined) data.description = props.description;
   if (props.trust_level !== undefined) data.trust_level = props.trust_level;
+  if (props.is_banned !== undefined) {
+    if (busId === ROOT_BUS_ID) throw new Error("Root bus cannot be banned");
+    data.is_banned = props.is_banned;
+  }
   saveBusFile(data);
 }
 

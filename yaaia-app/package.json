@@ -1,6 +1,6 @@
 {
   "name": "yaaia",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Yet Another AI Agent - Browser automation with Chrome DevTools MCP",
   "main": "dist-electron/main/index.js",
   "type": "module",

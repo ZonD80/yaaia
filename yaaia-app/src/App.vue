@@ -63,7 +63,8 @@
           <div v-for="(msg, i) in messages" :key="i" :class="['msg', msg.role, { error: msg.isError, report: msg.isReport }, msg.type]">
             <template v-if="msg.role === 'user'">
               <span v-if="msg.injected" class="msg-type-label">Injected:</span>
-              <span class="msg-text">{{ msg.content }}</span>
+              <div v-if="msg.isTelegram" class="msg-markdown" v-html="renderMarkdown(msg.content)"></div>
+              <span v-else class="msg-text">{{ msg.content }}</span>
             </template>
             <template v-else>
               <div v-if="msg.isError" class="msg-error">{{ msg.content }}</div>
@@ -94,7 +95,8 @@
             <div v-for="(p, pi) in streamingParsed.parts" :key="'stream-' + pi" :class="['msg', p.role, p.type]">
               <template v-if="p.role === 'user'">
                 <span v-if="p.injected" class="msg-type-label">Injected:</span>
-                <span class="msg-text">{{ p.content }}</span>
+                <div v-else-if="p.isTelegram" class="msg-markdown" v-html="renderMarkdown(p.content)"></div>
+                <span v-else class="msg-text">{{ p.content }}</span>
               </template>
               <template v-else-if="p.type === 'assessment'">
                 <span class="msg-type-label">{{ p.bus_id ? `Remote bus (${p.bus_id}) assessment` : 'Assessment' }}</span>
@@ -142,6 +144,7 @@
         <button class="btn secondary" @click="openConfigsEditor">Configs Editor</button>
         <button class="btn secondary" @click="openMessageBusEditor">Message Buses</button>
         <button class="btn secondary" @click="openKbEditor">KB Editor</button>
+        <button class="btn secondary" @click="openScheduleEditor">Schedules</button>
         <button class="btn secondary" @click="viewRecipe">View recipe</button>
         <button class="btn secondary" @click="saveRecipe">Save recipe</button>
         <button class="btn secondary" @click="loadRecipe">Load recipe</button>
@@ -167,8 +170,8 @@
     <div v-if="askUserInfo" class="ask-user-overlay">
       <div class="ask-user-modal">
         <h3>Agent needs your input</h3>
-        <p v-if="askUserInfo.clarification" class="ask-user-clarification">{{ askUserInfo.clarification }}</p>
-        <p v-if="askUserInfo.assessment" class="ask-user-assessment">{{ askUserInfo.assessment }}</p>
+        <div v-if="askUserInfo.clarification" class="ask-user-clarification msg-markdown" v-html="renderMarkdown(askUserInfo.clarification)"></div>
+        <div v-if="askUserInfo.assessment" class="ask-user-assessment msg-markdown" v-html="renderMarkdown(askUserInfo.assessment)"></div>
         <p class="ask-user-countdown">Reply within {{ askUserCountdown }} seconds</p>
         <textarea v-model="askUserReply" placeholder="Type your reply..." rows="4" @keydown.enter.ctrl="submitAskUserReply" />
         <div class="ask-user-actions">
@@ -334,6 +337,37 @@
         <div class="editor-modal-actions">
           <button class="btn secondary" @click="startAddKbFile">Add new</button>
           <button class="btn secondary" @click="showKbEditor = false">Close</button>
+        </div>
+      </div>
+    </div>
+    <div v-if="showScheduleEditor" class="ask-user-overlay editor-overlay" @click.self="showScheduleEditor = false">
+      <div class="ask-user-modal editor-modal schedule-editor-modal">
+        <h3>Schedules</h3>
+        <p v-if="scheduleError" class="editor-error">{{ scheduleError }}</p>
+        <div class="schedule-editor-layout">
+          <div class="schedule-editor-list">
+            <div v-for="s in scheduleListWithZero" :key="s.id" class="schedule-editor-item"
+              :class="{ selected: scheduleSelectedId === s.id, 'schedule-zero': s.id === 'zero' }"
+              @click="selectSchedule(s)">
+              <span class="schedule-item-title">{{ s.title }}</span>
+              <span class="schedule-item-at">{{ s.id === 'zero' ? 'On app start' : formatScheduleAt(s.at) }}</span>
+            </div>
+          </div>
+          <div class="schedule-editor-form">
+            <input v-if="scheduleSelectedId !== 'zero'" v-model="scheduleFormAt" type="datetime-local" class="editor-input" />
+            <input v-model="scheduleFormTitle" type="text" placeholder="Title" class="editor-input" />
+            <textarea v-model="scheduleFormInstructions" placeholder="Instructions..." rows="8" class="editor-textarea"></textarea>
+            <div class="editor-form-actions">
+              <button class="btn primary" @click="saveSchedule" :disabled="scheduleSaving">
+                {{ scheduleSaving ? "Saving…" : (scheduleSelectedId ? "Update" : "Add") }}
+              </button>
+              <button v-if="scheduleSelectedId && scheduleSelectedId !== 'zero'" class="btn secondary" @click="deleteSchedule" :disabled="scheduleSaving">Delete</button>
+            </div>
+          </div>
+        </div>
+        <div class="editor-modal-actions">
+          <button class="btn secondary" @click="startAddSchedule">Add new</button>
+          <button class="btn secondary" @click="showScheduleEditor = false">Close</button>
         </div>
       </div>
     </div>
@@ -683,6 +717,136 @@ async function openKbEditor() {
   await refreshKbList();
 }
 
+function formatScheduleAt(iso: string): string {
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return iso;
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  const h = String(d.getHours()).padStart(2, "0");
+  const min = String(d.getMinutes()).padStart(2, "0");
+  return `${y}-${m}-${day} ${h}:${min}`;
+}
+
+function toDatetimeLocal(iso: string): string {
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return "";
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  const h = String(d.getHours()).padStart(2, "0");
+  const min = String(d.getMinutes()).padStart(2, "0");
+  return `${y}-${m}-${day}T${h}:${min}`;
+}
+
+async function openScheduleEditor() {
+  showScheduleEditor.value = true;
+  scheduleError.value = "";
+  startAddSchedule();
+  await refreshScheduleList();
+}
+
+async function refreshScheduleList() {
+  try {
+    const [list, startup] = await Promise.all([
+      window.electronAPI?.scheduleList?.() ?? [],
+      window.electronAPI?.scheduleGetStartup?.() ?? { title: "", instructions: "" },
+    ]);
+    scheduleItems.value = list;
+    scheduleStartupTask.value = startup;
+  } catch (err) {
+    scheduleItems.value = [];
+    scheduleStartupTask.value = null;
+    scheduleError.value = err instanceof Error ? err.message : "Failed to load";
+  }
+}
+
+function selectSchedule(s: { id: string; at: string; title: string; instructions: string }) {
+  scheduleSelectedId.value = s.id;
+  scheduleFormAt.value = s.id === ZERO_TASK_ID ? "" : toDatetimeLocal(s.at);
+  scheduleFormTitle.value = s.title;
+  scheduleFormInstructions.value = s.instructions;
+  scheduleError.value = "";
+}
+
+function startAddSchedule() {
+  scheduleSelectedId.value = null;
+  const now = new Date();
+  scheduleFormAt.value = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}T${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
+  scheduleFormTitle.value = "";
+  scheduleFormInstructions.value = "";
+  scheduleError.value = "";
+}
+
+async function saveSchedule() {
+  const title = scheduleFormTitle.value.trim();
+  const instructions = scheduleFormInstructions.value.trim();
+  if (!title) {
+    scheduleError.value = "Title is required";
+    return;
+  }
+  if (scheduleSelectedId.value === ZERO_TASK_ID) {
+    scheduleError.value = "";
+    scheduleSaving.value = true;
+    try {
+      await window.electronAPI?.scheduleSetStartup?.({ title, instructions });
+      await refreshScheduleList();
+      scheduleSelectedId.value = ZERO_TASK_ID;
+      scheduleFormTitle.value = title;
+      scheduleFormInstructions.value = instructions;
+    } catch (err) {
+      scheduleError.value = err instanceof Error ? err.message : "Failed to save";
+    } finally {
+      scheduleSaving.value = false;
+    }
+    return;
+  }
+  const atVal = scheduleFormAt.value.trim();
+  if (!atVal) {
+    scheduleError.value = "Date/time is required";
+    return;
+  }
+  const at = new Date(atVal).toISOString();
+  if (isNaN(new Date(at).getTime())) {
+    scheduleError.value = "Invalid date/time";
+    return;
+  }
+  if (new Date(at).getTime() <= Date.now()) {
+    scheduleError.value = "Schedule time must be in the future";
+    return;
+  }
+  scheduleError.value = "";
+  scheduleSaving.value = true;
+  try {
+    if (scheduleSelectedId.value) {
+      await window.electronAPI?.scheduleUpdate?.(scheduleSelectedId.value, { at, title, instructions });
+    } else {
+      await window.electronAPI?.scheduleAdd?.(at, title, instructions);
+    }
+    await refreshScheduleList();
+    startAddSchedule();
+  } catch (err) {
+    scheduleError.value = err instanceof Error ? err.message : "Failed to save";
+  } finally {
+    scheduleSaving.value = false;
+  }
+}
+
+async function deleteSchedule() {
+  if (!scheduleSelectedId.value || !confirm("Delete this schedule?")) return;
+  scheduleError.value = "";
+  scheduleSaving.value = true;
+  try {
+    await window.electronAPI?.scheduleDelete?.(scheduleSelectedId.value);
+    await refreshScheduleList();
+    startAddSchedule();
+  } catch (err) {
+    scheduleError.value = err instanceof Error ? err.message : "Failed to delete";
+  } finally {
+    scheduleSaving.value = false;
+  }
+}
+
 async function refreshKbList() {
   try {
     const list = (await window.electronAPI?.kbList?.(".", true)) ?? [];
@@ -911,6 +1075,24 @@ const messageBusHistoryBusId = ref("");
 // KB Editor
 const showKbEditor = ref(false);
 const kbEditorPreview = ref(false);
+
+// Schedule Editor
+const ZERO_TASK_ID = "zero";
+const showScheduleEditor = ref(false);
+const scheduleItems = ref<Array<{ id: string; at: string; title: string; instructions: string; created_at: string }>>([]);
+const scheduleStartupTask = ref<{ title: string; instructions: string } | null>(null);
+const scheduleSelectedId = ref<string | null>(null);
+const scheduleListWithZero = computed(() => {
+  const zero = scheduleStartupTask.value;
+  if (!zero) return scheduleItems.value;
+  const zeroItem = { id: ZERO_TASK_ID, at: "", title: zero.title, instructions: zero.instructions, created_at: "" };
+  return [zeroItem, ...scheduleItems.value];
+});
+const scheduleFormAt = ref("");
+const scheduleFormTitle = ref("");
+const scheduleFormInstructions = ref("");
+const scheduleError = ref("");
+const scheduleSaving = ref(false);
 const kbFiles = ref<string[]>([]);
 const kbSelectedPath = ref<string | null>(null);
 const kbFormPath = ref("");
@@ -929,6 +1111,7 @@ let agentBrowserErrorUnsub: (() => void) | undefined;
 let startupProgressUnsub: (() => void) | undefined;
 let startupProgressResetUnsub: (() => void) | undefined;
 let agentMessageUnsub: (() => void) | undefined;
+let scheduleTriggerUnsub: (() => void) | undefined;
 let telegramMessageUnsub: (() => void) | undefined;
 let telegramLoginUnsub: (() => void) | undefined;
 
@@ -1100,6 +1283,42 @@ onMounted(async () => {
     telegramLoginValue.value = "";
   });
 
+  scheduleTriggerUnsub = window.electronAPI?.onScheduleTrigger?.((msg) => {
+    let displayContent = "⏰ **Scheduled task**";
+    try {
+      const parsed = JSON.parse(msg);
+      if (typeof parsed?.content === "string" && parsed.content.trim()) {
+        displayContent = `⏰ **Scheduled task**\n\n${parsed.content}`;
+      }
+    } catch {
+      /* use default */
+    }
+    messages.value.push({ role: "user", content: displayContent, isTelegram: true });
+    scrollToBottomAlways();
+    if (sending.value) {
+      window.electronAPI?.agentInjectMessage?.(msg, false);
+    } else {
+      sending.value = true;
+      streaming.value = true;
+      streamBuffer.value = "";
+      window.electronAPI
+        ?.agentSendMessage?.(msg, [], "root")
+        ?.then(() => {})
+        ?.catch((err) => {
+          const { parts, tail } = parseStream(streamBuffer.value);
+          for (const p of parts) messages.value.push(p);
+          const content = tail.trim() ? `${tail.trim()}\n\n**Error:** ${err}` : `Error: ${err}`;
+          messages.value.push({ role: "assistant", content, isError: true });
+        })
+        ?.finally(() => {
+          sending.value = false;
+          streaming.value = false;
+          streamBuffer.value = "";
+          scrollToBottomAlways();
+        });
+    }
+  });
+
   telegramMessageUnsub = window.electronAPI?.onTelegramMessage?.((payload) => {
     const msg = JSON.stringify(payload);
     const incomingLabel = `📱 **Telegram** (${payload.user_name}): ${payload.content}`;
@@ -1199,6 +1418,7 @@ onUnmounted(() => {
   startupProgressUnsub?.();
   startupProgressResetUnsub?.();
   agentMessageUnsub?.();
+  scheduleTriggerUnsub?.();
   telegramMessageUnsub?.();
   telegramLoginUnsub?.();
   stopAskUserCountdown();
@@ -1681,6 +1901,59 @@ onUnmounted(() => {
   background: #1a3a5c;
   color: #58a6ff;
 }
+
+.schedule-editor-modal {
+  max-width: 700px;
+}
+.schedule-editor-layout {
+  display: flex;
+  gap: 1rem;
+  margin-bottom: 1rem;
+  min-height: 200px;
+}
+.schedule-editor-list {
+  width: 220px;
+  flex-shrink: 0;
+  overflow-y: auto;
+  border: 1px solid #333;
+  border-radius: 4px;
+  padding: 0.25rem;
+}
+.schedule-editor-item {
+  display: flex;
+  flex-direction: column;
+  padding: 0.5rem 0.75rem;
+  font-size: 0.85rem;
+  cursor: pointer;
+  border-radius: 4px;
+}
+.schedule-editor-item:hover {
+  background: #21262d;
+}
+.schedule-editor-item.selected {
+  background: #1a3a5c;
+  color: #58a6ff;
+}
+.schedule-item-title {
+  font-weight: 500;
+}
+.schedule-item-at {
+  font-size: 0.75rem;
+  color: #8b949e;
+  margin-top: 0.2rem;
+}
+.schedule-editor-item.schedule-zero .schedule-item-at {
+  color: #58a6ff;
+  font-style: italic;
+}
+.schedule-editor-form {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
 .kb-editor-form {
   flex: 1;
   min-width: 0;
