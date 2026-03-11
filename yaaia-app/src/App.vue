@@ -993,7 +993,51 @@ let scheduleTriggerUnsub: (() => void) | undefined;
 let telegramMessageUnsub: (() => void) | undefined;
 let telegramLoginUnsub: (() => void) | undefined;
 
+/** Queued messages when agent is busy; drained and sent together when agent finishes. */
+const messageQueue = ref<{ msg: string; bus_id: string }[]>([]);
+
 const streamingParsed = computed(() => parseStream(streamBuffer.value));
+
+function queueMessage(msg: string, bus_id: string): void {
+  messageQueue.value.push({ msg, bus_id });
+}
+
+function buildQueuedPayload(): string {
+  if (messageQueue.value.length === 0) return "";
+  const lines = messageQueue.value.map((q) => q.msg);
+  messageQueue.value = [];
+  return "[QUEUED]\n" + lines.join("\n");
+}
+
+async function drainQueueAndSend(): Promise<void> {
+  const payload = buildQueuedPayload();
+  if (!payload) return;
+  sending.value = true;
+  streaming.value = true;
+  streamBuffer.value = "";
+  try {
+    await window.electronAPI?.agentSendMessage?.(payload, [], "root");
+    const { parts, tail } = parseStream(streamBuffer.value);
+    for (const p of parts) messages.value.push(p);
+    const finalContent = tail.trim();
+    if (finalContent) {
+      messages.value.push({ role: "assistant", content: finalContent });
+    }
+  } catch (err) {
+    const { parts, tail } = parseStream(streamBuffer.value);
+    for (const p of parts) messages.value.push(p);
+    const msg = err instanceof Error ? err.message : String(err);
+    const content = tail.trim() ? `${tail.trim()}\n\n**Error:** ${msg}` : `Error: ${msg}`;
+    messages.value.push({ role: "assistant", content, isError: true });
+  } finally {
+    sending.value = false;
+    streaming.value = false;
+    streamBuffer.value = "";
+    await refreshMessagesFromRoot();
+    scrollToBottomAlways();
+    await drainQueueAndSend();
+  }
+}
 
 type RootHistoryMessage = { role: string; content: string; user_id?: number; user_name?: string; bus_id?: string };
 
@@ -1085,10 +1129,15 @@ async function send() {
   if (!text) return;
 
   if (sending.value) {
-    // Inject message into running agent (after last tool result)
     inputText.value = "";
     messages.value.push({ role: "user", content: text, injected: true });
-    window.electronAPI?.agentInjectMessage?.(text, false);
+    const queuedMsg = JSON.stringify({
+      bus_id: "root",
+      content: text,
+      user_id: 0,
+      user_name: config.value.userName ?? "",
+    });
+    queueMessage(queuedMsg, "root");
     scrollToBottomAlways();
     return;
   }
@@ -1129,6 +1178,7 @@ async function send() {
     streamBuffer.value = "";
     await refreshMessagesFromRoot();
     scrollToBottomAlways();
+    await drainQueueAndSend();
   }
 }
 
@@ -1198,7 +1248,7 @@ onMounted(async () => {
     messages.value.push({ role: "user", content: displayContent, isTelegram: true });
     scrollToBottomAlways();
     if (sending.value) {
-      window.electronAPI?.agentInjectMessage?.(msg, false);
+      queueMessage(msg, "root");
     } else {
       sending.value = true;
       streaming.value = true;
@@ -1218,6 +1268,7 @@ onMounted(async () => {
           streamBuffer.value = "";
           await refreshMessagesFromRoot();
           scrollToBottomAlways();
+          await drainQueueAndSend();
         });
     }
   });
@@ -1228,7 +1279,7 @@ onMounted(async () => {
     messages.value.push({ role: "user", content: incomingLabel, isTelegram: true });
     scrollToBottomAlways();
     if (sending.value) {
-      window.electronAPI?.agentInjectMessage?.(msg, false);
+      queueMessage(msg, payload.bus_id);
     } else {
       sending.value = true;
       streaming.value = true;
@@ -1248,6 +1299,7 @@ onMounted(async () => {
           streamBuffer.value = "";
           await refreshMessagesFromRoot();
           scrollToBottomAlways();
+          await drainQueueAndSend();
         });
     }
   });

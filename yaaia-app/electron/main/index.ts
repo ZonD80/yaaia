@@ -734,37 +734,62 @@ ipcMain.handle(
     busId?: string
   ) => {
     const cfg = loadConfig();
-    const targetBusId = busId ?? ROOT_BUS_ID;
-    if (targetBusId === ROOT_BUS_ID) {
-      let parsed: { content?: string; user_id?: number; user_name?: string; bus_id?: string } | null = null;
-      if (typeof message === "string" && message.startsWith("{")) {
+    let targetBusId = busId ?? ROOT_BUS_ID;
+    let userMsg: string;
+
+    if (typeof message === "string" && message.startsWith("[QUEUED]\n")) {
+      targetBusId = ROOT_BUS_ID;
+      const lines = message.slice(9).split("\n").filter((l) => l.trim());
+      const parts: string[] = [];
+      for (const line of lines) {
         try {
-          parsed = JSON.parse(message);
+          const parsed = JSON.parse(line) as { content?: string; user_id?: number; user_name?: string; bus_id?: string };
+          const busIdForAppend = parsed.bus_id && parsed.bus_id !== ROOT_BUS_ID ? parsed.bus_id : ROOT_BUS_ID;
+          appendToBusHistory(busIdForAppend, {
+            role: "user",
+            content: parsed.content ?? line,
+            user_id: parsed.user_id ?? 0,
+            user_name: parsed.user_name ?? cfg.userName ?? "",
+            bus_id: busIdForAppend,
+          });
+          parts.push(line);
         } catch {
-          /* fall through */
+          /* skip malformed line */
         }
       }
-      const content = parsed?.content ?? message;
-      const user_name = parsed?.user_name ?? cfg.userName ?? "";
-      const user_id = parsed?.user_id ?? 0;
-      const bus_id = parsed?.bus_id && parsed.bus_id !== ROOT_BUS_ID ? parsed.bus_id : undefined;
-      appendToBusHistory(ROOT_BUS_ID, {
-        role: "user",
-        content,
-        user_id,
-        user_name,
-        ...(bus_id && { bus_id }),
-      });
-    }
-    const userMsg =
-      typeof message === "string" && message.startsWith("{")
-        ? message
-        : JSON.stringify({
-          bus_id: ROOT_BUS_ID,
-          user_id: 0,
-          user_name: cfg.userName ?? "",
-          content: message,
+      userMsg = "[QUEUED]\n" + parts.join("\n");
+    } else {
+      if (targetBusId === ROOT_BUS_ID) {
+        let parsed: { content?: string; user_id?: number; user_name?: string; bus_id?: string } | null = null;
+        if (typeof message === "string" && message.startsWith("{")) {
+          try {
+            parsed = JSON.parse(message);
+          } catch {
+            /* fall through */
+          }
+        }
+        const content = parsed?.content ?? message;
+        const user_name = parsed?.user_name ?? cfg.userName ?? "";
+        const user_id = parsed?.user_id ?? 0;
+        const bus_id = parsed?.bus_id && parsed.bus_id !== ROOT_BUS_ID ? parsed.bus_id : undefined;
+        appendToBusHistory(ROOT_BUS_ID, {
+          role: "user",
+          content,
+          user_id,
+          user_name,
+          ...(bus_id && { bus_id }),
         });
+      }
+      userMsg =
+        typeof message === "string" && message.startsWith("{")
+          ? message
+          : JSON.stringify({
+            bus_id: ROOT_BUS_ID,
+            user_id: 0,
+            user_name: cfg.userName ?? "",
+            content: message,
+          });
+    }
     const tag = recipeStore.getSessionTag();
     const { messages: busHistory, trimmedCount } = getRootLogForModel();
     const history: { role: "user" | "assistant"; content: string; wrap?: boolean }[] = busHistory.map((m) => {
@@ -791,14 +816,48 @@ ipcMain.handle(
     } else {
       currentTargetBusIdForRun = null;
     }
-    try {
-      const result = await sendMessage(
+    const doSend = async () =>
+      sendMessage(
         userMsg,
         (chunk) => event.sender.send("agent-stream-chunk", String(chunk ?? "")),
         history,
         targetBusId,
         trimmedCount
       );
+
+    let result: { text: string };
+    try {
+      result = await doSend();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (
+        msg.includes("Session not found") &&
+        mcpHttpServer &&
+        !mainWindow?.isDestroyed()
+      ) {
+        try {
+          const cfg = loadConfig();
+          const mcpPort = getMcpServerPort(mcpHttpServer);
+          await startAgent({
+            mcpPort,
+            aiProvider: cfg.aiProvider ?? "claude",
+            claudeApiKey: cfg.claudeApiKey ?? "",
+            claudeModel: cfg.claudeModel ?? "claude-sonnet-4-6",
+            openrouterApiKey: cfg.openrouterApiKey ?? "",
+            openrouterModel: cfg.openrouterModel ?? "google/gemini-2.5-flash",
+          });
+          console.log("[YAAIA] Reconnected agent after session loss");
+          result = await doSend();
+        } catch (retryErr) {
+          const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr);
+          throw new Error(`Session lost. Please exit and restart the chat. (${retryMsg})`);
+        }
+      } else {
+        throw new Error(msg);
+      }
+    }
+
+    try {
       const finalizeInfo = recipeStore.completeFinalizeWithReport(result.text ?? "");
       if (finalizeInfo) {
         refocusMainWindow();
