@@ -72,6 +72,7 @@ export type OnTelegramMessageCallback = (
 ) => void;
 
 let onMessageCallback: OnTelegramMessageCallback | null = null;
+let messageHandlerUnsub: (() => void) | undefined;
 /** Client instance the handler was registered on, used to explicitly remove it on disconnect. */
 let messageHandlerClient: TelegramClient | null = null;
 
