@@ -8,10 +8,6 @@ export interface McpConfig {
   claudeModel: string;
   openrouterApiKey: string;
   openrouterModel: string;
-  telegramAppId: string;
-  telegramApiHash: string;
-  caldavGoogleClientId: string;
-  caldavGoogleClientSecret: string;
   userName: string;
 }
 
@@ -28,6 +24,7 @@ try {
     recipeView: () => ipcRenderer.invoke("recipe-view"),
     recipeSave: () => ipcRenderer.invoke("recipe-save"),
     recipeLoad: () => ipcRenderer.invoke("recipe-load"),
+    agentQueueMessage: (message: string) => ipcRenderer.invoke("agent-queue-message", message),
     agentInjectMessage: (message: string, placeAfterAskUser?: boolean) =>
       ipcRenderer.invoke("agent-inject-message", message, placeAfterAskUser),
     secretsListFull: () => ipcRenderer.invoke("secrets-list-full"),
@@ -125,6 +122,11 @@ try {
       const fn = (_: unknown, payload: { bus_id: string; content: string; instruction?: string }) => callback(payload);
       ipcRenderer.on("caldav-event", fn);
       return () => ipcRenderer.removeListener("caldav-event", fn);
+    },
+    onCaldavEventDeleted: (callback: (payload: { eventUid: string; busId: string }) => void) => {
+      const fn = (_: unknown, payload: { eventUid: string; busId: string }) => callback(payload);
+      ipcRenderer.on("caldav-event-deleted", fn);
+      return () => ipcRenderer.removeListener("caldav-event-deleted", fn);
     },
     onScheduleTrigger: (callback: (message: string) => void) => {
       const fn = (_: unknown, message: string) => callback(message);

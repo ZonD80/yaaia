@@ -72,7 +72,50 @@ export type OnTelegramMessageCallback = (
 ) => void;
 
 let onMessageCallback: OnTelegramMessageCallback | null = null;
-let messageHandlerUnsub: (() => void) | undefined;
+/** Client instance the handler was registered on, used to explicitly remove it on disconnect. */
+let messageHandlerClient: TelegramClient | null = null;
+
+/** Dedupe by (chatId|msgId). Guards against fetchMissedMessages + handleNewMessage delivering same msg. */
+const deliveredMessageIds = new Set<string>();
+const MAX_DELIVERED_IDS = 5000;
+
+/**
+ * Secondary dedup by content+timestamp. Guards against mtcute firing onNewMessage twice for the
+ * same physical message with different IDs (e.g. temp ID on arrival vs confirmed server ID, or
+ * catch-up updates after reconnect overlapping with live updates).
+ * Key: chatId|content_prefix|msgDateUnix  Value: delivery timestamp (ms)
+ */
+const deliveredContentKeys = new Map<string, number>();
+const CONTENT_DEDUP_WINDOW_MS = 10_000;
+
+function markDelivered(chatId: number, msgId: number, content?: string, msgDateUnix?: number): boolean {
+  const key = `${chatId}|${msgId}`;
+  if (deliveredMessageIds.has(key)) return false;
+
+  if (content !== undefined && msgDateUnix !== undefined) {
+    const contentKey = `${chatId}|${content.slice(0, 100)}|${msgDateUnix}`;
+    const now = Date.now();
+    if (deliveredContentKeys.has(contentKey)) {
+      console.log("[YAAIA Telegram] Skipping content-dedup duplicate:", key);
+      // Still register the ID so future ID-based checks also catch it
+      deliveredMessageIds.add(key);
+      return false;
+    }
+    deliveredContentKeys.set(contentKey, now);
+    // Prune old entries
+    for (const [k, ts] of deliveredContentKeys) {
+      if (now - ts > CONTENT_DEDUP_WINDOW_MS) deliveredContentKeys.delete(k);
+    }
+  }
+
+  deliveredMessageIds.add(key);
+  if (deliveredMessageIds.size > MAX_DELIVERED_IDS) {
+    const arr = [...deliveredMessageIds];
+    deliveredMessageIds.clear();
+    arr.slice(-Math.floor(MAX_DELIVERED_IDS * 0.8)).forEach((k) => deliveredMessageIds.add(k));
+  }
+  return true;
+}
 
 export function setOnTelegramMessage(cb: OnTelegramMessageCallback | null): void {
   onMessageCallback = cb;
@@ -85,7 +128,7 @@ export function isTelegramConnected(): boolean {
   return connected !== false;
 }
 
-async function scheduleReconnect(): Promise<void> {
+function scheduleReconnect(): void {
   if (reconnectTimeoutHandle) return;
   if (!storedReconnectParams) return;
   console.log("[YAAIA Telegram] Scheduling reconnect in", RECONNECT_DELAY_MS, "ms");
@@ -190,9 +233,14 @@ export async function telegramConnect(params: TelegramConnectParams): Promise<bo
       console.log("[YAAIA Telegram] Connected. Logged in as", self.displayName ?? self.id);
       storedReconnectParams = { apiId, apiHash, phone, getLoginInput };
       setupConnectionListeners(client);
-      const unsub = (client.onNewMessage as unknown as { add: (fn: (msg: Message) => void) => () => void }).add(handleNewMessage);
+      const dispatcher = client.onNewMessage as unknown as { add: (fn: (msg: Message) => void) => () => void; remove: (fn: (msg: Message) => void) => void };
+      const unsub = dispatcher.add(handleNewMessage);
+      messageHandlerClient = client;
+      // Prefer the returned unsubscribe fn; fall back to explicit .remove() call on the stored client ref.
+      messageHandlerUnsub = typeof unsub === "function" ? unsub : () => {
+        try { dispatcher.remove(handleNewMessage); } catch { /* ignore */ }
+      };
       console.log("[YAAIA Telegram] Message handler registered (onNewMessage.add)");
-      messageHandlerUnsub = typeof unsub === "function" ? unsub : undefined;
       return true;
     }
   } catch (err) {
@@ -220,6 +268,11 @@ async function handleNewMessage(msg: Message): Promise<void> {
   const userName = sender.type === "user" ? (sender.username ?? sender.displayName ?? String(userId)) : "unknown";
   const content = msg.text.trim();
   const timestamp = msg.date instanceof Date ? msg.date.toISOString() : undefined;
+  const msgDateUnix = msg.date instanceof Date ? Math.floor(msg.date.getTime() / 1000) : Math.floor(Date.now() / 1000);
+  if (!markDelivered(chatId, msg.id, content, msgDateUnix)) {
+    console.log("[YAAIA Telegram] Skipping duplicate message:", busId, msg.id);
+    return;
+  }
   console.log("[YAAIA Telegram] Delivering message to bus:", busId, "from", userName);
   onMessageCallback?.({
     bus_id: busId,
@@ -282,6 +335,7 @@ export async function telegramFetchMissedMessages(opts?: { deliverToModel?: bool
     const chat = msg.chat;
     const sender = msg.sender;
     const chatId = chat.id;
+    if (!markDelivered(chatId, msg.id)) continue; /* skip if handleNewMessage already delivered (e.g. on reconnect catch-up) */
     const busId = `telegram-${chatId}`;
     const userId = sender.type === "user" ? sender.id : 0;
     const userName = sender.type === "user" ? (sender.username ?? sender.displayName ?? String(userId)) : "unknown";
@@ -357,6 +411,7 @@ export async function telegramDisconnect(clearReconnectParams = true): Promise<v
     try {
       messageHandlerUnsub?.();
       messageHandlerUnsub = undefined;
+      messageHandlerClient = null;
       await client.destroy();
     } catch (err) {
       console.warn("[YAAIA Telegram] Disconnect error:", err);

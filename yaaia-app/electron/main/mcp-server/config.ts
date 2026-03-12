@@ -44,4 +44,6 @@ export interface McpServerConfig {
   };
   /** Open URL in browser (for CalDAV OAuth). */
   onOpenExternal?: (url: string) => void | Promise<void>;
+  /** Called when a CalDAV event is deleted. Notify renderer to remove from timeline. */
+  onCaldavEventDeleted?: (eventUid: string, busId: string) => void;
 }

@@ -21,6 +21,7 @@ import {
 } from "./history-store.js";
 import { isTelegramConnected, telegramDeleteChatHistory } from "./telegram-client.js";
 import { isMailConnected, mailDeleteMessagesByUids } from "./mail-client.js";
+import { isCaldavConnected } from "./caldav-client.js";
 
 export type RootLogForModel = { messages: BusMessage[]; trimmedCount: number };
 
@@ -36,6 +37,8 @@ export type BusMessage = {
   timestamp?: string;
   /** IMAP UID for email bus cleanup (delete from mailbox) */
   mail_uid?: number;
+  /** CalDAV event UID for calendar event cleanup (delete from history when event deleted) */
+  event_uid?: string;
 };
 
 export type BusTrustLevel = "normal" | "root";
@@ -45,6 +48,7 @@ export type BusEntry = {
   description: string;
   trust_level?: BusTrustLevel;
   is_banned?: boolean;
+  is_connected: boolean;
 };
 
 function ensureRootBus(): void {
@@ -59,6 +63,14 @@ function ensureRootBus(): void {
   }
 }
 
+function getBusConnected(busId: string): boolean {
+  if (busId === ROOT_BUS_ID) return true;
+  if (busId.startsWith("telegram-")) return isTelegramConnected();
+  if (busId.startsWith("email-")) return isMailConnected();
+  if (busId.startsWith("caldav-")) return isCaldavConnected();
+  return true;
+}
+
 export function listBuses(): BusEntry[] {
   ensureRootBus();
   const buses = getActiveBuses();
@@ -70,6 +82,7 @@ export function listBuses(): BusEntry[] {
       description: props?.description ?? "",
       trust_level: (props?.trust_level as BusTrustLevel) ?? "normal",
       is_banned: props?.is_banned ?? false,
+      is_connected: getBusConnected(busId),
     });
   }
   return out;
@@ -181,6 +194,11 @@ export function getBusHistorySlice(
   return getHistorySlice(busId, limit, offset).map(toBusMessage);
 }
 
+/** Get root bus history only (not merged). Useful for duplicate checks. */
+export function getRootBusHistoryOnly(): BusMessage[] {
+  return getHistory(ROOT_BUS_ID).map(toBusMessage);
+}
+
 export function appendToBusHistory(busId: string, message: BusMessage): void {
   ensureRootBus();
   ensureMbDir(busId);
@@ -192,5 +210,6 @@ export function appendToBusHistory(busId: string, message: BusMessage): void {
     bus_id: message.bus_id ?? busId,
     timestamp: message.timestamp,
     mail_uid: message.mail_uid,
+    event_uid: message.event_uid,
   });
 }

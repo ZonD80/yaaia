@@ -36,22 +36,6 @@
           <input v-model="config.openrouterModel" placeholder="google/gemini-2.5-flash" />
         </div>
         <div class="field">
-          <label>Telegram App ID</label>
-          <input v-model="config.telegramAppId" placeholder="e.g. 12345678" />
-        </div>
-        <div class="field">
-          <label>Telegram API Hash</label>
-          <input type="password" v-model="config.telegramApiHash" placeholder="e.g. abc123..." />
-        </div>
-        <div class="field">
-          <label>CalDAV Google Client ID</label>
-          <input v-model="config.caldavGoogleClientId" placeholder="For Google Calendar OAuth" />
-        </div>
-        <div class="field">
-          <label>CalDAV Google Client Secret</label>
-          <input type="password" v-model="config.caldavGoogleClientSecret" placeholder="For Google Calendar OAuth" />
-        </div>
-        <div class="field">
           <label>Your name (root bus)</label>
           <input v-model="config.userName" placeholder="e.g. Alice" />
         </div>
@@ -70,8 +54,9 @@
       <section class="chat" v-else>
         <div class="chat-messages" ref="messagesRef">
           <div v-if="messages.length === 0" class="chat-placeholder">Agent is ready. Type your message below.</div>
-          <div v-for="(msg, i) in messages" :key="i"
+          <div v-for="(msg, i) in messages" :key="`${msg.timestamp ?? ''}-${msg.role}-${i}`"
             :class="['msg', msg.role, { error: msg.isError, report: msg.isReport }, msg.type]">
+            <span v-if="msg.timestamp" class="msg-timestamp">{{ formatTimestamp(msg.timestamp) }}</span>
             <template v-if="msg.role === 'user'">
               <span v-if="msg.injected" class="msg-type-label">Injected:</span>
               <div v-if="msg.isTelegram" class="msg-markdown" v-html="renderMarkdown(msg.content)"></div>
@@ -158,6 +143,7 @@
         <button class="btn secondary" @click="viewRecipe">View recipe</button>
         <button class="btn secondary" @click="saveRecipe">Save recipe</button>
         <button class="btn secondary" @click="loadRecipe">Load recipe</button>
+        <button class="btn secondary" @click="openBusStatuses">Bus statuses</button>
         <button class="btn secondary" @click="exitChat">Exit chat</button>
       </aside>
     </main>
@@ -283,9 +269,12 @@
         <p v-if="kbError" class="editor-error">{{ kbError }}</p>
         <div class="kb-editor-layout">
           <div class="kb-editor-list">
-            <div v-for="path in kbFiles" :key="path" class="kb-editor-item"
-              :class="{ selected: kbSelectedPath === path }" @click="selectKbFile(path)">
-              {{ path }}
+            <input v-model="kbFilter" type="text" placeholder="Filter files..." class="editor-input kb-filter-input" />
+            <div class="kb-editor-list-scroll">
+              <div v-for="path in filteredKbFiles" :key="path" class="kb-editor-item"
+                :class="{ selected: kbSelectedPath === path }" @click="selectKbFile(path)">
+                {{ path }}
+              </div>
             </div>
           </div>
           <div class="kb-editor-form">
@@ -347,6 +336,25 @@
         </div>
       </div>
     </div>
+    <div v-if="showBusStatuses" class="ask-user-overlay editor-overlay" @click.self="showBusStatuses = false">
+      <div class="ask-user-modal editor-modal bus-status-modal">
+        <h3>Bus statuses</h3>
+        <div class="bus-status-list">
+          <div v-for="bus in busStatusList" :key="bus.bus_id" class="bus-status-row">
+            <span class="bus-status-dot" :class="bus.is_connected ? 'online' : 'offline'"></span>
+            <span class="bus-status-name">{{ bus.description || bus.bus_id }}</span>
+            <span class="bus-status-id">{{ bus.bus_id }}</span>
+            <span class="bus-status-label" :class="bus.is_connected ? 'online' : 'offline'">
+              {{ bus.is_connected ? 'online' : 'offline' }}
+            </span>
+          </div>
+          <div v-if="busStatusList.length === 0" class="editor-hint">No buses found.</div>
+        </div>
+        <div class="editor-modal-actions">
+          <button class="btn secondary" @click="showBusStatuses = false">Close</button>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -359,6 +367,7 @@ const appVersion = __APP_VERSION__;
 type ChatMessage = {
   role: "user" | "assistant";
   content: string;
+  timestamp?: string;
   injected?: boolean;
   isError?: boolean;
   isReport?: boolean;
@@ -625,6 +634,12 @@ async function openKbEditor() {
   await refreshKbList();
 }
 
+async function openBusStatuses() {
+  showBusStatuses.value = true;
+  const list = await window.electronAPI?.messageBusList?.() ?? [];
+  busStatusList.value = list as { bus_id: string; description: string; is_connected: boolean }[];
+}
+
 function formatScheduleAt(iso: string): string {
   const d = new Date(iso);
   if (isNaN(d.getTime())) return iso;
@@ -755,10 +770,19 @@ async function deleteSchedule() {
   }
 }
 
+const filteredKbFiles = computed(() => {
+  const q = kbFilter.value.trim().toLowerCase();
+  return kbFiles.value.filter((p) => {
+    if (p.includes(".DS_Store")) return false;
+    if (!q) return true;
+    return p.toLowerCase().includes(q);
+  });
+});
+
 async function refreshKbList() {
   try {
     const list = (await window.electronAPI?.kbList?.(".", true)) ?? [];
-    kbFiles.value = list.filter((p: string) => !p.endsWith("/")) as string[];
+    kbFiles.value = list.filter((p: string) => !p.endsWith("/") && !p.includes(".DS_Store")) as string[];
   } catch (err) {
     kbFiles.value = [];
     kbError.value = err instanceof Error ? err.message : "Failed to load";
@@ -880,10 +904,6 @@ const config = ref({
   claudeModel: "claude-sonnet-4-6",
   openrouterApiKey: "",
   openrouterModel: "google/gemini-2.5-flash",
-  telegramAppId: "",
-  telegramApiHash: "",
-  caldavGoogleClientId: "",
-  caldavGoogleClientSecret: "",
   userName: "",
 });
 
@@ -980,6 +1000,8 @@ const kbEditorPreview = ref(false);
 // Schedule Editor
 const ZERO_TASK_ID = "zero";
 const showScheduleEditor = ref(false);
+const showBusStatuses = ref(false);
+const busStatusList = ref<{ bus_id: string; description: string; is_connected: boolean }[]>([]);
 const scheduleItems = ref<Array<{ id: string; at: string; title: string; instructions: string; created_at: string }>>([]);
 const scheduleStartupTask = ref<{ title: string; instructions: string } | null>(null);
 const scheduleSelectedId = ref<string | null>(null);
@@ -995,6 +1017,7 @@ const scheduleFormInstructions = ref("");
 const scheduleError = ref("");
 const scheduleSaving = ref(false);
 const kbFiles = ref<string[]>([]);
+const kbFilter = ref("");
 const kbSelectedPath = ref<string | null>(null);
 const kbFormPath = ref("");
 const kbFormContent = ref("");
@@ -1016,10 +1039,11 @@ let scheduleTriggerUnsub: (() => void) | undefined;
 let telegramMessageUnsub: (() => void) | undefined;
 let emailMessageUnsub: (() => void) | undefined;
 let caldavEventUnsub: (() => void) | undefined;
+let caldavEventDeletedUnsub: (() => void) | undefined;
 let telegramLoginUnsub: (() => void) | undefined;
 
 /** Queued messages when agent is busy; drained and sent together when agent finishes. */
-const messageQueue = ref<{ msg: string; bus_id: string }[]>([]);
+const messageQueue = ref<{ msg: string; bus_id: string; timestamp: string }[]>([]);
 
 /** Debounce timer for batching incoming messages (Telegram/Email) into one agent request. */
 let drainDebounceTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1028,7 +1052,7 @@ const DRAIN_DEBOUNCE_MS = 1000;
 const streamingParsed = computed(() => parseStream(streamBuffer.value));
 
 function queueMessage(msg: string, bus_id: string): void {
-  messageQueue.value.push({ msg, bus_id });
+  messageQueue.value.push({ msg, bus_id, timestamp: new Date().toISOString() });
 }
 
 function buildQueuedPayload(): string {
@@ -1078,7 +1102,16 @@ async function drainQueueAndSend(): Promise<void> {
   }
 }
 
-type RootHistoryMessage = { role: string; content: string; user_id?: number; user_name?: string; bus_id?: string };
+type RootHistoryMessage = { role: string; content: string; user_id?: number; user_name?: string; bus_id?: string; timestamp?: string };
+
+function formatTimestamp(ts: string | undefined): string {
+  if (!ts) return "";
+  const d = new Date(ts);
+  if (isNaN(d.getTime())) return "";
+  return d.toLocaleString(undefined, { dateStyle: "short", timeStyle: "medium" });
+}
+
+const TOOL_BLOCK_RE = /^\[Tool: ([^\]]+)\]\n([\s\S]*)$/;
 
 function rootHistoryToMessages(hist: RootHistoryMessage[]): ChatMessage[] {
   return hist.map((m) => {
@@ -1086,22 +1119,30 @@ function rootHistoryToMessages(hist: RootHistoryMessage[]): ChatMessage[] {
     const busId = m.bus_id;
     const userName = m.user_name ?? "";
     let content = m.content;
+    const timestamp = m.timestamp;
     if (role === "user" && busId) {
-      content = `📱 **${busId}** (${userName}): ${content}`;
-      return { role, content, type: undefined, isTelegram: true };
+      let emoji = "📱";
+      if (busId.startsWith("email-")) emoji = "📧";
+      else if (busId.startsWith("caldav-")) emoji = "📅";
+      content = `${emoji} **${busId}** (${userName}): ${content}`;
+      return { role, content, timestamp, type: undefined, isTelegram: true };
     }
-    if (role === "assistant" && busId) {
-      content = `[${busId}] ${content}`;
+    if (role === "assistant") {
+      const match = content.match(TOOL_BLOCK_RE);
+      if (match) {
+        const [, name, accordion] = match;
+        return { role, content: "", timestamp, type: "tool_call", name: name ?? "", accordion };
+      }
     }
-    return { role, content, type: role === "assistant" ? "content" : undefined };
+    return { role, content, timestamp, type: role === "assistant" ? "content" : undefined };
   });
 }
 
 async function refreshMessagesFromRoot(): Promise<void> {
   try {
     const rootHistory = ((await window.electronAPI?.messageBusGetHistory?.("root")) ?? []) as RootHistoryMessage[];
-    messages.value = rootHistoryToMessages(rootHistory);
-    // Queued messages (e.g. user injected during task) are not yet in history; append them so they stay visible
+    const fromHistory = rootHistoryToMessages(rootHistory);
+    const fromQueue: ChatMessage[] = [];
     for (const q of messageQueue.value) {
       try {
         const parsed = JSON.parse(q.msg) as { content?: string; user_name?: string };
@@ -1113,15 +1154,21 @@ async function refreshMessagesFromRoot(): Promise<void> {
         } else if (q.bus_id?.startsWith("email-")) {
           display = `📧 **Email** (${parsed?.user_name ?? ""}): ${preview}`;
         } else if (q.bus_id?.startsWith("caldav-")) {
-          display = `📅 **Calendar** (${q.bus_id}): ${preview}`;
+          display = `📅 **Calendar** (${q.bus_id}): ${content}`;
         } else {
           display = content;
         }
-        messages.value.push({ role: "user", content: display, injected: true });
+        fromQueue.push({ role: "user", content: display, timestamp: q.timestamp, injected: true, isTelegram: true });
       } catch {
-        messages.value.push({ role: "user", content: q.msg, injected: true });
+        fromQueue.push({ role: "user", content: q.msg, timestamp: q.timestamp, injected: true });
       }
     }
+    const merged = [...fromHistory, ...fromQueue].sort((a, b) => {
+      const ta = a.timestamp ?? "";
+      const tb = b.timestamp ?? "";
+      return ta.localeCompare(tb);
+    });
+    messages.value = merged;
   } catch {
     /* ignore */
   }
@@ -1198,20 +1245,20 @@ async function send() {
 
   if (sending.value) {
     inputText.value = "";
-    messages.value.push({ role: "user", content: text, injected: true });
+    messages.value.push({ role: "user", content: text, injected: true, timestamp: new Date().toISOString() });
     const queuedMsg = JSON.stringify({
       bus_id: "root",
       content: text,
       user_id: 0,
       user_name: config.value.userName ?? "",
     });
-    queueMessage(queuedMsg, "root");
+    window.electronAPI?.agentQueueMessage?.(queuedMsg);
     scrollToBottomAlways();
     return;
   }
 
   inputText.value = "";
-  messages.value.push({ role: "user", content: text });
+  messages.value.push({ role: "user", content: text, timestamp: new Date().toISOString() });
   textareaFocused.value = true;
   sending.value = true;
   streaming.value = true;
@@ -1294,7 +1341,7 @@ onMounted(async () => {
   });
 
   agentMessageUnsub = window.electronAPI?.onAgentMessage?.((content) => {
-    messages.value.push({ role: "assistant", content, type: "content" });
+    messages.value.push({ role: "assistant", content, type: "content", timestamp: new Date().toISOString() });
     scrollToBottomAlways();
   });
 
@@ -1303,7 +1350,9 @@ onMounted(async () => {
     telegramLoginValue.value = "";
   });
 
-  scheduleTriggerUnsub = window.electronAPI?.onScheduleTrigger?.((msg) => {
+  scheduleTriggerUnsub = window.electronAPI?.onScheduleTrigger?.((payload) => {
+    const msg = typeof payload === "string" ? payload : payload.msg;
+    const injectHandled = typeof payload === "object" && payload.injectHandled;
     let displayContent = "⏰ **Scheduled task**";
     try {
       const parsed = JSON.parse(msg);
@@ -1313,17 +1362,27 @@ onMounted(async () => {
     } catch {
       /* use default */
     }
-    messages.value.push({ role: "user", content: displayContent, isTelegram: true });
+    messages.value.push({ role: "user", content: displayContent, isTelegram: true, timestamp: new Date().toISOString() });
     scrollToBottomAlways();
-    if (sending.value) {
+    if (!injectHandled && sending.value) {
       queueMessage(msg, "root");
+    }
+    if (injectHandled || sending.value) {
+      /* drain will run when current request finishes, or main process already has it */
     } else {
       sending.value = true;
       streaming.value = true;
       streamBuffer.value = "";
       window.electronAPI
         ?.agentSendMessage?.(msg, [], "root")
-        ?.then(() => { })
+        ?.then((reply) => {
+          const { parts, tail } = parseStream(streamBuffer.value);
+          for (const p of parts) messages.value.push(p);
+          const finalContent = reply === "Stopped by user."
+            ? (tail.trim() ? tail.trim() + "\n\n" : "") + "_Stopped by user._"
+            : reply || tail.trim();
+          if (finalContent) messages.value.push({ role: "assistant", content: finalContent, timestamp: new Date().toISOString() });
+        })
         ?.catch((err) => {
           const { parts, tail } = parseStream(streamBuffer.value);
           for (const p of parts) messages.value.push(p);
@@ -1343,43 +1402,67 @@ onMounted(async () => {
 
   telegramMessageUnsub = window.electronAPI?.onTelegramMessage?.((payload) => {
     const msg = JSON.stringify(payload);
+    const injectHandled = (payload as { injectHandled?: boolean }).injectHandled;
     const incomingLabel = `📱 **Telegram** (${payload.user_name}): ${payload.content}`;
-    messages.value.push({ role: "user", content: incomingLabel, isTelegram: true });
+    const ts = (payload as { timestamp?: string }).timestamp ?? new Date().toISOString();
+    messages.value.push({ role: "user", content: incomingLabel, timestamp: ts, isTelegram: true });
     scrollToBottomAlways();
-    queueMessage(msg, payload.bus_id);
-    if (sending.value) {
-      /* drain will run when current request finishes */
-    } else {
-      scheduleDrain();
+    if (!injectHandled) {
+      queueMessage(msg, payload.bus_id);
+      if (sending.value) {
+        /* drain will run when current request finishes */
+      } else {
+        scheduleDrain();
+      }
     }
   });
 
   emailMessageUnsub = window.electronAPI?.onEmailMessage?.((payload) => {
     const msg = JSON.stringify(payload);
+    const injectHandled = (payload as { injectHandled?: boolean }).injectHandled;
     const preview = payload.content.length > 300 ? payload.content.slice(0, 300) + "…" : payload.content;
     const incomingLabel = `📧 **Email** (${payload.user_name}): ${preview}`;
-    messages.value.push({ role: "user", content: incomingLabel, isTelegram: true });
+    const ts = (payload as { timestamp?: string }).timestamp ?? new Date().toISOString();
+    messages.value.push({ role: "user", content: incomingLabel, timestamp: ts, isTelegram: true });
     scrollToBottomAlways();
-    queueMessage(msg, payload.bus_id);
-    if (sending.value) {
-      /* drain will run when current request finishes */
-    } else {
-      scheduleDrain();
+    if (!injectHandled) {
+      queueMessage(msg, payload.bus_id);
+      if (sending.value) {
+        /* drain will run when current request finishes */
+      } else {
+        scheduleDrain();
+      }
     }
   });
 
   caldavEventUnsub = window.electronAPI?.onCaldavEvent?.((payload) => {
     const msg = JSON.stringify(payload);
-    const preview = payload.content.length > 300 ? payload.content.slice(0, 300) + "…" : payload.content;
-    const incomingLabel = `📅 **Calendar** (${payload.bus_id}): ${preview}`;
-    messages.value.push({ role: "user", content: incomingLabel, isTelegram: true });
+    const injectHandled = (payload as { injectHandled?: boolean }).injectHandled;
+    const incomingLabel = `📅 **Calendar** (${payload.bus_id}): ${payload.content}`;
+    messages.value.push({ role: "user", content: incomingLabel, timestamp: new Date().toISOString(), isTelegram: true });
     scrollToBottomAlways();
-    queueMessage(msg, payload.bus_id);
-    if (sending.value) {
-      /* drain will run when current request finishes */
-    } else {
-      scheduleDrain();
+    if (!injectHandled) {
+      queueMessage(msg, payload.bus_id);
+      if (sending.value) {
+        /* drain will run when current request finishes */
+      } else {
+        scheduleDrain();
+      }
     }
+  });
+
+  caldavEventDeletedUnsub = window.electronAPI?.onCaldavEventDeleted?.(({ eventUid, busId }) => {
+    const marker = `Event UID: ${eventUid}`;
+    messages.value = messages.value.filter((m) => !(m.role === "user" && m.content?.includes(marker)));
+    messageQueue.value = messageQueue.value.filter((q) => {
+      if (q.bus_id !== busId) return true;
+      try {
+        const parsed = JSON.parse(q.msg) as { event_uid?: string };
+        return parsed?.event_uid !== eventUid;
+      } catch {
+        return true;
+      }
+    });
   });
 
   askUserUnsub = window.electronAPI?.onAskUserPopup?.((info) => {
@@ -1454,6 +1537,7 @@ onUnmounted(() => {
   telegramMessageUnsub?.();
   emailMessageUnsub?.();
   caldavEventUnsub?.();
+  caldavEventDeletedUnsub?.();
   telegramLoginUnsub?.();
   stopAskUserCountdown();
   stopTaskTimer();
@@ -1611,6 +1695,13 @@ onUnmounted(() => {
 .msg.report {
   background: #1a2a1e;
   border: 1px solid #2d4035;
+}
+
+.msg-timestamp {
+  display: block;
+  font-size: 0.7rem;
+  color: #6e7681;
+  margin-bottom: 0.25rem;
 }
 
 .msg-type-label {
@@ -1844,6 +1935,56 @@ onUnmounted(() => {
   z-index: 200;
 }
 
+.bus-status-modal {
+  min-width: 360px;
+  max-width: 560px;
+}
+
+.bus-status-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin-bottom: 1rem;
+}
+
+.bus-status-row {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  font-size: 0.9rem;
+}
+
+.bus-status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.bus-status-dot.online { background: #3fb950; }
+.bus-status-dot.offline { background: #8b949e; }
+
+.bus-status-name {
+  flex: 1;
+  color: #e6edf3;
+}
+
+.bus-status-id {
+  color: #8b949e;
+  font-size: 0.8rem;
+  font-family: monospace;
+}
+
+.bus-status-label {
+  font-size: 0.8rem;
+  font-weight: 600;
+  min-width: 44px;
+  text-align: right;
+}
+
+.bus-status-label.online { color: #3fb950; }
+.bus-status-label.offline { color: #8b949e; }
+
 .editor-modal {
   max-width: 640px;
   max-height: 85vh;
@@ -1994,10 +2135,24 @@ onUnmounted(() => {
 .kb-editor-list {
   width: 220px;
   flex-shrink: 0;
-  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
   border: 1px solid #30363d;
   border-radius: 6px;
   background: #0d1117;
+}
+
+.kb-editor-list .kb-filter-input {
+  flex-shrink: 0;
+  margin: 0.5rem;
+  padding: 0.4rem 0.6rem;
+}
+
+.kb-editor-list-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
 }
 
 .kb-editor-preview {

@@ -19,6 +19,8 @@ export type HistoryMessage = {
   timestamp: string;
   /** IMAP UID for email bus cleanup (delete from mailbox) */
   mail_uid?: number;
+  /** CalDAV event UID for calendar event cleanup (delete from history when event deleted) */
+  event_uid?: string;
 };
 
 export type BusProperties = {
@@ -26,6 +28,7 @@ export type BusProperties = {
   description: string;
   trust_level?: "normal" | "root";
   is_banned?: boolean;
+  url?: string;
 };
 
 /** Sanitize bus_id for use in path (replace / and \ with safe chars) */
@@ -69,6 +72,7 @@ function messageToBlock(m: HistoryMessage): string {
   if (m.user_id !== undefined) lines.push(`user_id: ${m.user_id}`);
   if (m.user_name !== undefined) lines.push(`user_name: ${m.user_name}`);
   if (m.mail_uid !== undefined) lines.push(`mail_uid: ${m.mail_uid}`);
+  if (m.event_uid !== undefined) lines.push(`event_uid: ${m.event_uid}`);
   lines.push("---", "", m.content, "");
   return lines.join("\n");
 }
@@ -96,6 +100,7 @@ function parseHistoryFile(content: string, busId: string): HistoryMessage[] {
       bus_id: typeof meta.bus_id === "string" ? meta.bus_id : busId,
       timestamp,
       mail_uid: typeof meta.mail_uid === "number" ? meta.mail_uid : undefined,
+      event_uid: typeof meta.event_uid === "string" ? meta.event_uid : undefined,
     });
     i += 2;
   }
@@ -177,6 +182,7 @@ export function loadBusProperties(mbId: string): BusProperties | null {
         description: String(meta.description ?? ""),
         trust_level: meta.trust_level === "root" ? "root" : "normal",
         is_banned: meta.is_banned === true || meta.is_banned === "true",
+        url: meta.url ? String(meta.url) : undefined,
       };
     }
   } catch {
@@ -195,6 +201,7 @@ export function saveBusProperties(props: BusProperties): void {
     `description: "${desc}"`,
     `trust_level: ${props.trust_level ?? "normal"}`,
     `is_banned: ${props.is_banned ?? false}`,
+    ...(props.url ? [`url: "${props.url.replace(/"/g, '\\"')}"`] : []),
     "---",
   ];
   kbWrite(path, lines.join("\n"));
@@ -354,6 +361,7 @@ export function toBusMessage(m: HistoryMessage): {
   bus_id?: string;
   timestamp?: string;
   mail_uid?: number;
+  event_uid?: string;
 } {
   return {
     role: m.role,
@@ -363,6 +371,7 @@ export function toBusMessage(m: HistoryMessage): {
     bus_id: m.bus_id,
     timestamp: m.timestamp,
     mail_uid: m.mail_uid,
+    event_uid: m.event_uid,
   };
 }
 
@@ -383,6 +392,49 @@ export function removeMessagesFromBusHistoryByMailUids(busId: string, uids: numb
         const content = kbRead(f);
         const messages = parseHistoryFile(content, busId);
         const remaining = messages.filter((m) => !(m.mail_uid !== undefined && uidSet.has(m.mail_uid)));
+        if (remaining.length === 0) {
+          kbDelete(f);
+        } else {
+          const newContent = remaining.map((m) => messageToBlock(m)).join("\n");
+          kbWrite(f, newContent);
+        }
+      } catch {
+        /* skip */
+      }
+    }
+  }
+}
+
+function extractEventUidFromContent(content: string): string | undefined {
+  const m = content.match(/Event UID:\s*(.+)$/m);
+  return m ? m[1].trim() : undefined;
+}
+
+/** Check if an event with this event_uid already exists in bus history. Used to avoid duplicate CalDAV events on reconnect. */
+export function hasEventInBusHistory(busId: string, eventUid: string): boolean {
+  const messages = getBusHistory(busId);
+  if (eventUid.length === 0) return false;
+  return messages.some((m) => {
+    const uid = m.event_uid ?? extractEventUidFromContent(m.content);
+    return uid === eventUid;
+  });
+}
+
+/** Remove messages with given event_uids from bus history. Used when deleting CalDAV events. */
+export function removeMessagesFromBusHistoryByEventUids(busId: string, eventUids: string[]): void {
+  if (eventUids.length === 0) return;
+  const uidSet = new Set(eventUids);
+  const dates = listDateDirs(busId);
+  for (const date of dates) {
+    const files = listBusFiles(busId, date);
+    for (const f of files) {
+      try {
+        const content = kbRead(f);
+        const messages = parseHistoryFile(content, busId);
+        const remaining = messages.filter((m) => {
+          const uid = m.event_uid ?? extractEventUidFromContent(m.content);
+          return !(uid !== undefined && uidSet.has(uid));
+        });
         if (remaining.length === 0) {
           kbDelete(f);
         } else {

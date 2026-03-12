@@ -1,6 +1,6 @@
 {
   "name": "yaaia",
-  "version": "0.4.8",
+  "version": "0.5.0",
   "description": "Yet Another AI Agent - Browser automation with Chrome DevTools MCP",
   "main": "dist-electron/main/index.js",
   "type": "module",
@@ -10,6 +10,7 @@
   "scripts": {
     "postinstall": "node scripts/patch-qmd.js",
     "migrate:history": "node scripts/migrate-history-to-mb-format.js",
+    "migrate:caldav-bus-ids": "node scripts/migrate-caldav-bus-ids.js",
     "install:conda": "PYTHON=$(conda run -n yaaia-build which python) npm install && PYTHON=$(conda run -n yaaia-build which python) node node_modules/@electron/rebuild/lib/cli.js",
     "dev": "electron-vite dev",
     "build": "electron-vite build",

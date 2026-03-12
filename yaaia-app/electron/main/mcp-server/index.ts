@@ -81,9 +81,12 @@ import {
   caldavCreateEvent,
   caldavUpdateEvent,
   caldavDeleteEvent,
+  caldavRemoveFromLastKnown,
+  parseIcsEventUid,
   isCaldavConnected,
   startGoogleOAuthBrowserServer,
 } from "../caldav-client.js";
+import { removeEventTaskMapping } from "../caldav-event-tasks-store.js";
 import { addSchedule, listSchedules, getStartupTask, deleteSchedule } from "../schedule-store.js";
 import {
   listBuses,
@@ -96,7 +99,7 @@ import {
   getBusTrustLevel,
   ROOT_BUS_ID,
 } from "../message-bus-store.js";
-import { removeMessagesFromBusHistoryByMailUids } from "../history-store.js";
+import { removeMessagesFromBusHistoryByMailUids, removeMessagesFromBusHistoryByEventUids, loadBusProperties, saveBusProperties } from "../history-store.js";
 
 const BROWSER_URL = "http://127.0.0.1:9222";
 
@@ -728,7 +731,7 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
         return toolResult(unknownMsg);
       }
       const busId = String(a.bus_id ?? "").trim();
-      const content = String(a.content ?? "").trim();
+      const content = String(a.content ?? "").trim().replace(/\\n/g, "\n");
       const waitForAnswer = a.wait_for_answer === true;
       if (!busId) {
         recipeStore.appendToolCall("send_message", args, "bus_id is required");
@@ -747,8 +750,8 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
       if (busId === ROOT_BUS_ID) {
         config.onSendMessageToRoot?.(content);
         if (!waitForAnswer) recipeStore.setPendingReportFromSendMessage(content);
-      }
-      if (busId.startsWith("telegram-")) {
+      } else if (busId.startsWith("telegram-")) {
+        config.onSendMessageToRoot?.(`[${busId}] ${content}`);
         try {
           await config.onSendMessageToTelegram?.(busId, content);
         } catch (err) {
@@ -781,7 +784,7 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
   server.registerTool(
     "list_buses",
     {
-      description: "List all known message buses with their descriptions.",
+      description: "List all known message buses with their descriptions and connection status (is_connected).",
       inputSchema: z.object({
         bus_id: BUS_ID_PARAM,
         assessment: ASSESSMENT_PARAM,
@@ -800,6 +803,31 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
       const buses = listBuses();
       const resultText = JSON.stringify(buses);
       recipeStore.appendToolCall("list_buses", args, resultText);
+      return toolResult(resultText);
+    }
+  );
+
+  server.registerTool(
+    "get_datetime",
+    {
+      description: "Return the current date and time in UTC (ISO 8601).",
+      inputSchema: z.object({
+        bus_id: BUS_ID_PARAM,
+        assessment: ASSESSMENT_PARAM,
+        clarification: CLARIFICATION_PARAM,
+      }),
+    },
+    (args) => {
+      logToolCall("get_datetime", args);
+      const unknownMsg = validateUnknownParams("get_datetime", args, new Set(["bus_id", "assessment", "clarification"]));
+      if (unknownMsg) {
+        recipeStore.appendToolCall("get_datetime", args, unknownMsg);
+        return toolResult(unknownMsg);
+      }
+      logClarification("get_datetime", args);
+      logAssessment("get_datetime", args);
+      const resultText = new Date().toISOString();
+      recipeStore.appendToolCall("get_datetime", args, resultText);
       return toolResult(resultText);
     }
   );
@@ -2582,9 +2610,14 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
         }
 
         const account = a.authMethod === "OAuth" ? (a.username ?? "google") : a.username!;
-        const { busIds } = await caldavInitAndWatch(account);
+        const { calendars } = await caldavInitAndWatch(account);
+        for (const cal of calendars) {
+          ensureBus(cal.busId, `Calendar: ${cal.displayName}`);
+          const props = loadBusProperties(cal.busId);
+          if (props) saveBusProperties({ ...props, url: cal.url });
+        }
         recipeStore.appendToolCall("caldav__connect", args, "Connected.");
-        return toolResult(`Connected. Bus(es): ${busIds.join(", ")}`);
+        return toolResult(`Connected. Bus(es): ${calendars.map((c) => c.busId).join(", ")}`);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         recipeStore.appendToolCall("caldav__connect", args, msg);
@@ -2797,7 +2830,7 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
       description: "Delete a calendar event. Pass the object from get_event.",
       inputSchema: z.object({
         bus_id: BUS_ID_PARAM,
-        calendarObject: z.string().describe("JSON: {url, etag}"),
+        calendarObject: z.string().describe("JSON from get_event: {url, etag, data}. Include data for history sync."),
         assessment: ASSESSMENT_PARAM,
         clarification: CLARIFICATION_PARAM,
       }),
@@ -2810,12 +2843,19 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
         recipeStore.appendToolCall("caldav__delete_event", args, unknownMsg);
         return toolResult(unknownMsg);
       }
-      const a = args as { calendarObject: string };
+      const a = args as { bus_id: string; calendarObject: string };
       logClarification("caldav__delete_event", args);
       logAssessment("caldav__delete_event", args);
       try {
-        const obj = JSON.parse(a.calendarObject) as { url: string; etag?: string };
+        const obj = JSON.parse(a.calendarObject) as { url: string; etag?: string; data?: string };
         await caldavDeleteEvent(obj);
+        const eventUid = typeof obj.data === "string" ? parseIcsEventUid(obj.data) : undefined;
+        if (eventUid) {
+          removeEventTaskMapping(eventUid);
+          removeMessagesFromBusHistoryByEventUids(a.bus_id, [eventUid]);
+          config.onCaldavEventDeleted?.(eventUid, a.bus_id);
+        }
+        caldavRemoveFromLastKnown(obj.url);
         recipeStore.appendToolCall("caldav__delete_event", args, "Deleted.");
         return toolResult("Event deleted.");
       } catch (err) {

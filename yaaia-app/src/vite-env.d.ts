@@ -9,10 +9,6 @@ interface ElectronAPI {
     claudeModel: string;
     openrouterApiKey: string;
     openrouterModel: string;
-    telegramAppId: string;
-    telegramApiHash: string;
-    caldavGoogleClientId?: string;
-    caldavGoogleClientSecret?: string;
     userName: string;
   }>;
   startChat: (config: unknown) => Promise<{ ok: boolean; agentReady?: boolean; message: string }>;
@@ -24,6 +20,7 @@ interface ElectronAPI {
   recipeView: () => Promise<void>;
   recipeSave: () => Promise<string | null>;
   recipeLoad: () => Promise<{ ok: boolean; markdown?: string; error?: string }>;
+  agentQueueMessage: (message: string) => Promise<void>;
   agentInjectMessage: (message: string, placeAfterAskUser?: boolean) => Promise<void>;
   secretsListFull: () => Promise<unknown[]>;
   secretsSet: (args: unknown) => Promise<string>;
@@ -61,7 +58,8 @@ interface ElectronAPI {
   onTelegramMessage: (callback: (payload: { bus_id: string; user_id: number; user_name: string; content: string }) => void) => () => void;
   onEmailMessage: (callback: (payload: { bus_id: string; user_id: number; user_name: string; content: string; instruction?: string }) => void) => () => void;
   onCaldavEvent: (callback: (payload: { bus_id: string; content: string; instruction?: string }) => void) => () => void;
-  onScheduleTrigger: (callback: (message: string) => void) => () => void;
+  onCaldavEventDeleted: (callback: (payload: { eventUid: string; busId: string }) => void) => () => void;
+  onScheduleTrigger: (callback: (payload: { msg: string; injectHandled?: boolean } | string) => void) => () => void;
   onTelegramLoginRequest: (callback: (info: { step: "phone" | "code" | "password" }) => void) => () => void;
   telegramLoginReply: (value: string) => Promise<void>;
 }

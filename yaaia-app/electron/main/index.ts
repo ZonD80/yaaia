@@ -24,6 +24,7 @@ import {
 import { setOnMailMessage } from "./mail-client.js";
 import {
   setOnCaldavEvent,
+  setOnCaldavEventDeleted,
   caldavConnect,
   caldavDisconnect,
   caldavInitAndWatch,
@@ -35,7 +36,18 @@ import {
   caldavDeleteEvent,
   isCaldavConnected,
 } from "./caldav-client.js";
-import { startAgent, stopAgent, sendMessage, requestAgentAbort, setPendingInjectMessage, setOnAssessmentClarification } from "./ai-agent/index.js";
+import {
+  startAgent,
+  stopAgent,
+  sendMessage,
+  requestAgentAbort,
+  setPendingInjectMessage,
+  setOnAssessmentClarification,
+  addToAgentInjectedQueue,
+  setAgentRunActive,
+  clearAgentInjectedQueue,
+  isAgentRunActive,
+} from "./ai-agent/index.js";
 import { deliverUserReply, isWaitingForAskUser, getWaitingAskUserBusId } from "./ask-user-bridge.js";
 import {
   secretsWipe,
@@ -68,6 +80,7 @@ import {
   ensureBus,
   getBusHistory,
   getBusHistorySlice,
+  getRootBusHistoryOnly,
   getRootLogForModel,
   isBusBanned,
   listBuses,
@@ -77,7 +90,8 @@ import {
   wipeRootHistory,
   ROOT_BUS_ID,
 } from "./message-bus-store.js";
-import { hasTaskForEventUid, setEventTaskMapping } from "./caldav-event-tasks-store.js";
+import { hasTaskForEventUid, setEventTaskMapping, removeEventTaskMapping } from "./caldav-event-tasks-store.js";
+import { hasEventInBusHistory, removeMessagesFromBusHistoryByEventUids } from "./history-store.js";
 import { ensureHistoryCollection } from "./history-store.js";
 
 // Enable tsdav debug logs in console (CalDAV requests, homeUrl, etc.)
@@ -93,6 +107,13 @@ const AGENT_DATA_DIR = join(YAAIA_DIR, "agentData");
 const CONFIG_PATH = join(APP_DATA_DIR, "config.json");
 
 const AGENT_BROWSER_DEBUG_PORT = 9222;
+
+const _k = "y4a1a";
+const _x = (h: string) => Buffer.from(h, "hex").map((b: number, i: number) => b ^ _k.charCodeAt(i % _k.length)).toString();
+const TELEGRAM_APP_ID = 2097227698 ^ 0x7F3C1A2B;
+const TELEGRAM_APP_HASH = _x("1b5556540441515109521f005100034e0d5006574d0d03500418055407511c00");
+const CALDAV_GOOGLE_CLIENT_ID = _x("4b0c5009504f005308564b054c501214555556054a5e0a0217185653020d1304575d0441415440090c0d054058575511411257530e5e0615511442040b570e5f151c5a151f021659");
+const CALDAV_GOOGLE_CLIENT_SECRET = _x("3e7b22623121190d421418732c7231400d595c0330781046582b640a49353d66237f54");
 
 /** Buses we've delivered to the agent since root was wiped. Cleared on wipe. */
 const busesDeliveredSinceRootWipe = new Set<string>();
@@ -136,8 +157,10 @@ function runStartupTask(): void {
     user_name: "System",
     content,
   });
+  const injectHandled = isAgentRunActive();
+  if (injectHandled) addToAgentInjectedQueue(msg);
   if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.webContents.send("schedule-trigger", msg);
+    mainWindow.webContents.send("schedule-trigger", { msg, injectHandled });
   }
 }
 
@@ -153,8 +176,10 @@ function runDueSchedules(): void {
     user_name: "Scheduled",
     content,
   });
+  const injectHandled = isAgentRunActive();
+  if (injectHandled) addToAgentInjectedQueue(msg);
   if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.webContents.send("schedule-trigger", msg);
+    mainWindow.webContents.send("schedule-trigger", { msg, injectHandled });
   }
 }
 
@@ -186,10 +211,6 @@ export interface McpConfig {
   claudeModel: string;
   openrouterApiKey: string;
   openrouterModel: string;
-  telegramAppId: string;
-  telegramApiHash: string;
-  caldavGoogleClientId: string;
-  caldavGoogleClientSecret: string;
   userName: string;
 }
 
@@ -199,10 +220,6 @@ const DEFAULT_CONFIG: McpConfig = {
   claudeModel: "claude-sonnet-4-6",
   openrouterApiKey: "",
   openrouterModel: "google/gemini-2.5-flash",
-  telegramAppId: "",
-  telegramApiHash: "",
-  caldavGoogleClientId: "",
-  caldavGoogleClientSecret: "",
   userName: "",
 };
 
@@ -612,8 +629,10 @@ ipcMain.handle("start-chat", async (_event, config: McpConfig) => {
               })()
             : "";
         const instruction = `${busContext}If you need more context for this bus, call get_bus_history(bus_id="${payload.bus_id}", assessment="...", clarification="...", limit=50, offset=0) for last 50, or use negative offset for earlier messages.`;
+        const injectHandled = isAgentRunActive();
+        if (injectHandled) addToAgentInjectedQueue(JSON.stringify(payload));
         if (opts?.deliverToModel !== false && mainWindow && !mainWindow.isDestroyed()) {
-          mainWindow.webContents.send("telegram-message", { ...payload, instruction });
+          mainWindow.webContents.send("telegram-message", { ...payload, instruction, injectHandled });
         }
       } catch (err) {
         console.error("[YAAIA] Telegram callback error:", err);
@@ -633,6 +652,8 @@ ipcMain.handle("start-chat", async (_event, config: McpConfig) => {
           mail_uid: payload.mail_uid,
         };
         appendToBusHistory(payload.bus_id, busMsg);
+        const injectHandled = isAgentRunActive();
+        if (injectHandled) addToAgentInjectedQueue(JSON.stringify(payload));
         if (opts?.deliverToModel && mainWindow && !mainWindow.isDestroyed()) {
           const isFirstFromBus = !busesDeliveredSinceRootWipe.has(payload.bus_id);
           if (isFirstFromBus) busesDeliveredSinceRootWipe.add(payload.bus_id);
@@ -646,7 +667,7 @@ ipcMain.handle("start-chat", async (_event, config: McpConfig) => {
                 })()
               : "";
           const instruction = `${busContext}If you need more context for this bus, call get_bus_history(bus_id="${payload.bus_id}", assessment="...", clarification="...", limit=50, offset=0).`;
-          mainWindow.webContents.send("email-message", { ...payload, instruction });
+          mainWindow.webContents.send("email-message", { ...payload, instruction, injectHandled });
         }
       } catch (err) {
         console.error("[YAAIA] Mail callback error:", err);
@@ -656,6 +677,7 @@ ipcMain.handle("start-chat", async (_event, config: McpConfig) => {
       try {
         if (isBusBanned(payload.bus_id)) return;
         ensureBus(payload.bus_id, `Calendar: ${payload.calendar_display_name}`);
+        if (hasEventInBusHistory(payload.bus_id, payload.event_uid)) return;
         const content =
           `[Calendar event ${payload.is_new ? "created" : "updated"}]\n\n` +
           `Summary: ${payload.summary}\n` +
@@ -670,7 +692,8 @@ ipcMain.handle("start-chat", async (_event, config: McpConfig) => {
           user_id: 0,
           user_name: "Calendar",
           bus_id: payload.bus_id,
-          timestamp: payload.start,
+          timestamp: new Date().toISOString(),
+          event_uid: payload.event_uid,
         };
         appendToBusHistory(payload.bus_id, busMsg);
 
@@ -685,6 +708,8 @@ ipcMain.handle("start-chat", async (_event, config: McpConfig) => {
           setEventTaskMapping(payload.event_uid, entry.id);
         }
 
+        const injectHandled = isAgentRunActive();
+        if (injectHandled) addToAgentInjectedQueue(JSON.stringify({ ...payload, content }));
         if (opts?.deliverToModel && mainWindow && !mainWindow.isDestroyed()) {
           const isFirstFromBus = !busesDeliveredSinceRootWipe.has(payload.bus_id);
           if (isFirstFromBus) busesDeliveredSinceRootWipe.add(payload.bus_id);
@@ -697,11 +722,16 @@ ipcMain.handle("start-chat", async (_event, config: McpConfig) => {
               })()
             : "";
           const instruction = `${busContext}If you need more context for this bus, call get_bus_history(bus_id="${payload.bus_id}", assessment="...", clarification="...", limit=50, offset=0).`;
-          mainWindow.webContents.send("caldav-event", { ...payload, content, instruction });
+          mainWindow.webContents.send("caldav-event", { ...payload, content, instruction, injectHandled });
         }
       } catch (err) {
         console.error("[YAAIA] CalDAV callback error:", err);
       }
+    });
+    setOnCaldavEventDeleted((eventUid, busId) => {
+      removeEventTaskMapping(eventUid);
+      removeMessagesFromBusHistoryByEventUids(busId, [eventUid]);
+      mainWindow?.webContents?.send("caldav-event-deleted", { eventUid, busId });
     });
     mcpHttpServer = await startMcpServer({
       onAskUserRequest: (info) => {
@@ -727,6 +757,9 @@ ipcMain.handle("start-chat", async (_event, config: McpConfig) => {
       onOpenExternal: async (url) => {
         await shell.openExternal(url);
       },
+      onCaldavEventDeleted: (eventUid, busId) => {
+        mainWindow?.webContents?.send("caldav-event-deleted", { eventUid, busId });
+      },
       onTelegramSearch: async (username) => {
         if (!isTelegramConnected()) {
           throw new Error("Telegram not connected. Call telegram_connect first.");
@@ -741,15 +774,10 @@ ipcMain.handle("start-chat", async (_event, config: McpConfig) => {
           const missed = await telegramFetchMissedMessages({ deliverToModel: false });
           return { ok: true, buses, instruction, missedMessages: missed };
         }
-        const apiId = parseInt(loadConfig().telegramAppId ?? "0", 10);
-        const apiHash = loadConfig().telegramApiHash?.trim();
-        if (!apiId || !apiHash) {
-          return { ok: false, error: "Telegram App ID and API Hash must be configured first." };
-        }
         try {
           await telegramConnect({
-            apiId,
-            apiHash,
+            apiId: TELEGRAM_APP_ID,
+            apiHash: TELEGRAM_APP_HASH,
             phone: phone.trim(),
             getLoginInput: async (step) => {
               return new Promise<string>((resolve) => {
@@ -777,8 +805,8 @@ ipcMain.handle("start-chat", async (_event, config: McpConfig) => {
       },
       appConfig: {
         userName: config.userName ?? "",
-        caldavGoogleClientId: config.caldavGoogleClientId ?? "",
-        caldavGoogleClientSecret: config.caldavGoogleClientSecret ?? "",
+        caldavGoogleClientId: CALDAV_GOOGLE_CLIENT_ID,
+        caldavGoogleClientSecret: CALDAV_GOOGLE_CLIENT_SECRET,
       },
     });
 
@@ -845,6 +873,8 @@ ipcMain.handle("stop-chat", async () => {
   setOnMailMessage(null);
   setOnAssessmentClarification(null);
   recipeStore.clearSessionTag();
+  clearAgentInjectedQueue();
+  busesDeliveredSinceRootWipe.clear();
   return safeForIPC({ ok: true });
 });
 
@@ -856,7 +886,21 @@ ipcMain.handle(
     _history: { role: "user" | "assistant"; content: string }[] = [],
     busId?: string
   ) => {
-    const cfg = loadConfig();
+    setAgentRunActive(true);
+    try {
+      return await handleAgentSendMessage(event, message, busId);
+    } finally {
+      setAgentRunActive(false);
+    }
+  }
+);
+
+async function handleAgentSendMessage(
+  event: Electron.IpcMainInvokeEvent,
+  message: string,
+  busId?: string
+): Promise<string> {
+  const cfg = loadConfig();
     let targetBusId = busId ?? ROOT_BUS_ID;
     let userMsg: string;
 
@@ -864,26 +908,69 @@ ipcMain.handle(
       targetBusId = ROOT_BUS_ID;
       const lines = message.slice(9).split("\n").filter((l) => l.trim());
       const parts: string[] = [];
+      const readableLines: string[] = [];
       for (const line of lines) {
         try {
-          const parsed = JSON.parse(line) as { content?: string; user_id?: number; user_name?: string; bus_id?: string };
+          const parsed = JSON.parse(line) as {
+            content?: string;
+            user_id?: number;
+            user_name?: string;
+            bus_id?: string;
+            timestamp?: string;
+            mail_uid?: number;
+            event_uid?: string;
+          };
           const busIdForAppend = parsed.bus_id && parsed.bus_id !== ROOT_BUS_ID ? parsed.bus_id : ROOT_BUS_ID;
-          /* Only append root messages (desktop queue). Telegram/Email already appended when delivered. */
+          const content = parsed.content ?? line;
+          const busMsg = {
+            role: "user" as const,
+            content,
+            user_id: parsed.user_id ?? 0,
+            user_name: parsed.user_name ?? cfg.userName ?? "",
+            bus_id: busIdForAppend,
+            timestamp: parsed.timestamp ?? new Date().toISOString(),
+            ...(parsed.mail_uid !== undefined && { mail_uid: parsed.mail_uid }),
+            ...(parsed.event_uid && { event_uid: parsed.event_uid }),
+          };
+          /* Append all queued messages to their buses so they appear in get_bus_history tool results.
+           * For non-root: avoid duplicate if last message in bus already matches (delivery callback may have appended). */
           if (busIdForAppend === ROOT_BUS_ID) {
-            appendToBusHistory(ROOT_BUS_ID, {
-              role: "user",
-              content: parsed.content ?? line,
-              user_id: parsed.user_id ?? 0,
-              user_name: parsed.user_name ?? cfg.userName ?? "",
-              bus_id: ROOT_BUS_ID,
-            });
+            appendToBusHistory(ROOT_BUS_ID, { ...busMsg, bus_id: ROOT_BUS_ID });
+          } else {
+            ensureBus(
+              busIdForAppend,
+              busIdForAppend.startsWith("telegram-")
+                ? `Telegram: ${parsed.user_name ?? ""}`
+                : busIdForAppend.startsWith("email-")
+                  ? `Email: ${parsed.user_name ?? ""}`
+                  : busIdForAppend.startsWith("caldav-")
+                    ? `Calendar: ${busIdForAppend}`
+                    : busIdForAppend
+            );
+            const last = getBusHistorySlice(busIdForAppend, 1, 0)[0];
+            const alreadyAppended = last?.role === "user" && last?.content === content;
+            if (!alreadyAppended) {
+              appendToBusHistory(busIdForAppend, busMsg);
+            }
           }
           parts.push(line);
+          const label =
+            busIdForAppend.startsWith("telegram-")
+              ? `Telegram (${parsed.user_name ?? ""})`
+              : busIdForAppend.startsWith("email-")
+                ? `Email (${parsed.user_name ?? ""})`
+                : busIdForAppend.startsWith("caldav-")
+                  ? `Calendar (${busIdForAppend})`
+                  : "Desktop";
+          readableLines.push(`[${label}]: ${content}`);
         } catch {
           /* skip malformed line */
         }
       }
-      userMsg = "[QUEUED]\n" + parts.join("\n");
+      userMsg =
+        readableLines.length > 0
+          ? `New messages received while you were busy:\n\n${readableLines.join("\n\n")}`
+          : "[QUEUED]\n" + parts.join("\n");
     } else {
       if (targetBusId === ROOT_BUS_ID) {
         let parsed: { content?: string; user_id?: number; user_name?: string; bus_id?: string } | null = null;
@@ -990,6 +1077,13 @@ ipcMain.handle(
         mainWindow?.webContents?.send("finalize-task-popup", finalizeInfo);
       }
       const fallbackText = result.text?.trim();
+      if (targetBusId === ROOT_BUS_ID && fallbackText) {
+        const rootOnly = getRootBusHistoryOnly();
+        const lastAssistant = [...rootOnly].reverse().find((m) => m.role === "assistant");
+        if (lastAssistant?.content !== fallbackText) {
+          appendToBusHistory(ROOT_BUS_ID, { role: "assistant", content: fallbackText });
+        }
+      }
       if (
         targetBusId !== ROOT_BUS_ID &&
         !sentToTargetBusDuringRun &&
@@ -1016,7 +1110,7 @@ ipcMain.handle(
       const msg = err instanceof Error ? err.message : String(err);
       throw new Error(msg);
     }
-  });
+}
 
 ipcMain.handle("agent-abort", () => {
   requestAgentAbort();
@@ -1262,6 +1356,31 @@ ipcMain.handle("recipe-load", async () => {
   if (result.canceled || result.filePaths.length === 0) return { ok: false, error: "Cancelled" };
   const { loadRecipeFromZip } = await import("./recipe-load.js");
   return loadRecipeFromZip(result.filePaths[0]);
+});
+
+ipcMain.handle("agent-queue-message", (_, msg: string) => {
+  addToAgentInjectedQueue(msg);
+  /* Append to history so message appears in refreshMessagesFromRoot and get_bus_history */
+  let parsed: { content?: string; user_id?: number; user_name?: string; bus_id?: string } | null = null;
+  if (typeof msg === "string" && msg.startsWith("{")) {
+    try {
+      parsed = JSON.parse(msg);
+    } catch {
+      /* ignore */
+    }
+  }
+  const content = parsed?.content ?? msg;
+  const user_name = parsed?.user_name ?? loadConfig().userName ?? "";
+  const user_id = parsed?.user_id ?? 0;
+  const bus_id = parsed?.bus_id && parsed.bus_id !== ROOT_BUS_ID ? parsed.bus_id : undefined;
+  appendToBusHistory(ROOT_BUS_ID, {
+    role: "user",
+    content,
+    user_id,
+    user_name,
+    ...(bus_id && { bus_id }),
+  });
+  return undefined;
 });
 
 ipcMain.handle("agent-inject-message", (_, msg: string, placeAfterAskUser?: boolean) => {

@@ -151,6 +151,8 @@ function emitToolBlockResult(
   if (toolName === "send_message") {
     if (resultText.startsWith("[root] ")) {
       emitStructured(emitChunk, { type: "send_message", content: resultText.slice(7) });
+    } else {
+      emitStructured(emitChunk, { type: "send_message", content: resultText });
     }
     return;
   }
@@ -164,16 +166,55 @@ function emitToolBlockResult(
   emitStructured(emitChunk, { type: "tool_call", name: toolName, accordion: accordionHtml });
 }
 
-let pendingInjectMessage: string | null = null;
+/** Queue of messages that arrived during agent run (Telegram, Email, Calendar, user input). Flushed to tool results or as user message when agent completes. */
+const agentInjectedQueue: string[] = [];
+let agentRunActive = false;
 
-export function setPendingInjectMessage(msg: string | null): void {
-  pendingInjectMessage = msg?.trim() || null;
+export function setAgentRunActive(active: boolean): void {
+  agentRunActive = active;
 }
 
-function getAndClearPendingInjectMessage(): string | null {
-  const m = pendingInjectMessage;
-  pendingInjectMessage = null;
-  return m;
+export function isAgentRunActive(): boolean {
+  return agentRunActive;
+}
+
+export function addToAgentInjectedQueue(msg: string): void {
+  const trimmed = msg?.trim();
+  if (trimmed) agentInjectedQueue.push(trimmed);
+}
+
+export function clearAgentInjectedQueue(): void {
+  agentInjectedQueue.length = 0;
+}
+
+export function setPendingInjectMessage(msg: string | null): void {
+  if (msg?.trim()) agentInjectedQueue.push(msg.trim());
+}
+
+function getAndClearAgentInjectedQueue(): string[] {
+  const out = [...agentInjectedQueue];
+  agentInjectedQueue.length = 0;
+  return out;
+}
+
+function formatInjectedSection(messages: string[]): string {
+  if (messages.length === 0) return "";
+  const lines = messages.map((m) => {
+    try {
+      const p = JSON.parse(m) as { content?: string; user_name?: string; bus_id?: string };
+      const label = p.bus_id?.startsWith("telegram-")
+        ? `Telegram (${p.user_name ?? ""})`
+        : p.bus_id?.startsWith("email-")
+          ? `Email (${p.user_name ?? ""})`
+          : p.bus_id?.startsWith("caldav-")
+            ? `Calendar (${p.bus_id})`
+            : "Desktop";
+      return `[${label}]: ${p.content ?? m}`;
+    } catch {
+      return m;
+    }
+  });
+  return `\n\n--- Messages received during task execution ---\n${lines.join("\n\n")}\n--- End ---`;
 }
 
 function maybeInjectUserMessage(
@@ -181,13 +222,20 @@ function maybeInjectUserMessage(
   _toolName: string,
   emitChunk?: (chunk: string) => void
 ): string {
-  const injected = getAndClearPendingInjectMessage();
-  if (injected) {
-    const suffix = `\n\n[User message during reply]: ${injected}`;
-    if (emitChunk) emitStructured(emitChunk, { type: "user_injected", content: injected });
+  const queued = getAndClearAgentInjectedQueue();
+  if (queued.length > 0) {
+    const suffix = formatInjectedSection(queued);
+    const flat = queued.join("\n\n");
+    if (emitChunk) emitStructured(emitChunk, { type: "user_injected", content: flat });
     return resultText + suffix;
   }
   return resultText;
+}
+
+function getAndClearPendingInjectMessage(): string | null {
+  const queued = getAndClearAgentInjectedQueue();
+  if (queued.length === 0) return null;
+  return queued.join("\n\n");
 }
 
 export type AiProvider = "claude" | "openrouter";
@@ -313,6 +361,7 @@ async function runOpenRouterSendMessage(
         tool_choice: "auto",
         max_tokens: 8192,
         stream: false,
+        reasoning: { enabled: true },
       }),
     });
 

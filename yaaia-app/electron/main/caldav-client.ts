@@ -8,9 +8,11 @@ import type { DAVClient } from "tsdav";
 import type { DAVCalendar, DAVCalendarObject } from "tsdav";
 import { fetchOauthTokens } from "tsdav";
 import { createServer, type Server } from "node:http";
+import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
+import { getActiveBuses, deleteBusHistory } from "./history-store.js";
 
 const YAAIA_DIR = join(homedir(), "yaaia");
 const POLL_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
@@ -65,12 +67,18 @@ let storedParams: CaldavConnectParams | null = null;
 let onCaldavEvent: OnCaldavEventCallback | null = null;
 let pollIntervalHandle: ReturnType<typeof setInterval> | null = null;
 let reconnectTimeoutHandle: ReturnType<typeof setTimeout> | null = null;
-let lastKnownEvents: Map<string, { etag?: string; dataHash: string }> = new Map(); // url -> { etag, dataHash }
+type LastKnownEntry = { etag?: string; dataHash: string; eventUid?: string; busId?: string };
+let lastKnownEvents: Map<string, LastKnownEntry> = new Map();
 let currentAccount: string | null = null;
 let currentCalendars: { calendar: DAVCalendar; busId: string }[] = [];
+let onCaldavEventDeleted: ((eventUid: string, busId: string) => void) | null = null;
 
 export function setOnCaldavEvent(cb: OnCaldavEventCallback | null): void {
   onCaldavEvent = cb;
+}
+
+export function setOnCaldavEventDeleted(cb: ((eventUid: string, busId: string) => void) | null): void {
+  onCaldavEventDeleted = cb;
 }
 
 export function isCaldavConnected(): boolean {
@@ -81,7 +89,7 @@ function getLastEventsPath(account: string): string {
   return join(YAAIA_DIR, `caldav-last-${sanitizeForBusId(account)}.json`);
 }
 
-function loadLastEvents(account: string): Record<string, { etag?: string; dataHash: string }> {
+function loadLastEvents(account: string): Record<string, LastKnownEntry> {
   try {
     const path = getLastEventsPath(account);
     if (existsSync(path)) {
@@ -94,7 +102,7 @@ function loadLastEvents(account: string): Record<string, { etag?: string; dataHa
   return {};
 }
 
-function saveLastEvents(account: string, mapping: Record<string, { etag?: string; dataHash: string }>): void {
+function saveLastEvents(account: string, mapping: Record<string, LastKnownEntry>): void {
   try {
     mkdirSync(YAAIA_DIR, { recursive: true });
     const path = getLastEventsPath(account);
@@ -105,12 +113,7 @@ function saveLastEvents(account: string, mapping: Record<string, { etag?: string
 }
 
 function simpleHash(s: string): string {
-  let h = 0;
-  for (let i = 0; i < s.length; i++) {
-    h = (h << 5) - h + s.charCodeAt(i);
-    h |= 0;
-  }
-  return String(h);
+  return createHash("sha256").update(s).digest("hex").slice(0, 16);
 }
 
 function parseIcsEvent(icsData: string): { uid?: string; summary?: string; start?: string; end?: string; location?: string; description?: string; url?: string } {
@@ -367,19 +370,33 @@ export async function caldavDisconnect(): Promise<void> {
 }
 
 /** Fetch calendars, create buses, start polling. Call after caldavConnect. */
-export async function caldavInitAndWatch(account: string): Promise<{ busIds: string[] }> {
+export async function caldavInitAndWatch(account: string): Promise<{ calendars: { busId: string; displayName: string }[] }> {
   const c = client;
   if (!c) throw new Error("Not connected. Call caldav__connect first.");
 
   const calendars = await c.fetchCalendars();
   const accountSanitized = sanitizeForBusId(account);
   currentCalendars = calendars.map((cal) => {
-    const calId = (cal.url?.split("/").pop() ?? "default").replace(/\.ics$/, "") || "default";
-    const busId = `caldav-${accountSanitized}-${sanitizeForBusId(calId)}`;
+    const displayName = (cal.displayName as string) ?? "";
+    const busId = `caldav-${accountSanitized}-${sanitizeForBusId(displayName)}`;
     return { calendar: cal, busId };
   });
 
   lastKnownEvents = new Map(Object.entries(loadLastEvents(account)));
+
+  // Wipe stale caldav-* buses (renamed or removed calendars).
+  const newBusIds = new Set(currentCalendars.map((c) => c.busId));
+  for (const b of getActiveBuses()) {
+    if (b.startsWith("caldav-") && !newBusIds.has(b)) {
+      console.log("[YAAIA CalDAV] Wiping stale bus:", b);
+      deleteBusHistory(b);
+      // Also purge lastKnownEvents entries so events re-download under new bus ID.
+      for (const [url, entry] of lastKnownEvents) {
+        if (entry.busId === b) lastKnownEvents.delete(url);
+      }
+    }
+  }
+  if (currentAccount) saveLastEvents(currentAccount, Object.fromEntries(lastKnownEvents));
 
   const doPoll = async (): Promise<void> => {
     if (!client || !currentAccount) return;
@@ -394,6 +411,7 @@ export async function caldavInitAndWatch(account: string): Promise<{ busIds: str
             calendar,
             timeRange: { start, end },
           });
+          const fetchedUrls = new Set(objects.map((o) => o.url ?? "").filter(Boolean));
 
           for (const obj of objects) {
             const url = obj.url ?? "";
@@ -405,9 +423,9 @@ export async function caldavInitAndWatch(account: string): Promise<{ busIds: str
             const isChanged = prev && prev.dataHash !== dataHash;
 
             if (isNew || isChanged) {
-              lastKnownEvents.set(url, { etag, dataHash });
               const parsed = parseIcsEvent(data);
               const uid = parsed.uid ?? url;
+              lastKnownEvents.set(url, { etag, dataHash, eventUid: uid, busId });
               const displayName = (calendar.displayName as string) ?? calendar.url ?? "Calendar";
 
               const payload: CaldavEventPayload = {
@@ -427,6 +445,17 @@ export async function caldavInitAndWatch(account: string): Promise<{ busIds: str
               onCaldavEvent?.(payload, { deliverToModel: true });
             }
           }
+
+          const calendarUrl = calendar.url ?? "";
+          const toRemove: string[] = [];
+          for (const [url, entry] of lastKnownEvents) {
+            const belongsToCalendar = entry.busId === busId || (!entry.busId && calendarUrl && url.startsWith(calendarUrl));
+            if (belongsToCalendar && !fetchedUrls.has(url)) {
+              toRemove.push(url);
+              if (entry.eventUid) onCaldavEventDeleted?.(entry.eventUid, busId);
+            }
+          }
+          for (const url of toRemove) lastKnownEvents.delete(url);
         } catch (err) {
           console.warn("[YAAIA CalDAV] Poll error for", busId, err instanceof Error ? err.message : String(err));
           const isConnErr =
@@ -452,7 +481,13 @@ export async function caldavInitAndWatch(account: string): Promise<{ busIds: str
   await doPoll();
   pollIntervalHandle = setInterval(doPoll, POLL_INTERVAL_MS);
 
-  return { busIds: currentCalendars.map((c) => c.busId) };
+  return {
+    calendars: currentCalendars.map((c) => ({
+      busId: c.busId,
+      displayName: (c.calendar.displayName as string) ?? "",
+      url: c.calendar.url ?? "",
+    })),
+  };
 }
 
 export async function caldavListCalendars(): Promise<Array<{ url: string; displayName: string }>> {
@@ -525,4 +560,17 @@ export async function caldavDeleteEvent(calendarObject: DAVCalendarObject): Prom
   return c.deleteCalendarObject({
     calendarObject,
   });
+}
+
+/** Remove an event URL from lastKnownEvents (call after deleting event). */
+export function caldavRemoveFromLastKnown(objectUrl: string): void {
+  lastKnownEvents.delete(objectUrl);
+  if (currentAccount) {
+    saveLastEvents(currentAccount, Object.fromEntries(lastKnownEvents));
+  }
+}
+
+/** Parse UID from ICS data. Exported for delete_event cleanup. */
+export function parseIcsEventUid(icsData: string): string | undefined {
+  return parseIcsEvent(icsData).uid;
 }
