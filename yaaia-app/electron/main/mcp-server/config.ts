@@ -37,5 +37,11 @@ export interface McpServerConfig {
   /** Resolve Telegram username to bus_id. Requires Telegram to be connected. */
   onTelegramSearch?: (username: string) => Promise<{ bus_id: string; display_name?: string }>;
   /** App config for root bus (userName). Telegram credentials are read from config, not passed here. */
-  appConfig?: { userName: string };
+  appConfig?: {
+    userName: string;
+    caldavGoogleClientId?: string;
+    caldavGoogleClientSecret?: string;
+  };
+  /** Open URL in browser (for CalDAV OAuth). */
+  onOpenExternal?: (url: string) => void | Promise<void>;
 }

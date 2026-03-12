@@ -11,6 +11,8 @@ interface ElectronAPI {
     openrouterModel: string;
     telegramAppId: string;
     telegramApiHash: string;
+    caldavGoogleClientId?: string;
+    caldavGoogleClientSecret?: string;
     userName: string;
   }>;
   startChat: (config: unknown) => Promise<{ ok: boolean; agentReady?: boolean; message: string }>;
@@ -58,6 +60,7 @@ interface ElectronAPI {
   onAgentMessage: (callback: (content: string) => void) => () => void;
   onTelegramMessage: (callback: (payload: { bus_id: string; user_id: number; user_name: string; content: string }) => void) => () => void;
   onEmailMessage: (callback: (payload: { bus_id: string; user_id: number; user_name: string; content: string; instruction?: string }) => void) => () => void;
+  onCaldavEvent: (callback: (payload: { bus_id: string; content: string; instruction?: string }) => void) => () => void;
   onScheduleTrigger: (callback: (message: string) => void) => () => void;
   onTelegramLoginRequest: (callback: (info: { step: "phone" | "code" | "password" }) => void) => () => void;
   telegramLoginReply: (value: string) => Promise<void>;

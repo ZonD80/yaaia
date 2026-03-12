@@ -16,12 +16,7 @@ import {
   type ChromeTool,
 } from "./chrome-client.js";
 import { waitForUserReply } from "../ask-user-bridge.js";
-import {
-  secretsList,
-  secretsGet,
-  secretsSet,
-  secretsDelete,
-} from "../secrets-store.js";
+import { secretsList, secretsGet, secretsSet, secretsDelete } from "../secrets-store.js";
 import {
   agentConfigList,
   agentConfigSet,
@@ -76,6 +71,19 @@ import {
   mailMessageLabelsSet,
   mailAppend,
 } from "../mail-client.js";
+import {
+  caldavConnect,
+  caldavDisconnect,
+  caldavInitAndWatch,
+  caldavListCalendars,
+  caldavListEvents,
+  caldavGetEvent,
+  caldavCreateEvent,
+  caldavUpdateEvent,
+  caldavDeleteEvent,
+  isCaldavConnected,
+  startGoogleOAuthBrowserServer,
+} from "../caldav-client.js";
 import { addSchedule, listSchedules, getStartupTask, deleteSchedule } from "../schedule-store.js";
 import {
   listBuses,
@@ -2422,6 +2430,424 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
     }
   );
 
+  // --- CalDAV tools ---
+  const CALDAV_BASE = new Set([...TOOL_BASE]);
+
+  server.registerTool(
+    "caldav__oauth_browser",
+    {
+      description:
+        "Start Google CalDAV OAuth flow. Opens the OAuth URL in the agent's Chrome browser. User signs in; Google redirects to localhost where tokens are displayed. Read the tokens from the page (pre#caldav-tokens), save via secrets_set, then call caldav__connect with credentials_secret_id. Requires CalDAV Google Client ID and Secret in app settings.",
+      inputSchema: z.object({
+        bus_id: BUS_ID_PARAM,
+        assessment: ASSESSMENT_PARAM,
+        clarification: CLARIFICATION_PARAM,
+      }),
+    },
+    async (args) => {
+      logToolCall("caldav__oauth_browser", args);
+      const unknownMsg = validateUnknownParams("caldav__oauth_browser", args, CALDAV_BASE);
+      if (unknownMsg) {
+        recipeStore.appendToolCall("caldav__oauth_browser", args, unknownMsg);
+        return toolResult(unknownMsg);
+      }
+      logClarification("caldav__oauth_browser", args);
+      logAssessment("caldav__oauth_browser", args);
+      const clientId = config.appConfig?.caldavGoogleClientId?.trim();
+      const clientSecret = config.appConfig?.caldavGoogleClientSecret?.trim();
+      if (!clientId || !clientSecret) {
+        recipeStore.appendToolCall("caldav__oauth_browser", args, "Configure CalDAV Google Client ID and Secret in app settings");
+        return toolResult("Error: Configure CalDAV Google Client ID and Secret in app settings first.");
+      }
+      try {
+        const { url, redirectUrl, closeServer } = await startGoogleOAuthBrowserServer(clientId, clientSecret);
+        try {
+          const result = await callChromeTool("new_page", { url });
+          const text = (result.content ?? []).map((c) => (c as { text?: string }).text).filter(Boolean).join("\n");
+          if (result.isError) {
+            recipeStore.appendToolCall("caldav__oauth_browser", args, text || "Failed to open page");
+            return toolResult(`Error opening OAuth page: ${text || "Chrome may not be connected"}`);
+          }
+        } catch (err) {
+          closeServer();
+          throw err;
+        }
+        const instruction =
+          `OAuth page opened in Chrome. User signs in; Google redirects to ${redirectUrl}. ` +
+          `The redirect page displays tokens in <pre id="caldav-tokens">. Read the JSON (refreshToken, username), ` +
+          `save via secrets_set (value = JSON string), then call caldav__connect with credentials_secret_id.`;
+        const out = JSON.stringify({ url, redirectUrl, instruction }, null, 2);
+        recipeStore.appendToolCall("caldav__oauth_browser", args, out);
+        return toolResult(out);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        recipeStore.appendToolCall("caldav__oauth_browser", args, msg);
+        return toolResult(`Error: ${msg}`);
+      }
+    }
+  );
+
+  server.registerTool(
+    "caldav__connect",
+    {
+      description:
+        "Connect to CalDAV. Basic: serverUrl, username, password. OAuth (Google): authMethod=OAuth, provider=google, credentials_secret_id (from secrets_set after caldav__oauth_browser). For OAuth, run caldav__oauth_browser first to get tokens.",
+      inputSchema: z.object({
+        bus_id: BUS_ID_PARAM,
+        authMethod: z.enum(["Basic", "OAuth"]),
+        serverUrl: z.string().optional().describe("For Basic: CalDAV server URL. For Google OAuth: omit (uses Google CalDAV)"),
+        username: z.string().optional(),
+        password: z.string().optional(),
+        provider: z.enum(["google"]).optional().describe("For OAuth: provider (google only for now)"),
+        refreshToken: z.string().optional().describe("From secrets. If missing, OAuth flow runs."),
+        credentials_secret_id: z.string().optional().describe("Secret id with refreshToken, clientId, clientSecret, username"),
+        assessment: ASSESSMENT_PARAM,
+        clarification: CLARIFICATION_PARAM,
+      }),
+    },
+    async (args) => {
+      logToolCall("caldav__connect", args);
+      const allowed = new Set([
+        ...CALDAV_BASE,
+        "authMethod",
+        "serverUrl",
+        "username",
+        "password",
+        "provider",
+        "refreshToken",
+        "credentials_secret_id",
+      ]);
+      const unknownMsg = validateUnknownParams("caldav__connect", args, allowed);
+      if (unknownMsg) {
+        recipeStore.appendToolCall("caldav__connect", args, unknownMsg);
+        return toolResult(unknownMsg);
+      }
+      const a = args as {
+        authMethod: "Basic" | "OAuth";
+        serverUrl?: string;
+        username?: string;
+        password?: string;
+        provider?: string;
+        refreshToken?: string;
+        credentials_secret_id?: string;
+      };
+      logClarification("caldav__connect", args);
+      logAssessment("caldav__connect", args);
+      try {
+        const clientId = config.appConfig?.caldavGoogleClientId?.trim();
+        const clientSecret = config.appConfig?.caldavGoogleClientSecret?.trim();
+
+        if (a.authMethod === "OAuth") {
+          if (!clientId || !clientSecret) {
+            recipeStore.appendToolCall("caldav__connect", args, "Configure CalDAV Google Client ID and Secret in app settings");
+            return toolResult("Error: Configure CalDAV Google Client ID and Secret in app settings first.");
+          }
+          let refreshToken = a.refreshToken;
+          let username = a.username;
+          if (a.credentials_secret_id) {
+            const secret = await secretsGet(a.credentials_secret_id);
+            const secretValue = typeof secret === "string" ? secret : secret && typeof secret === "object" && "value" in secret ? secret.value : null;
+            if (secretValue) {
+              try {
+                const cred = JSON.parse(secretValue) as { refreshToken?: string; username?: string };
+                refreshToken = refreshToken ?? cred.refreshToken;
+                username = username ?? cred.username;
+              } catch {
+                /* ignore */
+              }
+            }
+          }
+          await caldavConnect(
+            {
+              authMethod: "OAuth",
+              provider: "google",
+              refreshToken,
+              username,
+              clientId,
+              clientSecret,
+            },
+            { googleClientId: clientId, googleClientSecret: clientSecret }
+          );
+        } else {
+          if (!a.serverUrl || !a.username || !a.password) {
+            recipeStore.appendToolCall("caldav__connect", args, "Basic auth requires serverUrl, username, password");
+            return toolResult("Error: Basic auth requires serverUrl, username, password");
+          }
+          await caldavConnect({
+            authMethod: "Basic",
+            serverUrl: a.serverUrl,
+            username: a.username,
+            password: a.password,
+          });
+        }
+
+        const account = a.authMethod === "OAuth" ? (a.username ?? "google") : a.username!;
+        const { busIds } = await caldavInitAndWatch(account);
+        recipeStore.appendToolCall("caldav__connect", args, "Connected.");
+        return toolResult(`Connected. Bus(es): ${busIds.join(", ")}`);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        recipeStore.appendToolCall("caldav__connect", args, msg);
+        return toolResult(`Error: ${msg}`);
+      }
+    }
+  );
+
+  server.registerTool(
+    "caldav__disconnect",
+    {
+      description: "Disconnect from CalDAV.",
+      inputSchema: z.object({ bus_id: BUS_ID_PARAM, assessment: ASSESSMENT_PARAM, clarification: CLARIFICATION_PARAM }),
+    },
+    async (args) => {
+      logToolCall("caldav__disconnect", args);
+      const unknownMsg = validateUnknownParams("caldav__disconnect", args, CALDAV_BASE);
+      if (unknownMsg) {
+        recipeStore.appendToolCall("caldav__disconnect", args, unknownMsg);
+        return toolResult(unknownMsg);
+      }
+      logClarification("caldav__disconnect", args);
+      logAssessment("caldav__disconnect", args);
+      await caldavDisconnect();
+      recipeStore.appendToolCall("caldav__disconnect", args, "Disconnected.");
+      return toolResult("Disconnected.");
+    }
+  );
+
+  server.registerTool(
+    "caldav__list_calendars",
+    {
+      description: "List CalDAV calendars.",
+      inputSchema: z.object({ bus_id: BUS_ID_PARAM, assessment: ASSESSMENT_PARAM, clarification: CLARIFICATION_PARAM }),
+    },
+    async (args) => {
+      logToolCall("caldav__list_calendars", args);
+      const unknownMsg = validateUnknownParams("caldav__list_calendars", args, CALDAV_BASE);
+      if (unknownMsg) {
+        recipeStore.appendToolCall("caldav__list_calendars", args, unknownMsg);
+        return toolResult(unknownMsg);
+      }
+      logClarification("caldav__list_calendars", args);
+      logAssessment("caldav__list_calendars", args);
+      try {
+        const list = await caldavListCalendars();
+        const text = JSON.stringify(list, null, 2);
+        recipeStore.appendToolCall("caldav__list_calendars", args, text);
+        return toolResult(text);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        recipeStore.appendToolCall("caldav__list_calendars", args, msg);
+        return toolResult(`Error: ${msg}`);
+      }
+    }
+  );
+
+  server.registerTool(
+    "caldav__list_events",
+    {
+      description: "List events in a calendar. start and end in ISO 8601 (e.g. 2025-03-10T00:00:00Z).",
+      inputSchema: z.object({
+        bus_id: BUS_ID_PARAM,
+        calendarUrl: z.string(),
+        start: z.string(),
+        end: z.string(),
+        assessment: ASSESSMENT_PARAM,
+        clarification: CLARIFICATION_PARAM,
+      }),
+    },
+    async (args) => {
+      logToolCall("caldav__list_events", args);
+      const allowed = new Set([...CALDAV_BASE, "calendarUrl", "start", "end"]);
+      const unknownMsg = validateUnknownParams("caldav__list_events", args, allowed);
+      if (unknownMsg) {
+        recipeStore.appendToolCall("caldav__list_events", args, unknownMsg);
+        return toolResult(unknownMsg);
+      }
+      const a = args as { calendarUrl: string; start: string; end: string };
+      logClarification("caldav__list_events", args);
+      logAssessment("caldav__list_events", args);
+      try {
+        const objects = await caldavListEvents(a.calendarUrl, a.start, a.end);
+        const list = objects.map((o) => ({ url: o.url, etag: o.etag, data: typeof o.data === "string" ? o.data.slice(0, 500) : "" }));
+        const text = JSON.stringify(list, null, 2);
+        recipeStore.appendToolCall("caldav__list_events", args, text);
+        return toolResult(text);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        recipeStore.appendToolCall("caldav__list_events", args, msg);
+        return toolResult(`Error: ${msg}`);
+      }
+    }
+  );
+
+  server.registerTool(
+    "caldav__get_event",
+    {
+      description: "Get a single event by object URL.",
+      inputSchema: z.object({
+        bus_id: BUS_ID_PARAM,
+        calendarUrl: z.string(),
+        objectUrl: z.string(),
+        assessment: ASSESSMENT_PARAM,
+        clarification: CLARIFICATION_PARAM,
+      }),
+    },
+    async (args) => {
+      logToolCall("caldav__get_event", args);
+      const allowed = new Set([...CALDAV_BASE, "calendarUrl", "objectUrl"]);
+      const unknownMsg = validateUnknownParams("caldav__get_event", args, allowed);
+      if (unknownMsg) {
+        recipeStore.appendToolCall("caldav__get_event", args, unknownMsg);
+        return toolResult(unknownMsg);
+      }
+      const a = args as { calendarUrl: string; objectUrl: string };
+      logClarification("caldav__get_event", args);
+      logAssessment("caldav__get_event", args);
+      try {
+        const obj = await caldavGetEvent(a.calendarUrl, a.objectUrl);
+        if (!obj) {
+          recipeStore.appendToolCall("caldav__get_event", args, "Not found");
+          return toolResult("Event not found.");
+        }
+        const text = JSON.stringify({ url: obj.url, etag: obj.etag, data: obj.data }, null, 2);
+        recipeStore.appendToolCall("caldav__get_event", args, text);
+        return toolResult(text);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        recipeStore.appendToolCall("caldav__get_event", args, msg);
+        return toolResult(`Error: ${msg}`);
+      }
+    }
+  );
+
+  server.registerTool(
+    "caldav__create_event",
+    {
+      description: "Create a calendar event. filename should end in .ics. iCalString is the full iCalendar data.",
+      inputSchema: z.object({
+        bus_id: BUS_ID_PARAM,
+        calendarUrl: z.string(),
+        filename: z.string(),
+        iCalString: z.string(),
+        assessment: ASSESSMENT_PARAM,
+        clarification: CLARIFICATION_PARAM,
+      }),
+    },
+    async (args) => {
+      logToolCall("caldav__create_event", args);
+      const allowed = new Set([...CALDAV_BASE, "calendarUrl", "filename", "iCalString"]);
+      const unknownMsg = validateUnknownParams("caldav__create_event", args, allowed);
+      if (unknownMsg) {
+        recipeStore.appendToolCall("caldav__create_event", args, unknownMsg);
+        return toolResult(unknownMsg);
+      }
+      const a = args as { calendarUrl: string; filename: string; iCalString: string };
+      logClarification("caldav__create_event", args);
+      logAssessment("caldav__create_event", args);
+      try {
+        await caldavCreateEvent(a.calendarUrl, a.filename, a.iCalString);
+        recipeStore.appendToolCall("caldav__create_event", args, "Created.");
+        return toolResult("Event created.");
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        recipeStore.appendToolCall("caldav__create_event", args, msg);
+        return toolResult(`Error: ${msg}`);
+      }
+    }
+  );
+
+  server.registerTool(
+    "caldav__update_event",
+    {
+      description: "Update a calendar event. Pass the full object from get_event with data replaced by new iCalString.",
+      inputSchema: z.object({
+        bus_id: BUS_ID_PARAM,
+        calendarObject: z.string().describe("JSON: {url, etag, data}. data = new iCalString"),
+        assessment: ASSESSMENT_PARAM,
+        clarification: CLARIFICATION_PARAM,
+      }),
+    },
+    async (args) => {
+      logToolCall("caldav__update_event", args);
+      const allowed = new Set([...CALDAV_BASE, "calendarObject"]);
+      const unknownMsg = validateUnknownParams("caldav__update_event", args, allowed);
+      if (unknownMsg) {
+        recipeStore.appendToolCall("caldav__update_event", args, unknownMsg);
+        return toolResult(unknownMsg);
+      }
+      const a = args as { calendarObject: string };
+      logClarification("caldav__update_event", args);
+      logAssessment("caldav__update_event", args);
+      try {
+        const obj = JSON.parse(a.calendarObject) as { url: string; etag?: string; data: string };
+        await caldavUpdateEvent(obj, obj.data);
+        recipeStore.appendToolCall("caldav__update_event", args, "Updated.");
+        return toolResult("Event updated.");
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        recipeStore.appendToolCall("caldav__update_event", args, msg);
+        return toolResult(`Error: ${msg}`);
+      }
+    }
+  );
+
+  server.registerTool(
+    "caldav__delete_event",
+    {
+      description: "Delete a calendar event. Pass the object from get_event.",
+      inputSchema: z.object({
+        bus_id: BUS_ID_PARAM,
+        calendarObject: z.string().describe("JSON: {url, etag}"),
+        assessment: ASSESSMENT_PARAM,
+        clarification: CLARIFICATION_PARAM,
+      }),
+    },
+    async (args) => {
+      logToolCall("caldav__delete_event", args);
+      const allowed = new Set([...CALDAV_BASE, "calendarObject"]);
+      const unknownMsg = validateUnknownParams("caldav__delete_event", args, allowed);
+      if (unknownMsg) {
+        recipeStore.appendToolCall("caldav__delete_event", args, unknownMsg);
+        return toolResult(unknownMsg);
+      }
+      const a = args as { calendarObject: string };
+      logClarification("caldav__delete_event", args);
+      logAssessment("caldav__delete_event", args);
+      try {
+        const obj = JSON.parse(a.calendarObject) as { url: string; etag?: string };
+        await caldavDeleteEvent(obj);
+        recipeStore.appendToolCall("caldav__delete_event", args, "Deleted.");
+        return toolResult("Event deleted.");
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        recipeStore.appendToolCall("caldav__delete_event", args, msg);
+        return toolResult(`Error: ${msg}`);
+      }
+    }
+  );
+
+  server.registerTool(
+    "caldav__status",
+    {
+      description: "Check CalDAV connection status.",
+      inputSchema: z.object({ bus_id: BUS_ID_PARAM, assessment: ASSESSMENT_PARAM, clarification: CLARIFICATION_PARAM }),
+    },
+    async (args) => {
+      logToolCall("caldav__status", args);
+      const unknownMsg = validateUnknownParams("caldav__status", args, CALDAV_BASE);
+      if (unknownMsg) {
+        recipeStore.appendToolCall("caldav__status", args, unknownMsg);
+        return toolResult(unknownMsg);
+      }
+      logClarification("caldav__status", args);
+      logAssessment("caldav__status", args);
+      const connected = isCaldavConnected();
+      const text = JSON.stringify({ connected }, null, 2);
+      recipeStore.appendToolCall("caldav__status", args, text);
+      return toolResult(text);
+    }
+  );
+
   return server;
 }
 
@@ -2480,4 +2906,8 @@ export async function stopKbMcp(): Promise<void> {
 
 export async function stopMailClient(): Promise<void> {
   await mailDisconnect();
+}
+
+export async function stopCaldavClient(): Promise<void> {
+  await caldavDisconnect();
 }

@@ -44,13 +44,23 @@
           <input type="password" v-model="config.telegramApiHash" placeholder="e.g. abc123..." />
         </div>
         <div class="field">
+          <label>CalDAV Google Client ID</label>
+          <input v-model="config.caldavGoogleClientId" placeholder="For Google Calendar OAuth" />
+        </div>
+        <div class="field">
+          <label>CalDAV Google Client Secret</label>
+          <input type="password" v-model="config.caldavGoogleClientSecret" placeholder="For Google Calendar OAuth" />
+        </div>
+        <div class="field">
           <label>Your name (root bus)</label>
           <input v-model="config.userName" placeholder="e.g. Alice" />
         </div>
         <ul v-if="startupSteps.length" class="startup-progress">
-          <li v-for="(step, i) in startupSteps" :key="i" :class="{ done: i < startupSteps.length - 1 || startupMilestones.includes(step) }">
-            <span class="check">{{ (i < startupSteps.length - 1 || startupMilestones.includes(step)) ? "✓" : "" }}</span>
-            <span class="text">{{ step }}</span>
+          <li v-for="(step, i) in startupSteps" :key="i"
+            :class="{ done: i < startupSteps.length - 1 || startupMilestones.includes(step) }">
+            <span class="check">{{ (i < startupSteps.length - 1 || startupMilestones.includes(step)) ? "✓" : ""
+                }}</span>
+                <span class="text">{{ step }}</span>
           </li>
         </ul>
         <button class="btn primary" @click="startChat" :disabled="starting">
@@ -60,7 +70,8 @@
       <section class="chat" v-else>
         <div class="chat-messages" ref="messagesRef">
           <div v-if="messages.length === 0" class="chat-placeholder">Agent is ready. Type your message below.</div>
-          <div v-for="(msg, i) in messages" :key="i" :class="['msg', msg.role, { error: msg.isError, report: msg.isReport }, msg.type]">
+          <div v-for="(msg, i) in messages" :key="i"
+            :class="['msg', msg.role, { error: msg.isError, report: msg.isReport }, msg.type]">
             <template v-if="msg.role === 'user'">
               <span v-if="msg.injected" class="msg-type-label">Injected:</span>
               <div v-if="msg.isTelegram" class="msg-markdown" v-html="renderMarkdown(msg.content)"></div>
@@ -69,11 +80,13 @@
             <template v-else>
               <div v-if="msg.isError" class="msg-error">{{ msg.content }}</div>
               <template v-else-if="msg.type === 'assessment'">
-                <span class="msg-type-label">{{ msg.bus_id ? `Remote bus (${msg.bus_id}) assessment` : 'Assessment' }}</span>
+                <span class="msg-type-label">{{ msg.bus_id ? `Remote bus (${msg.bus_id}) assessment` : 'Assessment'
+                  }}</span>
                 <div class="msg-markdown" v-html="renderMarkdown(msg.content)"></div>
               </template>
               <template v-else-if="msg.type === 'clarification'">
-                <span class="msg-type-label">{{ msg.bus_id ? `Remote bus (${msg.bus_id}) clarification` : 'Clarification' }}</span>
+                <span class="msg-type-label">{{ msg.bus_id ? `Remote bus (${msg.bus_id}) clarification` :
+                  'Clarification' }}</span>
                 <div class="msg-markdown" v-html="renderMarkdown(msg.content)"></div>
               </template>
               <template v-else-if="msg.type === 'tool_running'">
@@ -99,11 +112,13 @@
                 <span v-else class="msg-text">{{ p.content }}</span>
               </template>
               <template v-else-if="p.type === 'assessment'">
-                <span class="msg-type-label">{{ p.bus_id ? `Remote bus (${p.bus_id}) assessment` : 'Assessment' }}</span>
+                <span class="msg-type-label">{{ p.bus_id ? `Remote bus (${p.bus_id}) assessment` : 'Assessment'
+                  }}</span>
                 <div class="msg-markdown" v-html="renderMarkdown(p.content)"></div>
               </template>
               <template v-else-if="p.type === 'clarification'">
-                <span class="msg-type-label">{{ p.bus_id ? `Remote bus (${p.bus_id}) clarification` : 'Clarification' }}</span>
+                <span class="msg-type-label">{{ p.bus_id ? `Remote bus (${p.bus_id}) clarification` : 'Clarification'
+                  }}</span>
                 <div class="msg-markdown" v-html="renderMarkdown(p.content)"></div>
               </template>
               <template v-else-if="p.type === 'tool_running'">
@@ -125,16 +140,12 @@
         </div>
         <div class="chat-input">
           <div class="chat-input-row">
-            <textarea
-              v-model="inputText"
-              :placeholder="sending ? 'Type to inject message…' : 'Ask the agent...'"
-              rows="2"
-              @keydown.enter.exact.prevent="send"
-              @focus="textareaFocused = true"
-              @blur="textareaFocused = false"
-            />
+            <textarea ref="messageTextareaRef" v-model="inputText" :placeholder="sending ? 'Type to inject message…' : 'Ask the agent...'"
+              rows="2" @keydown.enter.exact.prevent="send" @focus="textareaFocused = true"
+              @blur="textareaFocused = false" />
             <button class="btn secondary" @click="stopAgent" :disabled="!sending">Stop</button>
-            <button class="btn primary" @click="send" :disabled="!inputText.trim()">{{ sending ? 'Inject' : 'Send' }}</button>
+            <button class="btn primary" @click="send" :disabled="!inputText.trim()">{{ sending ? 'Inject' : 'Send'
+              }}</button>
           </div>
           <p class="chat-scroll-hint">Click outside the message box to stop automatic scrolling</p>
         </div>
@@ -154,13 +165,8 @@
       <div class="ask-user-modal">
         <h3>Telegram login</h3>
         <p class="ask-user-clarification">{{ telegramLoginLabel }}</p>
-        <input
-          v-model="telegramLoginValue"
-          :type="telegramLoginStep === 'phone' ? 'tel' : 'password'"
-          :placeholder="telegramLoginPlaceholder"
-          class="editor-input"
-          @keydown.enter="submitTelegramLogin"
-        />
+        <input v-model="telegramLoginValue" :type="telegramLoginStep === 'phone' ? 'tel' : 'password'"
+          :placeholder="telegramLoginPlaceholder" class="editor-input" @keydown.enter="submitTelegramLogin" />
         <div class="ask-user-actions">
           <button class="btn primary" @click="submitTelegramLogin">Submit</button>
         </div>
@@ -169,23 +175,27 @@
     <div v-if="askUserInfo" class="ask-user-overlay">
       <div class="ask-user-modal">
         <h3>Agent needs your input</h3>
-        <div v-if="askUserInfo.clarification" class="ask-user-clarification msg-markdown" v-html="renderMarkdown(askUserInfo.clarification)"></div>
-        <div v-if="askUserInfo.assessment" class="ask-user-assessment msg-markdown" v-html="renderMarkdown(askUserInfo.assessment)"></div>
+        <div v-if="askUserInfo.clarification" class="ask-user-clarification msg-markdown"
+          v-html="renderMarkdown(askUserInfo.clarification)"></div>
+        <div v-if="askUserInfo.assessment" class="ask-user-assessment msg-markdown"
+          v-html="renderMarkdown(askUserInfo.assessment)"></div>
         <p class="ask-user-countdown">Reply within {{ askUserCountdown }} seconds</p>
-        <textarea v-model="askUserReply" placeholder="Type your reply..." rows="4" @keydown.enter.ctrl="submitAskUserReply" />
+        <textarea v-model="askUserReply" placeholder="Type your reply..." rows="4"
+          @keydown.enter.ctrl="submitAskUserReply" />
         <div class="ask-user-actions">
           <button class="btn primary" @click="submitAskUserReply">Send</button>
           <button class="btn secondary" @click="dismissAskUser">Cancel</button>
         </div>
       </div>
     </div>
-    <div v-if="showFinalizePopup" class="ask-user-overlay"
-      @click.self="dismissFinalize">
+    <div v-if="showFinalizePopup" class="ask-user-overlay" @click.self="dismissFinalize">
       <div class="ask-user-modal finalize-modal"
         :class="{ 'finalize-failed': finalizeInfo && !finalizeInfo.is_successful }">
         <h3>Task {{ finalizeInfo?.is_successful ? 'completed' : 'failed' }}</h3>
-        <p v-if="finalizeInfo?.assessment" class="ask-user-assessment"><strong>Assessment:</strong> {{ finalizeInfo.assessment }}</p>
-        <p v-if="finalizeInfo?.clarification" class="ask-user-clarification"><strong>Clarification:</strong> {{ finalizeInfo.clarification }}</p>
+        <p v-if="finalizeInfo?.assessment" class="ask-user-assessment"><strong>Assessment:</strong> {{
+          finalizeInfo.assessment }}</p>
+        <p v-if="finalizeInfo?.clarification" class="ask-user-clarification"><strong>Clarification:</strong> {{
+          finalizeInfo.clarification }}</p>
         <div v-if="finalizeInfo?.detailed_report" class="ask-user-clarification report-block">
           <strong>Detailed report:</strong>
           <div class="msg-markdown report-content" v-html="renderMarkdown(finalizeInfo.detailed_report)"></div>
@@ -200,11 +210,15 @@
         <h3>Secrets Editor</h3>
         <p v-if="secretsError" class="editor-error">{{ secretsError }}</p>
         <div class="editor-form">
-          <input v-model="secretsForm.detailed_description" type="text" placeholder="Description" class="editor-input" />
-          <input v-model="secretsForm.first_factor" type="text" placeholder="First factor (e.g. user)" class="editor-input" />
-          <input v-model="secretsForm.first_factor_type" type="text" placeholder="First factor type (e.g. username)" class="editor-input" />
+          <input v-model="secretsForm.detailed_description" type="text" placeholder="Description"
+            class="editor-input" />
+          <input v-model="secretsForm.first_factor" type="text" placeholder="First factor (e.g. user)"
+            class="editor-input" />
+          <input v-model="secretsForm.first_factor_type" type="text" placeholder="First factor type (e.g. username)"
+            class="editor-input" />
           <input v-model="secretsForm.value" type="text" placeholder="Value (plaintext)" class="editor-input" />
-          <input v-model="secretsForm.totp_secret" type="text" placeholder="TOTP seed (Base32, optional)" class="editor-input" />
+          <input v-model="secretsForm.totp_secret" type="text" placeholder="TOTP seed (Base32, optional)"
+            class="editor-input" />
           <div class="editor-form-actions">
             <button class="btn primary" @click="saveSecret">{{ secretsEditingId ? "Update" : "Add" }}</button>
             <button v-if="secretsEditingId" class="btn secondary" @click="startAddSecret">Cancel edit</button>
@@ -236,7 +250,8 @@
         <h3>Configs Editor</h3>
         <p v-if="configsError" class="editor-error">{{ configsError }}</p>
         <div class="editor-form">
-          <input v-model="configsForm.detailed_description" type="text" placeholder="Description" class="editor-input" />
+          <input v-model="configsForm.detailed_description" type="text" placeholder="Description"
+            class="editor-input" />
           <input v-model="configsForm.value" type="text" placeholder="Value (plaintext)" class="editor-input" />
           <div class="editor-form-actions">
             <button class="btn primary" @click="saveConfigEntry">{{ configsEditingId ? "Update" : "Add" }}</button>
@@ -261,15 +276,15 @@
         </div>
       </div>
     </div>
-    <div v-if="showKbEditor" class="ask-user-overlay editor-overlay kb-editor-overlay" @click.self="showKbEditor = false">
+    <div v-if="showKbEditor" class="ask-user-overlay editor-overlay kb-editor-overlay"
+      @click.self="showKbEditor = false">
       <div class="ask-user-modal editor-modal kb-editor-modal">
         <h3>KB Editor</h3>
         <p v-if="kbError" class="editor-error">{{ kbError }}</p>
         <div class="kb-editor-layout">
           <div class="kb-editor-list">
             <div v-for="path in kbFiles" :key="path" class="kb-editor-item"
-              :class="{ selected: kbSelectedPath === path }"
-              @click="selectKbFile(path)">
+              :class="{ selected: kbSelectedPath === path }" @click="selectKbFile(path)">
               {{ path }}
             </div>
           </div>
@@ -278,7 +293,8 @@
             <div v-if="kbEditorPreview" class="kb-editor-preview">
               <div class="msg-markdown" v-html="renderMarkdown(kbFormContent)"></div>
             </div>
-            <textarea v-else v-model="kbFormContent" placeholder="Markdown content..." rows="12" class="editor-textarea"></textarea>
+            <textarea v-else v-model="kbFormContent" placeholder="Markdown content..." rows="12"
+              class="editor-textarea"></textarea>
             <div class="editor-form-actions">
               <button class="btn primary" @click="saveKbFile" :disabled="kbSaving">
                 {{ kbSaving ? "Saving…" : "Save" }}
@@ -286,7 +302,8 @@
               <button class="btn secondary" @click="kbEditorPreview = !kbEditorPreview">
                 {{ kbEditorPreview ? "Edit" : "Preview" }}
               </button>
-              <button v-if="kbSelectedPath" class="btn secondary" @click="deleteKbFile" :disabled="kbSaving">Delete</button>
+              <button v-if="kbSelectedPath" class="btn secondary" @click="deleteKbFile"
+                :disabled="kbSaving">Delete</button>
             </div>
           </div>
         </div>
@@ -310,14 +327,17 @@
             </div>
           </div>
           <div class="schedule-editor-form">
-            <input v-if="scheduleSelectedId !== 'zero'" v-model="scheduleFormAt" type="datetime-local" class="editor-input" />
+            <input v-if="scheduleSelectedId !== 'zero'" v-model="scheduleFormAt" type="datetime-local"
+              class="editor-input" />
             <input v-model="scheduleFormTitle" type="text" placeholder="Title" class="editor-input" />
-            <textarea v-model="scheduleFormInstructions" placeholder="Instructions..." rows="8" class="editor-textarea"></textarea>
+            <textarea v-model="scheduleFormInstructions" placeholder="Instructions..." rows="8"
+              class="editor-textarea"></textarea>
             <div class="editor-form-actions">
               <button class="btn primary" @click="saveSchedule" :disabled="scheduleSaving">
                 {{ scheduleSaving ? "Saving…" : (scheduleSelectedId ? "Update" : "Add") }}
               </button>
-              <button v-if="scheduleSelectedId && scheduleSelectedId !== 'zero'" class="btn secondary" @click="deleteSchedule" :disabled="scheduleSaving">Delete</button>
+              <button v-if="scheduleSelectedId && scheduleSelectedId !== 'zero'" class="btn secondary"
+                @click="deleteSchedule" :disabled="scheduleSaving">Delete</button>
             </div>
           </div>
         </div>
@@ -862,6 +882,8 @@ const config = ref({
   openrouterModel: "google/gemini-2.5-flash",
   telegramAppId: "",
   telegramApiHash: "",
+  caldavGoogleClientId: "",
+  caldavGoogleClientSecret: "",
   userName: "",
 });
 
@@ -877,6 +899,7 @@ const streamBuffer = ref("");
 const sending = ref(false);
 const messagesRef = ref<HTMLElement | null>(null);
 const scrollAnchor = ref<HTMLElement | null>(null);
+const messageTextareaRef = ref<HTMLTextAreaElement | null>(null);
 
 /** When true, new content triggers auto-scroll. Set by textarea focus/blur. */
 const textareaFocused = ref(false);
@@ -992,10 +1015,15 @@ let agentMessageUnsub: (() => void) | undefined;
 let scheduleTriggerUnsub: (() => void) | undefined;
 let telegramMessageUnsub: (() => void) | undefined;
 let emailMessageUnsub: (() => void) | undefined;
+let caldavEventUnsub: (() => void) | undefined;
 let telegramLoginUnsub: (() => void) | undefined;
 
 /** Queued messages when agent is busy; drained and sent together when agent finishes. */
 const messageQueue = ref<{ msg: string; bus_id: string }[]>([]);
+
+/** Debounce timer for batching incoming messages (Telegram/Email) into one agent request. */
+let drainDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+const DRAIN_DEBOUNCE_MS = 1000;
 
 const streamingParsed = computed(() => parseStream(streamBuffer.value));
 
@@ -1008,6 +1036,16 @@ function buildQueuedPayload(): string {
   const lines = messageQueue.value.map((q) => q.msg);
   messageQueue.value = [];
   return "[QUEUED]\n" + lines.join("\n");
+}
+
+/** Schedule a debounced drain so multiple incoming messages (e.g. when agent was offline) are batched into one request. */
+function scheduleDrain(): void {
+  if (!agentReady.value) return;
+  if (drainDebounceTimer) clearTimeout(drainDebounceTimer);
+  drainDebounceTimer = setTimeout(async () => {
+    drainDebounceTimer = null;
+    await drainQueueAndSend();
+  }, DRAIN_DEBOUNCE_MS);
 }
 
 async function drainQueueAndSend(): Promise<void> {
@@ -1063,6 +1101,27 @@ async function refreshMessagesFromRoot(): Promise<void> {
   try {
     const rootHistory = ((await window.electronAPI?.messageBusGetHistory?.("root")) ?? []) as RootHistoryMessage[];
     messages.value = rootHistoryToMessages(rootHistory);
+    // Queued messages (e.g. user injected during task) are not yet in history; append them so they stay visible
+    for (const q of messageQueue.value) {
+      try {
+        const parsed = JSON.parse(q.msg) as { content?: string; user_name?: string };
+        const content = String(parsed?.content ?? q.msg);
+        const preview = content.length > 300 ? content.slice(0, 300) + "…" : content;
+        let display: string;
+        if (q.bus_id?.startsWith("telegram-")) {
+          display = `📱 **Telegram** (${parsed?.user_name ?? ""}): ${preview}`;
+        } else if (q.bus_id?.startsWith("email-")) {
+          display = `📧 **Email** (${parsed?.user_name ?? ""}): ${preview}`;
+        } else if (q.bus_id?.startsWith("caldav-")) {
+          display = `📅 **Calendar** (${q.bus_id}): ${preview}`;
+        } else {
+          display = content;
+        }
+        messages.value.push({ role: "user", content: display, injected: true });
+      } catch {
+        messages.value.push({ role: "user", content: q.msg, injected: true });
+      }
+    }
   } catch {
     /* ignore */
   }
@@ -1087,6 +1146,9 @@ async function startChat() {
       agentReady.value = true;
       agentBrowserError.value = "";
       await refreshMessagesFromRoot();
+      if (messageQueue.value.length > 0) scheduleDrain();
+      await nextTick();
+      messageTextareaRef.value?.focus();
     } else {
       alert(result?.message ?? "Failed to start");
     }
@@ -1098,6 +1160,11 @@ async function startChat() {
 }
 
 async function exitChat() {
+  if (drainDebounceTimer) {
+    clearTimeout(drainDebounceTimer);
+    drainDebounceTimer = null;
+  }
+  messageQueue.value = [];
   await window.electronAPI?.stopChat?.();
   agentReady.value = false;
 }
@@ -1256,7 +1323,7 @@ onMounted(async () => {
       streamBuffer.value = "";
       window.electronAPI
         ?.agentSendMessage?.(msg, [], "root")
-        ?.then(() => {})
+        ?.then(() => { })
         ?.catch((err) => {
           const { parts, tail } = parseStream(streamBuffer.value);
           for (const p of parts) messages.value.push(p);
@@ -1279,29 +1346,11 @@ onMounted(async () => {
     const incomingLabel = `📱 **Telegram** (${payload.user_name}): ${payload.content}`;
     messages.value.push({ role: "user", content: incomingLabel, isTelegram: true });
     scrollToBottomAlways();
+    queueMessage(msg, payload.bus_id);
     if (sending.value) {
-      queueMessage(msg, payload.bus_id);
+      /* drain will run when current request finishes */
     } else {
-      sending.value = true;
-      streaming.value = true;
-      streamBuffer.value = "";
-      window.electronAPI
-        ?.agentSendMessage?.(msg, [], payload.bus_id)
-        ?.then(() => {})
-        ?.catch((err) => {
-          const { parts, tail } = parseStream(streamBuffer.value);
-          for (const p of parts) messages.value.push(p);
-          const content = tail.trim() ? `${tail.trim()}\n\n**Error:** ${err}` : `Error: ${err}`;
-          messages.value.push({ role: "assistant", content, isError: true });
-        })
-        ?.finally(async () => {
-          sending.value = false;
-          streaming.value = false;
-          streamBuffer.value = "";
-          await refreshMessagesFromRoot();
-          scrollToBottomAlways();
-          await drainQueueAndSend();
-        });
+      scheduleDrain();
     }
   });
 
@@ -1311,29 +1360,25 @@ onMounted(async () => {
     const incomingLabel = `📧 **Email** (${payload.user_name}): ${preview}`;
     messages.value.push({ role: "user", content: incomingLabel, isTelegram: true });
     scrollToBottomAlways();
+    queueMessage(msg, payload.bus_id);
     if (sending.value) {
-      queueMessage(msg, payload.bus_id);
+      /* drain will run when current request finishes */
     } else {
-      sending.value = true;
-      streaming.value = true;
-      streamBuffer.value = "";
-      window.electronAPI
-        ?.agentSendMessage?.(msg, [], payload.bus_id)
-        ?.then(() => {})
-        ?.catch((err) => {
-          const { parts, tail } = parseStream(streamBuffer.value);
-          for (const p of parts) messages.value.push(p);
-          const content = tail.trim() ? `${tail.trim()}\n\n**Error:** ${err}` : `Error: ${err}`;
-          messages.value.push({ role: "assistant", content, isError: true });
-        })
-        ?.finally(async () => {
-          sending.value = false;
-          streaming.value = false;
-          streamBuffer.value = "";
-          await refreshMessagesFromRoot();
-          scrollToBottomAlways();
-          await drainQueueAndSend();
-        });
+      scheduleDrain();
+    }
+  });
+
+  caldavEventUnsub = window.electronAPI?.onCaldavEvent?.((payload) => {
+    const msg = JSON.stringify(payload);
+    const preview = payload.content.length > 300 ? payload.content.slice(0, 300) + "…" : payload.content;
+    const incomingLabel = `📅 **Calendar** (${payload.bus_id}): ${preview}`;
+    messages.value.push({ role: "user", content: incomingLabel, isTelegram: true });
+    scrollToBottomAlways();
+    queueMessage(msg, payload.bus_id);
+    if (sending.value) {
+      /* drain will run when current request finishes */
+    } else {
+      scheduleDrain();
     }
   });
 
@@ -1408,6 +1453,7 @@ onUnmounted(() => {
   scheduleTriggerUnsub?.();
   telegramMessageUnsub?.();
   emailMessageUnsub?.();
+  caldavEventUnsub?.();
   telegramLoginUnsub?.();
   stopAskUserCountdown();
   stopTaskTimer();
@@ -1421,45 +1467,55 @@ onUnmounted(() => {
   flex-direction: column;
   overflow: hidden;
 }
+
 .header {
   flex-shrink: 0;
   padding: 1rem 1.5rem;
   border-bottom: 1px solid #333;
 }
+
 .header h1 {
   margin: 0;
   font-size: 1.5rem;
 }
+
 .header h1 .version {
   font-size: 0.7em;
   font-weight: 400;
   opacity: 0.7;
 }
+
 .error {
   color: #f85149;
   margin: 0.5rem 0 0;
 }
+
 .main {
   flex: 1;
   min-height: 0;
   display: flex;
   gap: 1rem;
   padding: 1rem;
-  padding-right: 11rem; /* space for fixed sidebar */
+  padding-right: 11rem;
+  /* space for fixed sidebar */
   overflow: hidden;
 }
+
 .config {
   flex: 1;
   min-width: 0;
 }
+
 .config .field {
   margin-bottom: 1rem;
 }
+
 .config label {
   display: block;
   margin-bottom: 0.25rem;
   color: #8b949e;
 }
+
 .config input,
 .config select {
   width: 100%;
@@ -1469,12 +1525,14 @@ onUnmounted(() => {
   border-radius: 6px;
   color: #e6edf3;
 }
+
 .startup-progress {
   list-style: none;
   padding: 0;
   margin: 1rem 0;
   font-size: 0.9rem;
 }
+
 .startup-progress li {
   display: flex;
   align-items: center;
@@ -1482,13 +1540,16 @@ onUnmounted(() => {
   padding: 0.25rem 0;
   color: #8b949e;
 }
+
 .startup-progress li.done {
   color: #3fb950;
 }
+
 .startup-progress .check {
   width: 1.2em;
   font-weight: bold;
 }
+
 .chat {
   flex: 1;
   display: flex;
@@ -1496,6 +1557,7 @@ onUnmounted(() => {
   min-width: 0;
   min-height: 0;
 }
+
 .chat-messages {
   flex: 1;
   min-height: 0;
@@ -1506,48 +1568,58 @@ onUnmounted(() => {
   border-radius: 8px;
   margin-bottom: 1rem;
 }
+
 .msg {
   margin-bottom: 1rem;
   padding: 0.75rem;
   border-radius: 6px;
 }
+
 .msg.user {
   background: #1a2d3d;
   border: 1px solid #2d3d4d;
   margin-left: 2rem;
 }
+
 .msg.assistant {
   background: #161b22;
   margin-right: 2rem;
 }
+
 .msg.assistant.assessment {
   background: #2a2518;
   border: 1px solid #3d3520;
 }
+
 .msg.assistant.clarification {
   background: #1e1a2a;
   border: 1px solid #2d2840;
 }
+
 .msg.assistant.content,
 .msg.assistant:not(.assessment):not(.clarification):not(.tool_running):not(.tool_call):not(.report) {
   background: #1a1f26;
   border: 1px solid #252b33;
 }
+
 .msg.assistant.tool_running,
 .msg.assistant.tool_call {
   background: #1e2228;
   border: 1px solid #2a3038;
 }
+
 .msg.report {
   background: #1a2a1e;
   border: 1px solid #2d4035;
 }
+
 .msg-type-label {
   display: block;
   font-size: 0.75rem;
   color: #8b949e;
   margin-bottom: 0.25rem;
 }
+
 .msg-markdown :deep(pre) {
   background: #21262d;
   padding: 0.5rem;
@@ -1555,34 +1627,42 @@ onUnmounted(() => {
   overflow-x: auto;
   font-size: 0.85rem;
 }
+
 .msg-markdown :deep(details) {
   margin-top: 0.25rem;
 }
+
 .msg-running {
   color: #58a6ff;
 }
+
 .msg-text {
   white-space: pre-wrap;
 }
+
 .msg-error,
 .msg.error .msg-text {
   color: #f85149;
 }
+
 .chat-placeholder {
   color: #8b949e;
   padding: 1rem;
 }
+
 .chat-input {
   flex-shrink: 0;
   display: flex;
   flex-direction: column;
   gap: 0.25rem;
 }
+
 .chat-input-row {
   display: flex;
   gap: 0.5rem;
   align-items: flex-end;
 }
+
 .chat-input textarea {
   flex: 1;
   padding: 0.5rem;
@@ -1592,20 +1672,24 @@ onUnmounted(() => {
   color: #e6edf3;
   resize: none;
 }
+
 .chat-scroll-hint {
   font-size: 0.75rem;
   color: #8b949e;
   margin: 0;
 }
+
 .sidebar {
   position: fixed;
-  top: 5rem; /* below header */
+  top: 5rem;
+  /* below header */
   right: 1rem;
   z-index: 50;
   display: flex;
   flex-direction: column;
   gap: 0.5rem;
 }
+
 .btn {
   padding: 0.5rem 1rem;
   border-radius: 6px;
@@ -1613,25 +1697,31 @@ onUnmounted(() => {
   cursor: pointer;
   font-size: 0.9rem;
 }
+
 .btn.primary {
   background: #238636;
   color: white;
 }
+
 .btn.primary:hover:not(:disabled) {
   background: #2ea043;
 }
+
 .btn.secondary {
   background: #21262d;
   color: #e6edf3;
   border: 1px solid #30363d;
 }
+
 .btn.secondary:hover {
   background: #30363d;
 }
+
 .btn:disabled {
   opacity: 0.6;
   cursor: not-allowed;
 }
+
 .ask-user-overlay {
   position: fixed;
   inset: 0;
@@ -1641,6 +1731,7 @@ onUnmounted(() => {
   justify-content: center;
   z-index: 100;
 }
+
 .ask-user-modal {
   background: #161b22;
   border: 1px solid #30363d;
@@ -1648,9 +1739,11 @@ onUnmounted(() => {
   padding: 1.5rem;
   min-width: 400px;
 }
+
 .ask-user-modal h3 {
   margin-top: 0;
 }
+
 .ask-user-modal textarea {
   width: 100%;
   padding: 0.5rem;
@@ -1661,20 +1754,24 @@ onUnmounted(() => {
   margin: 1rem 0;
   resize: vertical;
 }
+
 .ask-user-actions {
   display: flex;
   gap: 0.5rem;
   justify-content: flex-end;
 }
+
 .ask-user-assessment,
 .ask-user-clarification {
   margin: 0.5rem 0;
 }
+
 .ask-user-countdown {
   color: #58a6ff;
   font-size: 0.9rem;
   margin: 0.5rem 0;
 }
+
 .report-block {
   margin-top: 1rem;
   padding: 0.75rem;
@@ -1684,16 +1781,20 @@ onUnmounted(() => {
   overflow-y: auto;
   border: 1px solid #2d4035;
 }
+
 .report-block .report-content {
   margin-top: 0.5rem;
 }
+
 .finalize-modal.finalize-failed {
   border-color: #6a4a4a;
   background: #1e1616;
 }
+
 .finalize-modal.finalize-failed h3 {
   color: #b86a6a;
 }
+
 .floating-task {
   position: fixed;
   top: 1rem;
@@ -1710,57 +1811,70 @@ onUnmounted(() => {
   z-index: 500;
   font-size: 0.9rem;
 }
+
 .floating-task-name {
   color: #e0e0e0;
   font-weight: 500;
 }
+
 .floating-task-timer {
   color: #6ab7ff;
   font-variant-numeric: tabular-nums;
 }
+
 .floating-task.finalized {
   border-color: #4a6a4a;
   background: #1e2a1e;
 }
+
 .floating-task.finalized .floating-task-timer {
   color: #6ab86a;
 }
+
 .floating-task.finalized.failed {
   border-color: #6a4a4a;
   background: #2a1e1e;
 }
+
 .floating-task.finalized.failed .floating-task-timer {
   color: #b86a6a;
 }
+
 .editor-overlay {
   z-index: 200;
 }
+
 .editor-modal {
   max-width: 640px;
   max-height: 85vh;
   overflow: auto;
   min-width: 420px;
 }
+
 .editor-error {
   color: #f85149;
   font-size: 0.9rem;
   margin: 0 0 0.75rem;
 }
+
 .editor-hint {
   color: #8b949e;
   font-size: 0.85rem;
   margin: 0 0 0.5rem;
 }
+
 .editor-form {
   display: flex;
   flex-direction: column;
   gap: 0.5rem;
   margin-bottom: 1rem;
 }
+
 .editor-form input {
   width: 100%;
   box-sizing: border-box;
 }
+
 .editor-input {
   padding: 0.5rem 0.75rem;
   border: 1px solid #30363d;
@@ -1769,14 +1883,17 @@ onUnmounted(() => {
   color: #e6edf3;
   font-size: 0.95rem;
 }
+
 .editor-input:focus {
   outline: none;
   border-color: #58a6ff;
 }
+
 .editor-form-actions {
   display: flex;
   gap: 0.5rem;
 }
+
 .editor-list {
   max-height: 240px;
   overflow-y: auto;
@@ -1785,6 +1902,7 @@ onUnmounted(() => {
   background: #0d1117;
   margin-bottom: 1rem;
 }
+
 .editor-row {
   display: flex;
   align-items: center;
@@ -1793,9 +1911,11 @@ onUnmounted(() => {
   border-bottom: 1px solid #21262d;
   gap: 0.75rem;
 }
+
 .editor-row:last-child {
   border-bottom: none;
 }
+
 .editor-row-fields {
   flex: 1;
   min-width: 0;
@@ -1804,18 +1924,22 @@ onUnmounted(() => {
   gap: 0.5rem;
   font-size: 0.85rem;
 }
+
 .editor-row-desc {
   font-weight: 600;
   color: #58a6ff;
 }
+
 .editor-row-factor,
 .editor-row-type {
   color: #8b949e;
 }
+
 .editor-row-value {
   word-break: break-all;
   color: #e6edf3;
 }
+
 .editor-row-badge {
   font-size: 0.7rem;
   padding: 0.1rem 0.4rem;
@@ -1824,20 +1948,24 @@ onUnmounted(() => {
   border-radius: 4px;
   margin-left: 0.25rem;
 }
+
 .editor-row-actions {
   flex-shrink: 0;
   display: flex;
   gap: 0.35rem;
 }
+
 .editor-modal-actions {
   display: flex;
   gap: 0.5rem;
   justify-content: flex-end;
 }
+
 .btn.small {
   padding: 0.35rem 0.6rem;
   font-size: 0.85rem;
 }
+
 .kb-editor-overlay .kb-editor-modal {
   width: 95vw !important;
   max-width: 95vw !important;
@@ -1846,19 +1974,23 @@ onUnmounted(() => {
   display: flex;
   flex-direction: column;
 }
+
 .kb-editor-overlay .kb-editor-modal .kb-editor-layout {
   flex: 1;
   min-height: 0;
 }
+
 .kb-editor-modal {
   max-width: 800px;
 }
+
 .kb-editor-layout {
   display: flex;
   gap: 1rem;
   margin-bottom: 1rem;
   min-height: 280px;
 }
+
 .kb-editor-list {
   width: 220px;
   flex-shrink: 0;
@@ -1867,6 +1999,7 @@ onUnmounted(() => {
   border-radius: 6px;
   background: #0d1117;
 }
+
 .kb-editor-preview {
   flex: 1;
   min-height: 200px;
@@ -1876,10 +2009,12 @@ onUnmounted(() => {
   background: #0d1117;
   overflow-y: auto;
 }
+
 .kb-editor-preview .msg-markdown {
   font-size: 0.95rem;
   line-height: 1.6;
 }
+
 .kb-editor-item {
   padding: 0.4rem 0.75rem;
   font-size: 0.85rem;
@@ -1887,9 +2022,11 @@ onUnmounted(() => {
   border-bottom: 1px solid #21262d;
   word-break: break-all;
 }
+
 .kb-editor-item:hover {
   background: #21262d;
 }
+
 .kb-editor-item.selected {
   background: #1a3a5c;
   color: #58a6ff;
@@ -1898,12 +2035,14 @@ onUnmounted(() => {
 .schedule-editor-modal {
   max-width: 700px;
 }
+
 .schedule-editor-layout {
   display: flex;
   gap: 1rem;
   margin-bottom: 1rem;
   min-height: 200px;
 }
+
 .schedule-editor-list {
   width: 220px;
   flex-shrink: 0;
@@ -1912,6 +2051,7 @@ onUnmounted(() => {
   border-radius: 4px;
   padding: 0.25rem;
 }
+
 .schedule-editor-item {
   display: flex;
   flex-direction: column;
@@ -1920,25 +2060,31 @@ onUnmounted(() => {
   cursor: pointer;
   border-radius: 4px;
 }
+
 .schedule-editor-item:hover {
   background: #21262d;
 }
+
 .schedule-editor-item.selected {
   background: #1a3a5c;
   color: #58a6ff;
 }
+
 .schedule-item-title {
   font-weight: 500;
 }
+
 .schedule-item-at {
   font-size: 0.75rem;
   color: #8b949e;
   margin-top: 0.2rem;
 }
+
 .schedule-editor-item.schedule-zero .schedule-item-at {
   color: #58a6ff;
   font-style: italic;
 }
+
 .schedule-editor-form {
   flex: 1;
   min-width: 0;
@@ -1955,6 +2101,7 @@ onUnmounted(() => {
   flex-direction: column;
   gap: 0.5rem;
 }
+
 .editor-textarea {
   flex: 1;
   min-height: 200px;
@@ -1967,6 +2114,7 @@ onUnmounted(() => {
   font-size: 0.9rem;
   resize: vertical;
 }
+
 .editor-textarea:focus {
   outline: none;
   border-color: #58a6ff;

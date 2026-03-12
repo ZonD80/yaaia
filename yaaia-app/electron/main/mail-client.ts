@@ -236,7 +236,8 @@ export async function mailInitInboxAndWatch(account: string): Promise<{ busId: s
           const from = m.envelope?.from?.[0];
           const userName = from ? (from.name ?? from.address ?? account) : account;
           const payload: MailMessagePayload = { bus_id: busId, user_id: 0, user_name: userName, content, timestamp, mail_uid: m.uid };
-          onMailMessage?.(payload, { deliverToModel: true });
+          /* deliverToModel: false — init fetch during connect. Messages go to bus history; agent can get_bus_history to see them. Only IDLE deliverToModel: true for live arrivals. */
+          onMailMessage?.(payload, { deliverToModel: false });
           messageCount++;
           if (date > maxDate) maxDate = date;
         }
@@ -286,8 +287,25 @@ export async function mailInitInboxAndWatch(account: string): Promise<{ busId: s
       await c.mailboxOpen(INBOX, { readOnly: false });
       lastOpenedMailbox = INBOX;
     } catch (err) {
-      console.warn("[YAAIA Mail] Failed to open INBOX for IDLE:", err instanceof Error ? err.message : err);
-      if (client && currentAccount) setTimeout(startIdle, 5000);
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn("[YAAIA Mail] Failed to open INBOX for IDLE:", msg);
+      const isConnectionError =
+        /connection not available|connection closed|connection lost|ECONNRESET|ETIMEDOUT|ECONNREFUSED|socket hang up/i.test(msg);
+      if (isConnectionError) {
+        if (client) {
+          try {
+            client.close();
+          } catch {
+            /* ignore */
+          }
+          client = null;
+          currentLock = null;
+          lastOpenedMailbox = null;
+        }
+        scheduleReconnect();
+      } else if (client && currentAccount) {
+        setTimeout(startIdle, 5000);
+      }
       return;
     }
     idleAbortController = new AbortController();
@@ -330,7 +348,22 @@ export async function mailInitInboxAndWatch(account: string): Promise<{ busId: s
           lock.release();
         }
       } catch (err) {
-        console.warn("[YAAIA Mail] exists handler error:", err instanceof Error ? err.message : err);
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn("[YAAIA Mail] exists handler error:", msg);
+        const isConnectionError =
+          /connection not available|connection closed|connection lost|ECONNRESET|ETIMEDOUT|ECONNREFUSED|socket hang up/i.test(msg);
+        if (isConnectionError && client) {
+          try {
+            client.close();
+          } catch {
+            /* ignore */
+          }
+          client = null;
+          currentLock = null;
+          lastOpenedMailbox = null;
+          scheduleReconnect();
+          return;
+        }
       }
       if (client && currentAccount) setTimeout(startIdle, 1000);
     };

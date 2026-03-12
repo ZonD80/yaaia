@@ -30,6 +30,7 @@
     "**/node_modules/zip-stream/**",
   ],
   mac: {
+    icon: "resources/icon.png",
     target: [{ target: "dmg", arch: ["arm64", "x64"] }],
     artifactName: "${productName}-${version}-${arch}.${ext}",
     category: "public.app-category.developer-tools",

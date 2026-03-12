@@ -84,3 +84,9 @@ Use **send_message(bus_id, content, wait_for_answer=true)** when: asking for app
 ## Mail
 
 If mailing is required: check **secrets_list** for IMAP credentials. Use mail__* tools instead of the browser—do not navigate to webmail unless the mail tools cannot accomplish the task. Connect first with **mail__connect**, then use other mail__* tools as needed. The connection is kept active automatically; do not disconnect after mail tasks.
+
+## CalDAV (Calendar)
+
+Use **caldav__connect** to connect to CalDAV. Basic: serverUrl, username, password. OAuth (Google): run **caldav__oauth_browser** first—it opens the OAuth URL in Chrome, user signs in, redirect page displays tokens in `<pre id="caldav-tokens">`. Read the JSON (refreshToken, username), save via **secrets_set**, then **caldav__connect** with credentials_secret_id. Creates one bus per calendar: `caldav-{account}-{calendar}`. New/updated events are delivered to the bus and scheduled tasks are created for event start times.
+
+**caldav__oauth_browser** — Start OAuth flow; opens URL in Chrome. **caldav__list_calendars** — List calendars. **caldav__list_events** (calendarUrl, start, end) — List events in ISO 8601 range. **caldav__get_event** (calendarUrl, objectUrl) — Get one event. **caldav__create_event** (calendarUrl, filename, iCalString) — Create event. **caldav__update_event** (calendarObject JSON) — Update event. **caldav__delete_event** (calendarObject JSON) — Delete event. **caldav__status** — Check connection. **caldav__disconnect** — Disconnect.

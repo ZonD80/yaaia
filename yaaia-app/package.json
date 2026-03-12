@@ -14,7 +14,7 @@
     "dev": "electron-vite dev",
     "build": "electron-vite build",
     "preview": "electron-vite preview",
-    "pack": "npm run build && mkdir -p dist-electron/resources && cp -f resources/agent-browser-placeholder.html dist-electron/resources/ && electron-builder --mac"
+    "pack": "npm run build && mkdir -p dist-electron/resources && cp -f resources/agent-browser-placeholder.html resources/icon.png dist-electron/resources/ && electron-builder --mac"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.78.0",
@@ -29,6 +29,7 @@
     "mailparser": "^3.9.4",
     "marked": "^17.0.2",
     "otplib": "^13.3.0",
+    "tsdav": "^2.1.8",
     "vue": "^3.4.0",
     "ws": "^8.19.0",
     "zod": "^3.23.0"

@@ -10,6 +10,8 @@ export interface McpConfig {
   openrouterModel: string;
   telegramAppId: string;
   telegramApiHash: string;
+  caldavGoogleClientId: string;
+  caldavGoogleClientSecret: string;
   userName: string;
 }
 
@@ -118,6 +120,11 @@ try {
       const fn = (_: unknown, payload: { bus_id: string; user_id: number; user_name: string; content: string; instruction?: string }) => callback(payload);
       ipcRenderer.on("email-message", fn);
       return () => ipcRenderer.removeListener("email-message", fn);
+    },
+    onCaldavEvent: (callback: (payload: { bus_id: string; content: string; instruction?: string }) => void) => {
+      const fn = (_: unknown, payload: { bus_id: string; content: string; instruction?: string }) => callback(payload);
+      ipcRenderer.on("caldav-event", fn);
+      return () => ipcRenderer.removeListener("caldav-event", fn);
     },
     onScheduleTrigger: (callback: (message: string) => void) => {
       const fn = (_: unknown, message: string) => callback(message);
