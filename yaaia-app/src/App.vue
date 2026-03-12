@@ -634,10 +634,21 @@ async function openKbEditor() {
   await refreshKbList();
 }
 
+const BUS_STATUS_POLL_MS = 2000;
+let busStatusPollTimer: ReturnType<typeof setInterval> | null = null;
+
+async function refreshBusStatusList() {
+  try {
+    const list = await window.electronAPI?.messageBusList?.() ?? [];
+    busStatusList.value = list as { bus_id: string; description: string; is_connected: boolean }[];
+  } catch {
+    busStatusList.value = [];
+  }
+}
+
 async function openBusStatuses() {
   showBusStatuses.value = true;
-  const list = await window.electronAPI?.messageBusList?.() ?? [];
-  busStatusList.value = list as { bus_id: string; description: string; is_connected: boolean }[];
+  await refreshBusStatusList();
 }
 
 function formatScheduleAt(iso: string): string {
@@ -1331,6 +1342,16 @@ watch(showKbEditor, (v) => {
   if (!v) kbEditorPreview.value = false;
 });
 
+watch(showBusStatuses, (open) => {
+  if (busStatusPollTimer) {
+    clearInterval(busStatusPollTimer);
+    busStatusPollTimer = null;
+  }
+  if (open) {
+    busStatusPollTimer = setInterval(refreshBusStatusList, BUS_STATUS_POLL_MS);
+  }
+});
+
 onMounted(async () => {
   const cfg = await window.electronAPI?.getConfig?.();
   if (cfg) config.value = { ...config.value, ...cfg };
@@ -1523,6 +1544,10 @@ onMounted(async () => {
 });
 
 onUnmounted(() => {
+  if (busStatusPollTimer) {
+    clearInterval(busStatusPollTimer);
+    busStatusPollTimer = null;
+  }
   scrollCleanup?.();
   streamUnsub?.();
   askUserUnsub?.();

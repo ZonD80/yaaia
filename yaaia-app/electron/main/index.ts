@@ -1073,7 +1073,6 @@ async function handleAgentSendMessage(
     try {
       const finalizeInfo = recipeStore.completeFinalizeWithReport(result.text ?? "");
       if (finalizeInfo) {
-        refocusMainWindow();
         mainWindow?.webContents?.send("finalize-task-popup", finalizeInfo);
       }
       const fallbackText = result.text?.trim();
