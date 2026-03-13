@@ -124,11 +124,16 @@ export async function connectKbMcp(
 }
 
 export async function disconnectKbMcp(): Promise<void> {
-  if (kbTransport) {
-    await kbTransport.close();
+  try {
+    if (kbClient) {
+      await kbClient.close();
+    }
+  } catch (err) {
+    console.warn(`${QMD_LOG_PREFIX} Disconnect:`, err instanceof Error ? err.message : String(err));
+  } finally {
+    kbClient = null;
     kbTransport = null;
   }
-  kbClient = null;
 }
 
 export interface KbTool {

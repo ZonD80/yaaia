@@ -13,7 +13,7 @@ import { pipeline } from "node:stream/promises";
 import { Readable } from "node:stream";
 
 const YAAIA_DIR = join(homedir(), "yaaia");
-const DOWNLOADS_DIR = join(homedir(), "Downloads");
+const DOWNLOADS_DIR = join(YAAIA_DIR, "downloads");
 const INBOX = "INBOX";
 
 function sanitizeAccountForBusId(user: string): string {
@@ -123,6 +123,7 @@ export async function mailConnect(params: MailConnectParams): Promise<void> {
     secure,
     auth: { user, pass },
     socketTimeout: 10 * 60 * 1000,
+    logger: false,
   });
   client.on("error", (err: Error) => {
     console.error("[YAAIA Mail] IMAP error:", err.message);
@@ -342,6 +343,10 @@ export async function mailInitInboxAndWatch(account: string): Promise<{ busId: s
             const payload: MailMessagePayload = { bus_id: busId, user_id: 0, user_name: userName, content, timestamp, mail_uid: m.uid };
             onMailMessage?.(payload, { deliverToModel: true });
             if (date > maxDate) maxDate = date;
+          }
+          // Mark as \Seen when model receives content (same as mailFetchAll/mailFetchOne)
+          if (uidList.length > 0) {
+            await c.messageFlagsAdd(uidList.join(","), ["\\Seen"], { uid: true });
           }
           saveLastTimestamp(account, maxDate);
         } finally {
@@ -588,6 +593,7 @@ export async function mailDownload(
     const { meta, content } = await c.download(range, partOpt, { uid: options.uid });
     const filename = meta.filename || `mail-part-${range}-${part}-${Date.now()}`;
     const safeName = filename.replace(/[^a-zA-Z0-9._-]/g, "_");
+    mkdirSync(DOWNLOADS_DIR, { recursive: true });
     const filepath = join(DOWNLOADS_DIR, safeName);
     const writable = createWriteStream(filepath);
     const stream = content instanceof Readable ? content : Readable.from(content);

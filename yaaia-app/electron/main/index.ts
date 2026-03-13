@@ -10,7 +10,7 @@ import { spawn, execSync } from "node:child_process";
 import { platform } from "node:os";
 import { randomBytes } from "node:crypto";
 import type { Server } from "node:http";
-import { startMcpServer, getMcpServerPort, stopChromeMcp, stopKbMcp, stopMailClient, stopCaldavClient } from "./mcp-server/index.js";
+import { startMcpServer, getMcpServerPort, stopChromeMcp, stopKbMcp, stopFsMcp, stopMailClient, stopCaldavClient } from "./mcp-server/index.js";
 import {
   telegramConnect,
   telegramDisconnect,
@@ -94,6 +94,15 @@ import { hasTaskForEventUid, setEventTaskMapping, removeEventTaskMapping } from 
 import { hasEventInBusHistory, removeMessagesFromBusHistoryByEventUids } from "./history-store.js";
 import { ensureHistoryCollection } from "./history-store.js";
 
+// Suppress unhandled MCP "Connection closed" rejections (expected when subprocesses exit on shutdown)
+process.on("unhandledRejection", (reason) => {
+  const msg = reason instanceof Error ? reason.message : String(reason);
+  if (msg.includes("Connection closed") || (reason as { code?: number })?.code === -32000) {
+    console.warn("[YAAIA] MCP connection closed (expected on shutdown):", msg);
+    return;
+  }
+});
+
 // Enable tsdav debug logs in console (CalDAV requests, homeUrl, etc.)
 if (!process.env.DEBUG?.includes("tsdav")) {
   process.env.DEBUG = process.env.DEBUG ? `${process.env.DEBUG},tsdav:*` : "tsdav:*";
@@ -102,6 +111,7 @@ if (!process.env.DEBUG?.includes("tsdav")) {
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 const YAAIA_DIR = join(homedir(), "yaaia");
+const YAAIA_DOWNLOADS_DIR = join(YAAIA_DIR, "downloads");
 const APP_DATA_DIR = join(YAAIA_DIR, "appData");
 const AGENT_DATA_DIR = join(YAAIA_DIR, "agentData");
 const CONFIG_PATH = join(APP_DATA_DIR, "config.json");
@@ -455,6 +465,15 @@ async function ensureNoRestoreTabs(): Promise<void> {
   profile.exit_type = "Normal";
   profile.exited_cleanly = true;
   prefs.profile = profile;
+  // Default download folder for agent browser
+  mkdirSync(YAAIA_DOWNLOADS_DIR, { recursive: true });
+  const download = (prefs.download as Record<string, unknown>) ?? {};
+  download.default_directory = YAAIA_DOWNLOADS_DIR;
+  download.prompt_for_download = false;
+  prefs.download = download;
+  const savefile = (prefs.savefile as Record<string, unknown>) ?? {};
+  savefile.default_directory = YAAIA_DOWNLOADS_DIR;
+  prefs.savefile = savefile;
   await writeFile(prefsPath, JSON.stringify(prefs), "utf-8");
 }
 
@@ -548,6 +567,7 @@ app.on("before-quit", async (event) => {
   stopMcpServer();
   await stopChromeMcp();
   await stopKbMcp();
+  await stopFsMcp();
   await stopMailClient();
   await stopCaldavClient();
   if (agentBrowserProcess) {
@@ -866,6 +886,7 @@ ipcMain.handle("stop-chat", async () => {
   stopMcpServer();
   await stopChromeMcp();
   await stopKbMcp();
+  await stopFsMcp();
   await stopMailClient();
   await stopCaldavClient();
   await telegramDisconnect();

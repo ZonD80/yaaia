@@ -1,6 +1,6 @@
 {
   "name": "yaaia",
-  "version": "0.5.0",
+  "version": "0.5.5",
   "description": "Yet Another AI Agent - Browser automation with Chrome DevTools MCP",
   "main": "dist-electron/main/index.js",
   "type": "module",
@@ -19,6 +19,7 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.78.0",
+    "@cyanheads/filesystem-mcp-server": "^1.0.4",
     "@modelcontextprotocol/sdk": "^1.27.0",
     "@mtcute/node": "^0.28.2",
     "@tobilu/qmd": "^1.0.7",

@@ -425,6 +425,19 @@ export async function caldavInitAndWatch(account: string): Promise<{ calendars: 
             if (isNew || isChanged) {
               const parsed = parseIcsEvent(data);
               const uid = parsed.uid ?? url;
+
+              // Deduplicate by eventUid: same event can have different object URLs between polls (e.g. Google).
+              // If we've already seen this eventUid for this bus, update URL mapping but skip emit.
+              const existingByUid = [...lastKnownEvents.entries()].find(
+                ([_, e]) => e.eventUid === uid && e.busId === busId
+              );
+              if (existingByUid) {
+                const [oldUrl] = existingByUid;
+                lastKnownEvents.delete(oldUrl);
+                lastKnownEvents.set(url, { etag, dataHash, eventUid: uid, busId });
+                continue; // already delivered, skip
+              }
+
               lastKnownEvents.set(url, { etag, dataHash, eventUid: uid, busId });
               const displayName = (calendar.displayName as string) ?? calendar.url ?? "Calendar";
 

@@ -61,11 +61,16 @@ export async function connectChromeMcp(browserUrl: string): Promise<void> {
 }
 
 export async function disconnectChromeMcp(): Promise<void> {
-  if (chromeTransport) {
-    await chromeTransport.close();
+  try {
+    if (chromeClient) {
+      await chromeClient.close();
+    }
+  } catch (err) {
+    console.warn("[YAAIA Chrome] Disconnect:", err instanceof Error ? err.message : String(err));
+  } finally {
+    chromeClient = null;
     chromeTransport = null;
   }
-  chromeClient = null;
 }
 
 export async function listChromeTools(): Promise<ChromeTool[]> {

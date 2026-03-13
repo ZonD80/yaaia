@@ -15,6 +15,13 @@ import {
   takeScreenshotForRecipe,
   type ChromeTool,
 } from "./chrome-client.js";
+import {
+  connectFsMcp,
+  disconnectFsMcp,
+  listFsTools,
+  callFsTool,
+  type FsTool,
+} from "./fs-client.js";
 import { waitForUserReply } from "../ask-user-bridge.js";
 import { secretsList, secretsGet, secretsSet, secretsDelete } from "../secrets-store.js";
 import {
@@ -287,10 +294,33 @@ function buildKbToolInputSchema(
   return z.object(shape);
 }
 
+function buildFsToolInputSchema(
+  baseSchema: FsTool["inputSchema"],
+  required: string[]
+): z.ZodObject<Record<string, z.ZodTypeAny>> {
+  const props = baseSchema?.properties ?? {};
+  const baseRequired = new Set(baseSchema?.required ?? []);
+  const shape: Record<string, z.ZodTypeAny> = {
+    bus_id: BUS_ID_PARAM,
+    assessment: ASSESSMENT_PARAM,
+    clarification: CLARIFICATION_PARAM,
+  };
+  for (const [key, prop] of Object.entries(props)) {
+    if (key === "bus_id" || key === "assessment" || key === "clarification") continue;
+    const p = prop as JsonSchemaProp;
+    shape[key] = jsonSchemaPropToZod(p ?? {}, baseRequired.has(key));
+  }
+  return z.object(shape);
+}
+
 async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
   config.onStartupProgress?.("Connecting Chrome MCP...");
   await connectChromeMcp(BROWSER_URL);
   config.onStartupProgress?.("Chrome ready");
+
+  config.onStartupProgress?.("Connecting Filesystem MCP...");
+  await connectFsMcp();
+  config.onStartupProgress?.("Filesystem ready");
 
   config.onStartupProgress?.("Connecting Knowledge Base...");
   await connectKbMcp((line) => config.onStartupProgress?.(line));
@@ -298,6 +328,7 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
 
   const chromeTools = await listChromeTools();
   const kbTools = await listKbTools();
+  const fsTools = await listFsTools();
 
   const server = new McpServer(
     { name: "yaaia", version: "1.0.0" },
@@ -352,6 +383,11 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
     );
   }
 
+  const QMD_TOOL_DESCRIPTIONS: Record<string, string> = {
+    get: "Retrieve document by path or docid. file: collection/path.md (e.g. identity/identity.md), or docid #abc123, or path.md:100 for line offset.",
+    multi_get: "Batch retrieve by glob or comma-separated paths. pattern: collection/*.md (e.g. lessons_learned/*.md) or collection/subdir/**/*.md.",
+    search: "Semantic search over the knowledge base.",
+  };
   for (const tool of kbTools) {
     const qmdName = tool.name;
     const name = `kb__qmd_${qmdName.replace(/^qmd_/, "")}`;
@@ -361,10 +397,11 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
     if (!required.includes("assessment")) required.push("assessment");
     if (!required.includes("clarification")) required.push("clarification");
 
+    const qmdDesc = QMD_TOOL_DESCRIPTIONS[qmdName] ?? tool.description ?? `KB/QMD: ${qmdName}`;
     server.registerTool(
       name,
       {
-        description: (tool.description ?? `KB/QMD: ${qmdName}`) + " Always provide bus_id, assessment and clarification.",
+        description: qmdDesc + " Always provide bus_id, assessment and clarification.",
         inputSchema: buildKbToolInputSchema(baseSchema, required),
       },
       async (args) => {
@@ -391,6 +428,44 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
           const result = await callKbTool(qmdName, forwardArgs);
           const text = contentToText(result.content);
           recipeStore.appendToolCall(name, args, text);
+          return toolResult(text);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          recipeStore.appendToolCall(name, args, msg);
+          return toolResult(`Error: ${msg}`);
+        }
+      }
+    );
+  }
+
+  for (const tool of fsTools) {
+    const baseName = tool.name;
+    const name = `fs__${baseName}`;
+    const baseSchema = tool.inputSchema ?? { type: "object", properties: {}, required: [] };
+    const required = [...(baseSchema.required ?? [])];
+    if (!required.includes("bus_id")) required.push("bus_id");
+    if (!required.includes("assessment")) required.push("assessment");
+    if (!required.includes("clarification")) required.push("clarification");
+
+    server.registerTool(
+      name,
+      {
+        description: (tool.description ?? `Filesystem: ${baseName}`) + " Always provide bus_id, assessment and clarification. Paths are relative to ~/yaaia/downloads.",
+        inputSchema: buildFsToolInputSchema(baseSchema, required),
+      },
+      async (args) => {
+        const a = args as Record<string, unknown>;
+        logToolCall(name, args);
+        logClarification(name, args);
+        logAssessment(name, args);
+        const forwardArgs = stripBusIdAssessmentClarification(a);
+        try {
+          const result = await callFsTool(baseName, forwardArgs);
+          const text = contentToText(result.content);
+          recipeStore.appendToolCall(name, args, text);
+          if (result.isError) {
+            return toolResult(`Error: ${text}`);
+          }
           return toolResult(text);
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
@@ -836,7 +911,7 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
     "get_bus_history",
     {
       description:
-        "Get conversation history for a bus from kb/history (KB storage). Use limit and offset for slices. offset=0, limit=N = last N; offset>0 = from start; offset<0 = from end. Call when you need more context.",
+        "Get conversation history for a bus. offset=0, limit=N = last N messages; offset>0 = from start (offset=1 for first 50, offset=51 for next 50); offset<0 = from end. Use when root context is trimmed or you need more context.",
       inputSchema: z.object({
         bus_id: BUS_ID_PARAM,
         assessment: ASSESSMENT_PARAM,
@@ -1453,7 +1528,7 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
   server.registerTool(
     "mail__connect",
     {
-      description: "Connect to IMAP server. Explicit params: host, port, user, pass. secure=true by default.",
+      description: "Connect to IMAP server (host, port, user, pass). Creates bus email-{account}. New messages delivered via IDLE. Prefer over browser for email.",
       inputSchema: z.object({
         bus_id: BUS_ID_PARAM,
         host: z.string(),
@@ -1961,7 +2036,7 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
   server.registerTool(
     "mail__download",
     {
-      description: "Download message or body part. Saves to ~/Downloads. part: body part ID (e.g. '1', '2') or omit for full message.",
+      description: "Download message or body part. Saves to ~/yaaia/downloads. part: body part ID (e.g. '1', '2') or omit for full message.",
       inputSchema: z.object({
         bus_id: BUS_ID_PARAM,
         range: z.string(),
@@ -2519,7 +2594,7 @@ async function createMcpServer(config: McpServerConfig): Promise<McpServer> {
     "caldav__connect",
     {
       description:
-        "Connect to CalDAV. Basic: serverUrl, username, password. OAuth (Google): authMethod=OAuth, provider=google, credentials_secret_id (from secrets_set after caldav__oauth_browser). For OAuth, run caldav__oauth_browser first to get tokens.",
+        "Connect to CalDAV. Basic: serverUrl, username, password. OAuth (Google): authMethod=OAuth, provider=google, credentials_secret_id (from secrets_set after caldav__oauth_browser). Creates one bus per calendar: caldav-{account}-{calendar}. New events delivered to bus; scheduled tasks created for event start times.",
       inputSchema: z.object({
         bus_id: BUS_ID_PARAM,
         authMethod: z.enum(["Basic", "OAuth"]),
@@ -2942,6 +3017,10 @@ export async function stopChromeMcp(): Promise<void> {
 
 export async function stopKbMcp(): Promise<void> {
   await disconnectKbMcp();
+}
+
+export async function stopFsMcp(): Promise<void> {
+  await disconnectFsMcp();
 }
 
 export async function stopMailClient(): Promise<void> {
