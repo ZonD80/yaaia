@@ -9,8 +9,8 @@ const require = createRequire(import.meta.url);
 const HIDE_RESULT_TOOLS = new Set([
   "take_screenshot",
   "take_snapshot",
-  "secrets_list",
-  "secrets_get",
+  "passwords.list",
+  "passwords.get",
 ]);
 
 export interface RecipeEntry {
@@ -223,16 +223,15 @@ function formatDuration(ms: number): string {
   return `${s}s`;
 }
 
-function truncate(s: string, max = 500): string {
-  const t = s.trim();
-  return t.length <= max ? t : t.slice(0, max) + "...";
+function truncate(s: string, _max = 500): string {
+  return String(s ?? "").trim();
 }
 
 function formatParams(params: Record<string, unknown>): string {
   return Object.entries(params)
     .map(([k, v]) => {
       const val = typeof v === "string" ? v : JSON.stringify(v);
-      return `${k}=${val.length > 80 ? val.slice(0, 80) + "…" : val}`;
+      return `${k}=${val}`;
     })
     .join(", ");
 }

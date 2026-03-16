@@ -1,6 +1,6 @@
 import { contextBridge, ipcRenderer } from "electron";
 
-export type AiProvider = "claude" | "openrouter";
+export type AiProvider = "claude" | "openrouter" | "codex";
 
 export interface McpConfig {
   aiProvider: AiProvider;
@@ -8,7 +8,10 @@ export interface McpConfig {
   claudeModel: string;
   openrouterApiKey: string;
   openrouterModel: string;
+  codexModel: string;
   userName: string;
+  rootUserIdentifier?: string;
+  skipInitialTask?: boolean;
 }
 
 try {
@@ -27,32 +30,39 @@ try {
     agentQueueMessage: (message: string) => ipcRenderer.invoke("agent-queue-message", message),
     agentInjectMessage: (message: string, placeAfterAskUser?: boolean) =>
       ipcRenderer.invoke("agent-inject-message", message, placeAfterAskUser),
-    secretsListFull: () => ipcRenderer.invoke("secrets-list-full"),
-    secretsSet: (args: {
-      detailed_description: string;
-      first_factor: string;
-      first_factor_type: string;
+    passwordsListFull: () => ipcRenderer.invoke("passwords-list-full"),
+    passwordsSet: (args: {
+      description: string;
+      type: "string" | "totp";
       value: string;
-      totp_secret?: string;
       force?: boolean;
-    }) => ipcRenderer.invoke("secrets-set", args),
-    secretsDelete: (id: string) => ipcRenderer.invoke("secrets-delete", id),
-    wipeSecrets: () => ipcRenderer.invoke("wipe-secrets"),
-    agentConfigList: () => ipcRenderer.invoke("agent-config-list"),
-    agentConfigSet: (args: { detailed_description: string; value: string; force?: boolean }) =>
-      ipcRenderer.invoke("agent-config-set", args),
-    agentConfigDelete: (id: string) => ipcRenderer.invoke("agent-config-delete", id),
-    wipeConfigs: () => ipcRenderer.invoke("wipe-configs"),
+      uuid?: string;
+    }) => ipcRenderer.invoke("passwords-set", args),
+    passwordsDelete: (id: string) => ipcRenderer.invoke("passwords-delete", id),
+    wipePasswords: () => ipcRenderer.invoke("wipe-passwords"),
+    identityList: () => ipcRenderer.invoke("identity-list"),
+    identityGet: (idOrIdentifier: string) => ipcRenderer.invoke("identity-get", idOrIdentifier),
+    identityCreate: (args: {
+      name: string;
+      identifier: string;
+      trust_level?: "root" | "normal";
+      bus_ids?: string[];
+    }) => ipcRenderer.invoke("identity-create", args),
+    identityUpdate: (
+      idOrIdentifier: string,
+      args: { name?: string; identifier?: string; trust_level?: "root" | "normal"; bus_ids?: string[] }
+    ) => ipcRenderer.invoke("identity-update", idOrIdentifier, args),
+    identityDelete: (idOrIdentifier: string) => ipcRenderer.invoke("identity-delete", idOrIdentifier),
+    identitySetNote: (identifier: string, content: string) =>
+      ipcRenderer.invoke("identity-set-note", identifier, content),
     messageBusList: () => ipcRenderer.invoke("message-bus-list"),
     messageBusSetDescription: (busId: string, description: string) =>
       ipcRenderer.invoke("message-bus-set-description", busId, description),
     messageBusDelete: (busId: string) => ipcRenderer.invoke("message-bus-delete", busId),
     messageBusGetHistory: (busId: string) => ipcRenderer.invoke("message-bus-get-history", busId),
+    messageBusGetHistorySlice: (busId: string, limit: number, offset: number) =>
+      ipcRenderer.invoke("message-bus-get-history-slice", busId, limit, offset),
     messageBusWipeRoot: () => ipcRenderer.invoke("message-bus-wipe-root"),
-    kbList: (path?: string, recursive?: boolean) => ipcRenderer.invoke("kb-list", path ?? ".", recursive ?? true),
-    kbRead: (path: string) => ipcRenderer.invoke("kb-read", path),
-    kbWrite: (path: string, content: string) => ipcRenderer.invoke("kb-write", path, content),
-    kbDelete: (path: string) => ipcRenderer.invoke("kb-delete", path),
     scheduleList: () => ipcRenderer.invoke("schedule-list"),
     scheduleGetStartup: () => ipcRenderer.invoke("schedule-get-startup"),
     scheduleSetStartup: (task: { title: string; instructions: string }) =>
@@ -63,6 +73,7 @@ try {
       ipcRenderer.invoke("schedule-update", id, props),
     scheduleDelete: (id: string) => ipcRenderer.invoke("schedule-delete", id),
     openExternal: (url: string) => ipcRenderer.invoke("open-external", url),
+    openStorageFolder: () => ipcRenderer.invoke("open-storage-folder"),
     onAgentStreamChunk: (callback: (chunk: string) => void) => {
       const fn = (_: unknown, chunk: string) => callback(chunk);
       ipcRenderer.on("agent-stream-chunk", fn);
@@ -87,11 +98,6 @@ try {
       const fn = (_: unknown, info: { assessment: string; clarification: string; is_successful: boolean }) => callback(info);
       ipcRenderer.on("finalize-task-popup", fn);
       return () => ipcRenderer.removeListener("finalize-task-popup", fn);
-    },
-    onAgentBrowserError: (callback: (message: string) => void) => {
-      const fn = (_: unknown, message: string) => callback(message);
-      ipcRenderer.on("agent-browser-error", fn);
-      return () => ipcRenderer.removeListener("agent-browser-error", fn);
     },
     onStartupProgress: (callback: (step: string) => void) => {
       const fn = (_: unknown, step: string) => callback(step);
@@ -139,6 +145,18 @@ try {
       return () => ipcRenderer.removeListener("telegram-login-request", fn);
     },
     telegramLoginReply: (value: string) => ipcRenderer.invoke("telegram-login-reply", value),
+    codexAuthStatus: () => ipcRenderer.invoke("codex-auth-status"),
+    codexLogin: () => ipcRenderer.invoke("codex-login"),
+    codexLogout: () => ipcRenderer.invoke("codex-logout"),
+    vmList: () => ipcRenderer.invoke("vm-list"),
+    vmCreate: (options?: { isoPath?: string; ramMb?: number; diskGb?: number }) =>
+      ipcRenderer.invoke("vm-create", options),
+    vmStart: (vmId: string) => ipcRenderer.invoke("vm-start", vmId),
+    vmStop: (vmId: string) => ipcRenderer.invoke("vm-stop", vmId),
+    vmDelete: (vmId: string) => ipcRenderer.invoke("vm-delete", vmId),
+    vmShowConsole: (vmId: string) => ipcRenderer.invoke("vm-show-console", vmId),
+    vmPickIso: () => ipcRenderer.invoke("vm-pick-iso"),
+    vmOpenSerialConsole: () => ipcRenderer.invoke("vm-open-serial-console"),
   });
 } catch (err) {
   console.error("[YAAIA preload] Failed to expose electronAPI:", err);

@@ -16,14 +16,12 @@ export interface McpServerConfig {
   onAskUserTimeout?: () => void;
   onStartTask?: (info: { summary: string }) => void;
   onFinalizeTask?: (info: FinalizeTaskPopupInfo) => void;
-  /** Called after Chrome steals focus (e.g. new_page). Use to refocus the main window. */
+  /** Called after browser steals focus (e.g. new_page). Use to refocus the main window. */
   onRefocusMainWindow?: () => void;
-  /** Called during startup with progress steps (e.g. "Connecting Chrome MCP..."). */
+  /** Called during startup with progress steps (e.g. "Connecting Playwright CLI..."). */
   onStartupProgress?: (step: string) => void;
   /** Called when agent sends message to root bus. Display in chat UI. */
   onSendMessageToRoot?: (content: string) => void;
-  /** Called when agent sends message to any bus (for tracking). */
-  onSendMessage?: (busId: string) => void;
   /** Called when agent sends message to a Telegram bus. Send via telegram client. */
   onSendMessageToTelegram?: (busId: string, content: string) => void | Promise<void>;
   /** Called when agent wants to connect Telegram. phone is mandatory from the tool. Returns buses + instruction on success. */
@@ -36,14 +34,14 @@ export interface McpServerConfig {
   }>;
   /** Resolve Telegram username to bus_id. Requires Telegram to be connected. */
   onTelegramSearch?: (username: string) => Promise<{ bus_id: string; display_name?: string }>;
-  /** App config for root bus (userName). Telegram credentials are read from config, not passed here. */
+  /** App config for root bus (userName). Telegram and CalDAV OAuth credentials exposed to eval. */
   appConfig?: {
     userName: string;
+    telegramApiId?: number;
+    telegramApiHash?: string;
     caldavGoogleClientId?: string;
     caldavGoogleClientSecret?: string;
   };
-  /** Open URL in browser (for CalDAV OAuth). */
-  onOpenExternal?: (url: string) => void | Promise<void>;
   /** Called when a CalDAV event is deleted. Notify renderer to remove from timeline. */
   onCaldavEventDeleted?: (eventUid: string, busId: string) => void;
 }

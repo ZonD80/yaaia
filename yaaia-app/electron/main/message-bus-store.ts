@@ -22,6 +22,7 @@ import {
 import { isTelegramConnected, telegramDeleteChatHistory } from "./telegram-client.js";
 import { isMailConnected, mailDeleteMessagesByUids } from "./mail-client.js";
 import { isCaldavConnected } from "./caldav-client.js";
+import { getTrustLevelForBus, identityUpdateTrustByBusId } from "./identities-store.js";
 
 export type RootLogForModel = { messages: BusMessage[]; trimmedCount: number };
 
@@ -39,6 +40,10 @@ export type BusMessage = {
   mail_uid?: number;
   /** CalDAV event UID for calendar event cleanup (delete from history when event deleted) */
   event_uid?: string;
+  /** Telegram message ID for database duplicate check */
+  message_id?: string;
+  /** Explicit from_identifier for root (config.rootUserIdentifier or identity). User = identifier, assistant = "assistant". */
+  from_identifier?: string;
 };
 
 export type BusTrustLevel = "normal" | "root";
@@ -77,10 +82,11 @@ export function listBuses(): BusEntry[] {
   const out: BusEntry[] = [];
   for (const busId of buses) {
     const props = loadBusProperties(busId);
+    const trustLevel = getTrustLevelForBus(busId);
     out.push({
       bus_id: busId,
       description: props?.description ?? "",
-      trust_level: (props?.trust_level as BusTrustLevel) ?? "normal",
+      trust_level: trustLevel,
       is_banned: props?.is_banned ?? false,
       is_connected: getBusConnected(busId),
     });
@@ -93,9 +99,9 @@ export function getBusDescription(busId: string): string {
   return props?.description ?? "";
 }
 
-export function getBusTrustLevel(busId: string): BusTrustLevel {
-  const props = loadBusProperties(busId);
-  return props?.trust_level === "root" ? "root" : "normal";
+/** Trust from identity. For email, pass senderEmail to resolve per-sender identity. */
+export function getBusTrustLevel(busId: string, senderEmail?: string): BusTrustLevel {
+  return getTrustLevelForBus(busId, senderEmail);
 }
 
 export function isBusBanned(busId: string): boolean {
@@ -116,7 +122,12 @@ export function setBusProperties(
     is_banned: false,
   };
   if (props.description !== undefined) existing.description = props.description;
-  if (props.trust_level !== undefined) existing.trust_level = props.trust_level;
+  if (props.trust_level !== undefined) {
+    const updated = identityUpdateTrustByBusId(busId, props.trust_level);
+    if (!updated) {
+      existing.trust_level = props.trust_level;
+    }
+  }
   if (props.is_banned !== undefined) {
     if (busId === ROOT_BUS_ID) throw new Error("Root bus cannot be banned");
     existing.is_banned = props.is_banned;
@@ -167,10 +178,20 @@ export function getBusHistory(busId: string): BusMessage[] {
   return getHistory(busId).map(toBusMessage);
 }
 
+const DEFAULT_ROOT_LOG_CHARS = 50_000;
+const LLM_HISTORY_MESSAGE_LIMIT = 30;
+
 /** Root log for model: messages + trimmedCount. Use when building context for the model. */
-export function getRootLogForModel(): RootLogForModel {
-  const { messages, trimmedCount } = getRootLog(50_000);
+export function getRootLogForModel(maxChars: number = DEFAULT_ROOT_LOG_CHARS): RootLogForModel {
+  const { messages, trimmedCount } = getRootLog(maxChars);
   return { messages: messages.map(toBusMessage), trimmedCount };
+}
+
+/** Last N messages from merged root log for LLM context. No Mem0; uses database history only. */
+export function getRootLogForModelWithMessageLimit(limit: number = LLM_HISTORY_MESSAGE_LIMIT): RootLogForModel {
+  const full = getRootLogFull().map(toBusMessage);
+  const messages = full.slice(-limit);
+  return { messages, trimmedCount: Math.max(0, full.length - limit) };
 }
 
 export function getBusHistorySlice(
@@ -194,12 +215,34 @@ export function getBusHistorySlice(
   return getHistorySlice(busId, limit, offset).map(toBusMessage);
 }
 
+/** Root history slice with total count for pagination. offset=0 returns last `limit` messages. */
+export function getRootHistorySliceWithTotal(
+  limit: number,
+  offset: number
+): { messages: BusMessage[]; total: number } {
+  const { messages } = getRootLog(50_000);
+  const total = messages.length;
+  if (offset === 0) {
+    return { messages: messages.slice(-limit).map(toBusMessage), total };
+  }
+  const from = Math.max(0, offset - 1);
+  return { messages: messages.slice(from, from + limit).map(toBusMessage), total };
+}
+
 /** Get root bus history only (not merged). Useful for duplicate checks. */
 export function getRootBusHistoryOnly(): BusMessage[] {
   return getHistory(ROOT_BUS_ID).map(toBusMessage);
 }
 
+let _isRootUserIdentifierDefined: () => boolean = () => true;
+
+/** Inject check for root user identifier. When false, root chat history is not saved. */
+export function setRootUserIdentifierDefinedCheck(fn: () => boolean): void {
+  _isRootUserIdentifierDefined = fn;
+}
+
 export function appendToBusHistory(busId: string, message: BusMessage): void {
+  if (busId === ROOT_BUS_ID && !_isRootUserIdentifierDefined()) return;
   ensureRootBus();
   ensureMbDir(busId);
   appendToHistory(busId, {
@@ -211,5 +254,7 @@ export function appendToBusHistory(busId: string, message: BusMessage): void {
     timestamp: message.timestamp,
     mail_uid: message.mail_uid,
     event_uid: message.event_uid,
+    message_id: message.message_id,
+    from_identifier: message.from_identifier,
   });
 }

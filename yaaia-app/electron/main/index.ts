@@ -1,16 +1,17 @@
 import { app, BrowserWindow, ipcMain, dialog, shell, nativeImage } from "electron";
-import WebSocket from "ws";
+import { exec } from "node:child_process";
 import { join, dirname } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import { createServer } from "node:http";
 import { homedir } from "node:os";
 import { mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
-import { spawn, execSync } from "node:child_process";
-import { platform } from "node:os";
 import { randomBytes } from "node:crypto";
 import type { Server } from "node:http";
-import { startMcpServer, getMcpServerPort, stopChromeMcp, stopKbMcp, stopFsMcp, stopMailClient, stopCaldavClient } from "./mcp-server/index.js";
+import { startEvalMcpServer, getEvalServerPort, stopKbMcp, stopFsMcp } from "./eval-server.js";
+import { mailDisconnect as stopMailClient } from "./mail-client.js";
+import { caldavDisconnect as stopCaldavClient } from "./caldav-client.js";
+import { setDirectToolsConfig } from "./direct-tools.js";
 import {
   telegramConnect,
   telegramDisconnect,
@@ -21,7 +22,7 @@ import {
   telegramFetchMissedMessages,
   isTelegramConnected,
 } from "./telegram-client.js";
-import { setOnMailMessage } from "./mail-client.js";
+import { setOnMailMessage, mailMessageFlagsAdd } from "./mail-client.js";
 import {
   setOnCaldavEvent,
   setOnCaldavEventDeleted,
@@ -43,28 +44,24 @@ import {
   requestAgentAbort,
   setPendingInjectMessage,
   setOnAssessmentClarification,
+  setOnRouteParsedMessages,
+  setRouteCallbacksForEval,
   addToAgentInjectedQueue,
   setAgentRunActive,
   clearAgentInjectedQueue,
   isAgentRunActive,
 } from "./ai-agent/index.js";
+import { routeMessage } from "./message-router.js";
+import { caldavGetCalendarUrlForBusId } from "./caldav-client.js";
 import { deliverUserReply, isWaitingForAskUser, getWaitingAskUserBusId } from "./ask-user-bridge.js";
 import {
-  secretsWipe,
-  secretsListFull,
-  secretsSet,
-  secretsDelete,
-  validateDetailedDescription as validateSecretsDesc,
-} from "./secrets-store.js";
-import {
-  agentConfigWipe,
-  agentConfigList,
-  agentConfigSet,
-  agentConfigDelete,
-  validateDetailedDescription as validateConfigDesc,
-} from "./agent-config-store.js";
+  passwordsWipe,
+  passwordsListFull,
+  passwordsSet,
+  passwordsDelete,
+} from "./passwords-store.js";
+import { stopOllama } from "./ollama-manager.js";
 import * as recipeStore from "./recipe-store.js";
-import { kbList, kbRead, kbWrite, kbDelete, runQmdCli } from "./mcp-server/kb-client.js";
 import {
   listSchedules,
   addSchedule,
@@ -80,8 +77,8 @@ import {
   ensureBus,
   getBusHistory,
   getBusHistorySlice,
-  getRootBusHistoryOnly,
-  getRootLogForModel,
+  getRootHistorySliceWithTotal,
+  getRootLogForModelWithMessageLimit,
   isBusBanned,
   listBuses,
   setBusProperties,
@@ -89,10 +86,40 @@ import {
   deleteBus,
   wipeRootHistory,
   ROOT_BUS_ID,
+  setRootUserIdentifierDefinedCheck,
 } from "./message-bus-store.js";
 import { hasTaskForEventUid, setEventTaskMapping, removeEventTaskMapping } from "./caldav-event-tasks-store.js";
-import { hasEventInBusHistory, removeMessagesFromBusHistoryByEventUids } from "./history-store.js";
+import { hasEventInBusHistory, hasMailUidInBusHistory, hasMessageIdInBusHistory, removeMessagesFromBusHistoryByEventUids, isValidBusIdFormat } from "./history-store.js";
+import {
+  resolveIdentity,
+  identityList,
+  identityGet,
+  identityCreate,
+  identityUpdate,
+  identityDelete,
+  identitySetNote,
+} from "./identities-store.js";
+import { shouldBanBusForNoIdentity, incrementIdentityAttempts } from "./identity-attempts-store.js";
 import { ensureHistoryCollection } from "./history-store.js";
+import {
+  createAuthorizationFlow,
+  exchangeAuthorizationCode,
+  startCodexOAuthServer,
+  loadCodexAuth,
+  clearCodexAuth,
+} from "./codex-auth.js";
+import {
+  listVms,
+  createVm,
+  startVm,
+  stopVm,
+  deleteVm,
+  showConsoleVm,
+  getVmSerialPort,
+  type CreateVmOptions,
+} from "./vm-manager.js";
+import { startYaaiaVm, stopYaaiaVm } from "./vm-launcher.js";
+import { getVmSerialPortFromFile } from "./vm-ports.js";
 
 // Suppress unhandled MCP "Connection closed" rejections (expected when subprocesses exit on shutdown)
 process.on("unhandledRejection", (reason) => {
@@ -107,16 +134,17 @@ process.on("unhandledRejection", (reason) => {
 if (!process.env.DEBUG?.includes("tsdav")) {
   process.env.DEBUG = process.env.DEBUG ? `${process.env.DEBUG},tsdav:*` : "tsdav:*";
 }
+// Enable verbose agent/API logs (OpenRouter, Claude, Codex, eval, tool calls)
+if (!process.env.DEBUG?.includes("yaaia")) {
+  process.env.DEBUG = process.env.DEBUG ? `${process.env.DEBUG},yaaia:*` : "yaaia:*";
+}
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 const YAAIA_DIR = join(homedir(), "yaaia");
-const YAAIA_DOWNLOADS_DIR = join(YAAIA_DIR, "downloads");
+const YAAIA_SHARED_DIR = join(YAAIA_DIR, "storage", "shared");
 const APP_DATA_DIR = join(YAAIA_DIR, "appData");
-const AGENT_DATA_DIR = join(YAAIA_DIR, "agentData");
 const CONFIG_PATH = join(APP_DATA_DIR, "config.json");
-
-const AGENT_BROWSER_DEBUG_PORT = 9222;
 
 const _k = "y4a1a";
 const _x = (h: string) => Buffer.from(h, "hex").map((b: number, i: number) => b ^ _k.charCodeAt(i % _k.length)).toString();
@@ -128,8 +156,6 @@ const CALDAV_GOOGLE_CLIENT_SECRET = _x("3e7b22623121190d421418732c7231400d595c03
 /** Buses we've delivered to the agent since root was wiped. Cleared on wipe. */
 const busesDeliveredSinceRootWipe = new Set<string>();
 
-/** Track if agent sent to target bus during current run (for Telegram fallback). */
-let sentToTargetBusDuringRun = false;
 let currentTargetBusIdForRun: string | null = null;
 
 let scheduleIntervalHandle: ReturnType<typeof setInterval> | null = null;
@@ -161,12 +187,7 @@ function runStartupTask(): void {
     deleteSchedules(ids);
     content += `\n\n--- Resume: complete these scheduled tasks (were due while app was closed) ---\n\n${buildScheduleMessage(due)}`;
   }
-  const msg = JSON.stringify({
-    bus_id: ROOT_BUS_ID,
-    user_id: 0,
-    user_name: "System",
-    content,
-  });
+  const msg = `${ROOT_BUS_ID}:${content}`;
   const injectHandled = isAgentRunActive();
   if (injectHandled) addToAgentInjectedQueue(msg);
   if (mainWindow && !mainWindow.isDestroyed()) {
@@ -180,12 +201,7 @@ function runDueSchedules(): void {
   const ids = due.map((s) => s.id);
   deleteSchedules(ids);
   const content = buildScheduleMessage(due);
-  const msg = JSON.stringify({
-    bus_id: ROOT_BUS_ID,
-    user_id: 0,
-    user_name: "Scheduled",
-    content,
-  });
+  const msg = `${ROOT_BUS_ID}:${content}`;
   const injectHandled = isAgentRunActive();
   if (injectHandled) addToAgentInjectedQueue(msg);
   if (mainWindow && !mainWindow.isDestroyed()) {
@@ -213,7 +229,7 @@ function safeForIPC<T>(value: T): T {
   }
 }
 
-export type AiProvider = "claude" | "openrouter";
+export type AiProvider = "claude" | "openrouter" | "codex";
 
 export interface McpConfig {
   aiProvider: AiProvider;
@@ -221,7 +237,12 @@ export interface McpConfig {
   claudeModel: string;
   openrouterApiKey: string;
   openrouterModel: string;
+  codexModel: string;
   userName: string;
+  /** Who uses root chat (from_identifier for user messages). e.g. aleksei. Empty = use root identity. */
+  rootUserIdentifier: string;
+  /** Session-only: skip startup task and due schedules on start-chat */
+  skipInitialTask?: boolean;
 }
 
 const DEFAULT_CONFIG: McpConfig = {
@@ -230,7 +251,9 @@ const DEFAULT_CONFIG: McpConfig = {
   claudeModel: "claude-sonnet-4-6",
   openrouterApiKey: "",
   openrouterModel: "google/gemini-2.5-flash",
+  codexModel: "gpt-5.4-codex",
   userName: "",
+  rootUserIdentifier: "",
 };
 
 function loadConfig(): McpConfig {
@@ -245,6 +268,16 @@ function loadConfig(): McpConfig {
   return { ...DEFAULT_CONFIG };
 }
 
+/** Who uses root chat: config override or root identity identifier. Used as from_identifier for user messages. */
+function getRootUserIdentifier(): string {
+  const cfg = loadConfig();
+  const override = cfg.rootUserIdentifier?.trim();
+  if (override) return override;
+  return resolveIdentity(ROOT_BUS_ID)?.identifier ?? "user";
+}
+
+setRootUserIdentifierDefinedCheck(() => getRootUserIdentifier() !== "user");
+
 function saveConfig(config: McpConfig): void {
   try {
     mkdirSync(APP_DATA_DIR, { recursive: true });
@@ -254,60 +287,8 @@ function saveConfig(config: McpConfig): void {
   }
 }
 
-function getSystemChromePath(): string | null {
-  const plat = platform();
-  if (plat === "darwin") {
-    const paths = [
-      "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-      "/Applications/Chromium.app/Contents/MacOS/Chromium",
-      "/opt/homebrew/bin/chromium",
-      "/opt/homebrew/bin/google-chrome-stable",
-      "/usr/local/bin/chromium",
-      "/usr/local/bin/google-chrome-stable",
-    ];
-    for (const p of paths) {
-      if (existsSync(p)) return p;
-    }
-    for (const name of ["chromium", "google-chrome", "google-chrome-stable"]) {
-      try {
-        const p = execSync(`which ${name} 2>/dev/null`, { encoding: "utf-8" }).trim();
-        if (p && existsSync(p)) return p;
-      } catch {
-        /* ignore */
-      }
-    }
-  } else if (plat === "win32") {
-    const paths = [
-      join(process.env.LOCALAPPDATA ?? "", "Google", "Chrome", "Application", "chrome.exe"),
-      "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
-      "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
-    ];
-    for (const p of paths) {
-      if (p && existsSync(p)) return p;
-    }
-  } else {
-    const paths = ["/usr/bin/google-chrome", "/usr/bin/google-chrome-stable", "/usr/bin/chromium", "/usr/bin/chromium-browser"];
-    for (const p of paths) {
-      if (existsSync(p)) return p;
-    }
-    for (const name of ["google-chrome", "google-chrome-stable", "chromium", "chromium-browser"]) {
-      try {
-        const p = execSync(`which ${name} 2>/dev/null`, { encoding: "utf-8" }).trim();
-        if (p && existsSync(p)) return p;
-      } catch {
-        /* ignore */
-      }
-    }
-  }
-  return null;
-}
-
 function getResourcesDir(): string {
   return app.isPackaged ? join(__dirname, "..", "resources") : join(__dirname, "..", "..", "resources");
-}
-
-function getPlaceholderPath(): string {
-  return join(getResourcesDir(), "agent-browser-placeholder.html");
 }
 
 function getIconPath(): string {
@@ -315,7 +296,6 @@ function getIconPath(): string {
 }
 
 let mainWindow: BrowserWindow | null = null;
-let agentBrowserProcess: ReturnType<typeof spawn> | null = null;
 let mcpHttpServer: Server | null = null;
 
 function createMainWindow(): void {
@@ -342,188 +322,12 @@ function createMainWindow(): void {
   mainWindow.on("ready-to-show", () => {
     mainWindow?.maximize();
     mainWindow?.show();
+    // Start YaaiaVM in background so VM create/start is available on config screen
+    startYaaiaVm().catch((err) => console.warn("[YAAIA] YaaiaVM background start:", err));
   });
 
   mainWindow.on("closed", () => {
     mainWindow = null;
-  });
-}
-
-function pollCdpUntilReady(): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const url = `http://127.0.0.1:${AGENT_BROWSER_DEBUG_PORT}/json`;
-    let attempts = 0;
-    const maxAttempts = 60;
-
-    const tryFetch = async () => {
-      try {
-        const res = await fetch(url);
-        if (res.ok) {
-          const data = (await res.json()) as unknown[];
-          if (Array.isArray(data) && data.length > 0) {
-            resolve();
-            return;
-          }
-        }
-      } catch {
-        /* ignore */
-      }
-      attempts++;
-      if (attempts >= maxAttempts) {
-        reject(new Error("Agent browser did not become ready in time"));
-        return;
-      }
-      setTimeout(tryFetch, 500);
-    };
-
-    tryFetch();
-  });
-}
-
-async function grantClipboardPermission(): Promise<void> {
-  try {
-    const res = await fetch(`http://127.0.0.1:${AGENT_BROWSER_DEBUG_PORT}/json/version`);
-    if (!res.ok) return;
-    const data = (await res.json()) as { webSocketDebuggerUrl?: string };
-    const wsUrl = data.webSocketDebuggerUrl;
-    if (!wsUrl) return;
-
-    const ws = new WebSocket(wsUrl);
-    await new Promise<void>((resolve, reject) => {
-      ws.on("open", () => resolve());
-      ws.on("error", reject);
-    });
-
-    const id = 1;
-    ws.send(
-      JSON.stringify({
-        id,
-        method: "Browser.grantPermissions",
-        params: { permissions: ["clipboardReadWrite"] },
-      })
-    );
-
-    await new Promise<void>((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        ws.off("message", onMessage);
-        ws.off("error", onError);
-        resolve(); // proceed even if no response (permission may still apply)
-      }, 3000);
-      const onMessage = (raw: Buffer | ArrayBuffer | Buffer[]) => {
-        try {
-          const msg = JSON.parse(String(raw)) as { id?: number };
-          if (msg.id === id) {
-            clearTimeout(timeout);
-            ws.off("message", onMessage);
-            ws.off("error", onError);
-            resolve();
-          }
-        } catch {
-          /* ignore */
-        }
-      };
-      const onError = () => {
-        clearTimeout(timeout);
-        ws.off("message", onMessage);
-        ws.off("error", onError);
-        reject(new Error("CDP error"));
-      };
-      ws.on("message", onMessage);
-      ws.on("error", onError);
-    });
-
-    ws.close();
-    console.log("[YAAIA] Clipboard permission granted for agent browser");
-  } catch (err) {
-    console.warn("[YAAIA] Could not grant clipboard permission:", err instanceof Error ? err.message : err);
-  }
-}
-
-function parseBoolEnv(name: string, defaultValue: boolean): boolean {
-  const v = process.env[name];
-  if (v === undefined || v === "") return defaultValue;
-  return v === "1" || v.toLowerCase() === "true" || v === "yes";
-}
-
-async function ensureNoRestoreTabs(): Promise<void> {
-  if (!parseBoolEnv("YAAIA_NO_RESTORE_TABS", true)) return;
-  const defaultDir = join(AGENT_DATA_DIR, "Default");
-  mkdirSync(defaultDir, { recursive: true });
-  const prefsPath = join(defaultDir, "Preferences");
-  let prefs: Record<string, unknown> = {};
-  try {
-    const raw = await readFile(prefsPath, "utf-8");
-    prefs = JSON.parse(raw) as Record<string, unknown>;
-  } catch {
-    /* file missing or invalid, use empty */
-  }
-  const session = (prefs.session as Record<string, unknown>) ?? {};
-  session.restore_on_startup = 5; // 5 = New Tab Page (don't restore)
-  prefs.session = session;
-  const profile = (prefs.profile as Record<string, unknown>) ?? {};
-  profile.name = "Agent Browser";
-  profile.exit_type = "Normal";
-  profile.exited_cleanly = true;
-  prefs.profile = profile;
-  // Default download folder for agent browser
-  mkdirSync(YAAIA_DOWNLOADS_DIR, { recursive: true });
-  const download = (prefs.download as Record<string, unknown>) ?? {};
-  download.default_directory = YAAIA_DOWNLOADS_DIR;
-  download.prompt_for_download = false;
-  prefs.download = download;
-  const savefile = (prefs.savefile as Record<string, unknown>) ?? {};
-  savefile.default_directory = YAAIA_DOWNLOADS_DIR;
-  prefs.savefile = savefile;
-  await writeFile(prefsPath, JSON.stringify(prefs), "utf-8");
-}
-
-function spawnAgentBrowser(): void {
-  mkdirSync(AGENT_DATA_DIR, { recursive: true });
-  const chromePath = getSystemChromePath();
-  if (!chromePath) {
-    const msg =
-      platform() === "darwin"
-        ? "Google Chrome or Chromium not found. Install from https://www.google.com/chrome/ or run: brew install chromium"
-        : platform() === "win32"
-          ? "Google Chrome not found. Install from https://www.google.com/chrome/"
-          : "Google Chrome or Chromium not found. Install with: sudo apt install chromium-browser (or google-chrome)";
-    console.error("[YAAIA]", msg);
-    mainWindow?.webContents?.send("agent-browser-error", msg);
-    return;
-  }
-  const placeholderPath = getPlaceholderPath();
-  const placeholderUrl = pathToFileURL(placeholderPath).href;
-  const args = [
-    `--user-data-dir=${AGENT_DATA_DIR}`,
-    `--remote-debugging-port=${AGENT_BROWSER_DEBUG_PORT}`,
-    "--start-maximized",
-    "--password-store=basic",
-    "--disable-save-password-bubble",
-    "--disable-features=PasswordManager,PasswordLeakDetection",
-    "--disable-session-crashed-bubble",
-    "--hide-crash-restore-bubble",
-    placeholderUrl,
-  ];
-  agentBrowserProcess = spawn(chromePath, args, {
-    stdio: ["ignore", "pipe", "pipe"],
-    env: { ...process.env },
-  });
-  agentBrowserProcess.stderr?.on("data", (chunk) => {
-    const s = String(chunk).trim();
-    if (s) console.warn("[YAAIA Chromium]", s);
-  });
-
-  agentBrowserProcess.on("error", (err) => {
-    console.error("[YAAIA] Agent browser spawn error:", err);
-    mainWindow?.webContents?.send("agent-browser-error", err.message);
-  });
-
-  agentBrowserProcess.on("exit", (code, signal) => {
-    if (code !== 0 && code !== null) {
-      console.warn("[YAAIA] Agent browser exited:", code, signal);
-      mainWindow?.webContents?.send("agent-browser-error", `Agent browser exited (code ${code}). Restart the app.`);
-    }
-    agentBrowserProcess = null;
   });
 }
 
@@ -538,24 +342,9 @@ function stopMcpServer(): void {
 app.setPath("userData", APP_DATA_DIR);
 
 app.whenReady().then(async () => {
+  // Start YaaiaVM early so it's ready when config screen loads
+  startYaaiaVm().catch((err) => console.warn("[YAAIA] YaaiaVM background start:", err));
   createMainWindow();
-
-  mainWindow?.webContents?.send("startup-progress", "Starting agent browser...");
-  await ensureNoRestoreTabs();
-  await new Promise((r) => setTimeout(r, 200));
-  spawnAgentBrowser();
-
-  try {
-    await pollCdpUntilReady();
-    mainWindow?.webContents?.send("startup-progress", "Agent browser ready");
-    await new Promise((r) => setTimeout(r, 1500));
-    await grantClipboardPermission();
-    console.log("[YAAIA] Agent browser ready");
-    setTimeout(() => refocusMainWindow(), 3000);
-  } catch (err) {
-    console.error("[YAAIA] Agent browser not ready:", err);
-    mainWindow?.webContents?.send("agent-browser-error", err instanceof Error ? err.message : String(err));
-  }
 });
 
 let isQuitting = false;
@@ -564,20 +353,13 @@ app.on("before-quit", async (event) => {
   event.preventDefault();
   isQuitting = true;
 
+  stopYaaiaVm();
+  stopOllama();
   stopMcpServer();
-  await stopChromeMcp();
   await stopKbMcp();
   await stopFsMcp();
   await stopMailClient();
   await stopCaldavClient();
-  if (agentBrowserProcess) {
-    try {
-      agentBrowserProcess.kill("SIGKILL");
-    } catch {
-      /* ignore */
-    }
-    agentBrowserProcess = null;
-  }
   if (recipeServer) {
     recipeServer.close();
     recipeServer = null;
@@ -597,19 +379,30 @@ ipcMain.handle("start-chat", async (_event, config: McpConfig) => {
   saveConfig(config);
 
   try {
-    const hasApiKey =
+    const hasAuth =
       (config.aiProvider === "claude" && config.claudeApiKey?.trim()) ||
-      (config.aiProvider === "openrouter" && config.openrouterApiKey?.trim());
+      (config.aiProvider === "openrouter" && config.openrouterApiKey?.trim()) ||
+      (config.aiProvider === "codex" && loadCodexAuth()?.access);
 
-    if (!hasApiKey) {
+    if (!hasAuth) {
       return safeForIPC({
         ok: false,
-        message: "Add API key for Claude or OpenRouter first.",
+        message:
+          config.aiProvider === "codex"
+            ? "Click 'Login with ChatGPT' to authenticate Codex first."
+            : "Add API key for Claude or OpenRouter first.",
       });
     }
 
     recipeStore.clearPendingFinalize();
     mainWindow?.webContents?.send("startup-progress-reset");
+    mainWindow?.webContents?.send("startup-progress", "Starting YaaiaVM...");
+    const vmResult = await startYaaiaVm({
+      onProgress: (msg) => mainWindow?.webContents?.send("startup-progress", msg),
+    });
+    if (!vmResult.ok) {
+      console.warn("[YAAIA] YaaiaVM:", vmResult.message);
+    }
     mainWindow?.webContents?.send("startup-progress", "Starting MCP server...");
     setOnTelegramMessage((payload, opts) => {
       try {
@@ -619,10 +412,23 @@ ipcMain.handle("start-chat", async (_event, config: McpConfig) => {
         }
         if (isBusBanned(payload.bus_id)) {
           const peerId = parseInt(payload.bus_id.replace("telegram-", ""), 10);
-          if (!isNaN(peerId)) telegramSendText(peerId, "I don't want to talk with you").catch(() => {});
+          if (!isNaN(peerId)) telegramSendText(peerId, "I don't want to talk with you").catch(() => { });
           return;
         }
+        const identity = resolveIdentity(payload.bus_id);
+        if (!identity) {
+          if (shouldBanBusForNoIdentity(payload.bus_id)) {
+            setBusProperties(payload.bus_id, { is_banned: true });
+            const peerId = parseInt(payload.bus_id.replace("telegram-", ""), 10);
+            if (!isNaN(peerId)) telegramSendText(peerId, "I don't want to talk with you").catch(() => { });
+            return;
+          }
+          incrementIdentityAttempts(payload.bus_id);
+        }
         ensureBus(payload.bus_id, `Telegram: ${payload.user_name}`);
+        if (payload.message_id != null && hasMessageIdInBusHistory(payload.bus_id, String(payload.message_id))) {
+          return;
+        }
         const busMsg = {
           role: "user" as const,
           content: payload.content,
@@ -630,6 +436,7 @@ ipcMain.handle("start-chat", async (_event, config: McpConfig) => {
           user_name: payload.user_name,
           bus_id: payload.bus_id,
           timestamp: payload.timestamp,
+          ...(payload.message_id != null && { message_id: String(payload.message_id) }),
         };
         appendToBusHistory(payload.bus_id, busMsg);
         const peerId = parseInt(payload.bus_id.replace("telegram-", ""), 10);
@@ -641,16 +448,19 @@ ipcMain.handle("start-chat", async (_event, config: McpConfig) => {
         const busContext =
           isFirstFromBus
             ? (() => {
-                const last10 = getBusHistorySlice(payload.bus_id, 10, 0);
-                const ctx = last10.length
-                  ? `Recent history for ${payload.bus_id}:\n${last10.map((m) => `${m.role}: ${m.content}`).join("\n")}`
-                  : "";
-                return ctx ? `${ctx}\n\n` : "";
-              })()
+              const last10 = getBusHistorySlice(payload.bus_id, 10, 0);
+              const ctx = last10.length
+                ? `Recent history for ${payload.bus_id}:\n${last10.map((m) => `${m.role}: ${m.content}`).join("\n")}`
+                : "";
+              return ctx ? `${ctx}\n\n` : "";
+            })()
             : "";
-        const instruction = `${busContext}If you need more context for this bus, call get_bus_history(bus_id="${payload.bus_id}", assessment="...", clarification="...", limit=50, offset=0) for last 50, or use negative offset for earlier messages.`;
+        const identityAsk = !identity
+          ? `IMPORTANT: No identity exists for bus ${payload.bus_id}. Ask the user to create one via identity.create (name, identifier, bus_ids including "${payload.bus_id}"). `
+          : "";
+        const instruction = `${identityAsk}${busContext}If you need more context for this bus, call bus.get_history(bus_id="${payload.bus_id}", assessment="...", clarification="...", limit=50, offset=0) for last 50, or use negative offset for earlier messages.`;
         const injectHandled = isAgentRunActive();
-        if (injectHandled) addToAgentInjectedQueue(JSON.stringify(payload));
+        if (injectHandled) addToAgentInjectedQueue(`${payload.bus_id}:${payload.content}`);
         if (opts?.deliverToModel !== false && mainWindow && !mainWindow.isDestroyed()) {
           mainWindow.webContents.send("telegram-message", { ...payload, instruction, injectHandled });
         }
@@ -661,7 +471,23 @@ ipcMain.handle("start-chat", async (_event, config: McpConfig) => {
     setOnMailMessage((payload, opts) => {
       try {
         if (isBusBanned(payload.bus_id)) return;
+        const identity = resolveIdentity(payload.bus_id, payload.sender_email);
+        if (!identity) {
+          if (shouldBanBusForNoIdentity(payload.bus_id)) {
+            setBusProperties(payload.bus_id, { is_banned: true });
+            return;
+          }
+          incrementIdentityAttempts(payload.bus_id);
+        }
         ensureBus(payload.bus_id, `Email: ${payload.user_name}`);
+        if (payload.mail_uid != null && hasMailUidInBusHistory(payload.bus_id, payload.mail_uid)) {
+          setImmediate(() => {
+            mailMessageFlagsAdd(String(payload.mail_uid), ["\\Seen"], true).catch((err) =>
+              console.warn("[YAAIA] Mark email as read failed:", err instanceof Error ? err.message : err)
+            );
+          });
+          return;
+        }
         const busMsg = {
           role: "user" as const,
           content: payload.content,
@@ -673,20 +499,43 @@ ipcMain.handle("start-chat", async (_event, config: McpConfig) => {
         };
         appendToBusHistory(payload.bus_id, busMsg);
         const injectHandled = isAgentRunActive();
-        if (injectHandled) addToAgentInjectedQueue(JSON.stringify(payload));
+        if (injectHandled) {
+          const queued =
+            payload.mail_uid != null
+              ? JSON.stringify({
+                bus_id: payload.bus_id,
+                content: payload.content,
+                mail_uid: payload.mail_uid,
+                user_name: payload.user_name,
+                timestamp: payload.timestamp,
+              })
+              : `${payload.bus_id}:${payload.content}`;
+          addToAgentInjectedQueue(queued);
+          if (payload.mail_uid != null) {
+            const uid = payload.mail_uid;
+            setImmediate(() => {
+              mailMessageFlagsAdd(String(uid), ["\\Seen"], true).catch((err) =>
+                console.warn("[YAAIA] Mark email as read failed:", err instanceof Error ? err.message : err)
+              );
+            });
+          }
+        }
         if (opts?.deliverToModel && mainWindow && !mainWindow.isDestroyed()) {
           const isFirstFromBus = !busesDeliveredSinceRootWipe.has(payload.bus_id);
           if (isFirstFromBus) busesDeliveredSinceRootWipe.add(payload.bus_id);
           const busContext =
             isFirstFromBus
               ? (() => {
-                  const last10 = getBusHistorySlice(payload.bus_id, 10, 0);
-                  return last10.length
-                    ? `Recent history for ${payload.bus_id}:\n${last10.map((m) => `${m.role}: ${m.content}`).join("\n")}\n\n`
-                    : "";
-                })()
+                const last10 = getBusHistorySlice(payload.bus_id, 10, 0);
+                return last10.length
+                  ? `Recent history for ${payload.bus_id}:\n${last10.map((m) => `${m.role}: ${m.content}`).join("\n")}\n\n`
+                  : "";
+              })()
               : "";
-          const instruction = `${busContext}If you need more context for this bus, call get_bus_history(bus_id="${payload.bus_id}", assessment="...", clarification="...", limit=50, offset=0).`;
+          const identityAsk = !identity
+            ? `IMPORTANT: No identity exists for bus ${payload.bus_id} (sender: ${payload.sender_email ?? "unknown"}). Ask the user to create one via identity.create (name, identifier="${payload.sender_email ?? "email@example.com"}", bus_ids including "${payload.bus_id}"). `
+            : "";
+          const instruction = `${identityAsk}${busContext}If you need more context for this bus, call bus.get_history(bus_id="${payload.bus_id}", assessment="...", clarification="...", limit=50, offset=0).`;
           mainWindow.webContents.send("email-message", { ...payload, instruction, injectHandled });
         }
       } catch (err) {
@@ -696,6 +545,14 @@ ipcMain.handle("start-chat", async (_event, config: McpConfig) => {
     setOnCaldavEvent((payload, opts) => {
       try {
         if (isBusBanned(payload.bus_id)) return;
+        const identity = resolveIdentity(payload.bus_id);
+        if (!identity) {
+          if (shouldBanBusForNoIdentity(payload.bus_id)) {
+            setBusProperties(payload.bus_id, { is_banned: true });
+            return;
+          }
+          incrementIdentityAttempts(payload.bus_id);
+        }
         ensureBus(payload.bus_id, `Calendar: ${payload.calendar_display_name}`);
         if (hasEventInBusHistory(payload.bus_id, payload.event_uid)) return;
         const content =
@@ -729,19 +586,22 @@ ipcMain.handle("start-chat", async (_event, config: McpConfig) => {
         }
 
         const injectHandled = isAgentRunActive();
-        if (injectHandled) addToAgentInjectedQueue(JSON.stringify({ ...payload, content }));
+        if (injectHandled) addToAgentInjectedQueue(`${payload.bus_id}:${content}`);
         if (opts?.deliverToModel && mainWindow && !mainWindow.isDestroyed()) {
           const isFirstFromBus = !busesDeliveredSinceRootWipe.has(payload.bus_id);
           if (isFirstFromBus) busesDeliveredSinceRootWipe.add(payload.bus_id);
           const busContext = isFirstFromBus
             ? (() => {
-                const last10 = getBusHistorySlice(payload.bus_id, 10, 0);
-                return last10.length
-                  ? `Recent history for ${payload.bus_id}:\n${last10.map((m) => `${m.role}: ${m.content}`).join("\n")}\n\n`
-                  : "";
-              })()
+              const last10 = getBusHistorySlice(payload.bus_id, 10, 0);
+              return last10.length
+                ? `Recent history for ${payload.bus_id}:\n${last10.map((m) => `${m.role}: ${m.content}`).join("\n")}\n\n`
+                : "";
+            })()
             : "";
-          const instruction = `${busContext}If you need more context for this bus, call get_bus_history(bus_id="${payload.bus_id}", assessment="...", clarification="...", limit=50, offset=0).`;
+          const identityAsk = !identity
+            ? `IMPORTANT: No identity exists for bus ${payload.bus_id}. Ask the user to create one via identity.create (name, identifier="${payload.bus_id}", bus_ids including "${payload.bus_id}"). `
+            : "";
+          const instruction = `${identityAsk}${busContext}If you need more context for this bus, call bus.get_history(bus_id="${payload.bus_id}", assessment="...", clarification="...", limit=50, offset=0).`;
           mainWindow.webContents.send("caldav-event", { ...payload, content, instruction, injectHandled });
         }
       } catch (err) {
@@ -753,7 +613,7 @@ ipcMain.handle("start-chat", async (_event, config: McpConfig) => {
       removeMessagesFromBusHistoryByEventUids(busId, [eventUid]);
       mainWindow?.webContents?.send("caldav-event-deleted", { eventUid, busId });
     });
-    mcpHttpServer = await startMcpServer({
+    const mcpConfig = {
       onAskUserRequest: (info) => {
         refocusMainWindow();
         mainWindow?.webContents?.send("ask-user-popup", info);
@@ -767,15 +627,9 @@ ipcMain.handle("start-chat", async (_event, config: McpConfig) => {
       onRefocusMainWindow: refocusMainWindow,
       onStartupProgress: (step) => mainWindow?.webContents?.send("startup-progress", step),
       onSendMessageToRoot: (content) => mainWindow?.webContents?.send("agent-message", content),
-      onSendMessage: (busId) => {
-        if (currentTargetBusIdForRun && busId === currentTargetBusIdForRun) sentToTargetBusDuringRun = true;
-      },
       onSendMessageToTelegram: async (busId, content) => {
         const peerId = parseInt(busId.replace("telegram-", ""), 10);
         if (!isNaN(peerId)) await telegramSendText(peerId, content);
-      },
-      onOpenExternal: async (url) => {
-        await shell.openExternal(url);
       },
       onCaldavEventDeleted: (eventUid, busId) => {
         mainWindow?.webContents?.send("caldav-event-deleted", { eventUid, busId });
@@ -790,7 +644,7 @@ ipcMain.handle("start-chat", async (_event, config: McpConfig) => {
         if (isTelegramConnected()) {
           const buses = listBuses().filter((b) => b.bus_id.startsWith("telegram-"));
           const instruction =
-            "If you need more context for a bus, call get_bus_history(bus_id, assessment, clarification, limit, offset). offset=0 = last N; offset<0 = from end.";
+            "If you need more context for a bus, call bus.get_history(bus_id, assessment, clarification, limit, offset). offset=0 = last N; offset<0 = from end.";
           const missed = await telegramFetchMissedMessages({ deliverToModel: false });
           return { ok: true, buses, instruction, missedMessages: missed };
         }
@@ -808,7 +662,7 @@ ipcMain.handle("start-chat", async (_event, config: McpConfig) => {
           });
           const buses = listBuses().filter((b) => b.bus_id.startsWith("telegram-"));
           const instruction =
-            "If you need more context for a bus, call get_bus_history(bus_id, assessment, clarification, limit, offset). offset=0 = last N; offset<0 = from end.";
+            "If you need more context for a bus, call bus.get_history(bus_id, assessment, clarification, limit, offset). offset=0 = last N; offset<0 = from end.";
           const missed = await telegramFetchMissedMessages({ deliverToModel: false });
           return {
             ok: true,
@@ -825,16 +679,48 @@ ipcMain.handle("start-chat", async (_event, config: McpConfig) => {
       },
       appConfig: {
         userName: config.userName ?? "",
+        telegramApiId: TELEGRAM_APP_ID,
+        telegramApiHash: TELEGRAM_APP_HASH,
         caldavGoogleClientId: CALDAV_GOOGLE_CLIENT_ID,
         caldavGoogleClientSecret: CALDAV_GOOGLE_CLIENT_SECRET,
       },
-    });
+    };
+    setDirectToolsConfig(mcpConfig);
+    mcpHttpServer = await startEvalMcpServer(mcpConfig);
 
-    const mcpPort = getMcpServerPort(mcpHttpServer);
+    const mcpPort = getEvalServerPort(mcpHttpServer);
     mainWindow?.webContents?.send("startup-progress", "Starting agent...");
     const modelName =
       config.aiProvider === "claude" ? config.claudeModel : config.openrouterModel;
     recipeStore.setModel(modelName);
+
+    const routeCallbacksBase = {
+      onSendMessageToRoot: () => { /* display via stream */ },
+      onSendMessageToTelegram: async (busId: string, content: string) => {
+        const peerId = parseInt(busId.replace("telegram-", ""), 10);
+        if (!isNaN(peerId)) await telegramSendText(peerId, content);
+      },
+      onAskUserRequest: (info: { clarification: string; assessment: string; attempt: number }) => {
+        refocusMainWindow();
+        mainWindow?.webContents?.send("ask-user-popup", info);
+      },
+      onAskUserTimeout: () => mainWindow?.webContents?.send("ask-user-popup-close"),
+      getCalendarUrlForBusId: caldavGetCalendarUrlForBusId,
+    };
+    setRouteCallbacksForEval(routeCallbacksBase);
+
+    const MSG_START = "<<<MSG>>>";
+    const MSG_END = "<<<END>>>";
+    setOnRouteParsedMessages(async (messages, emitChunk, opts) => {
+      const callbacks = { ...routeCallbacksBase };
+      const nonWait = messages.filter((m) => !m.waitForAnswer);
+      const wait = messages.filter((m) => m.waitForAnswer);
+      for (const msg of [...nonWait, ...wait]) {
+        const displayContent = msg.busId === ROOT_BUS_ID ? msg.content : `[${msg.busId}] ${msg.content}`;
+        emitChunk(MSG_START + JSON.stringify({ type: "send_message", content: displayContent }) + MSG_END);
+        if (!opts?.skipRoute) await routeMessage(msg, callbacks);
+      }
+    });
 
     await startAgent({
       mcpPort,
@@ -843,9 +729,9 @@ ipcMain.handle("start-chat", async (_event, config: McpConfig) => {
       claudeModel: config.claudeModel,
       openrouterApiKey: config.openrouterApiKey,
       openrouterModel: config.openrouterModel,
+      codexModel: config.codexModel ?? "gpt-5.4-codex",
     });
     setOnAssessmentClarification((busId, assessment, clarification) => {
-      if (recipeStore.getTaskBusId() !== busId) return;
       if (getBusTrustLevel(busId) !== "root") return;
       if (!busId.startsWith("telegram-")) return;
       const parts: string[] = [];
@@ -859,8 +745,10 @@ ipcMain.handle("start-chat", async (_event, config: McpConfig) => {
 
     recipeStore.setSessionTag(randomBytes(16).toString("hex"));
 
-    runStartupTask();
-    runDueSchedules();
+    if (!config.skipInitialTask) {
+      runStartupTask();
+      runDueSchedules();
+    }
     if (scheduleIntervalHandle) clearInterval(scheduleIntervalHandle);
     scheduleIntervalHandle = setInterval(runDueSchedules, 60_000);
 
@@ -883,8 +771,9 @@ ipcMain.handle("stop-chat", async () => {
     clearInterval(scheduleIntervalHandle);
     scheduleIntervalHandle = null;
   }
+  stopYaaiaVm();
+  stopOllama();
   stopMcpServer();
-  await stopChromeMcp();
   await stopKbMcp();
   await stopFsMcp();
   await stopMailClient();
@@ -893,6 +782,7 @@ ipcMain.handle("stop-chat", async () => {
   setOnTelegramMessage(null);
   setOnMailMessage(null);
   setOnAssessmentClarification(null);
+  setRouteCallbacksForEval(null);
   recipeStore.clearSessionTag();
   clearAgentInjectedQueue();
   busesDeliveredSinceRootWipe.clear();
@@ -922,16 +812,77 @@ async function handleAgentSendMessage(
   busId?: string
 ): Promise<string> {
   const cfg = loadConfig();
-    let targetBusId = busId ?? ROOT_BUS_ID;
-    let userMsg: string;
+  let targetBusId = busId ?? ROOT_BUS_ID;
+  let userMsg: string;
 
-    if (typeof message === "string" && message.startsWith("[QUEUED]\n")) {
-      targetBusId = ROOT_BUS_ID;
-      const lines = message.slice(9).split("\n").filter((l) => l.trim());
-      const parts: string[] = [];
-      const readableLines: string[] = [];
-      for (const line of lines) {
-        try {
+  if (typeof message === "string" && message.startsWith("[QUEUED]\n")) {
+    targetBusId = ROOT_BUS_ID;
+    const lines = message.slice(9).split("\n");
+    const parts: string[] = [];
+    const readableLines: string[] = [];
+    let currentEntry: {
+      busId: string;
+      content: string[];
+      user_id: number;
+      user_name: string;
+      timestamp: string;
+      mail_uid?: number;
+      event_uid?: string;
+    } | null = null;
+
+    const flushEntry = () => {
+      if (!currentEntry) return;
+      const content = currentEntry.content.join("\n").trim();
+      if (!content) {
+        currentEntry = null;
+        return;
+      }
+      const { busId: busIdForAppend, user_id, user_name, timestamp, mail_uid, event_uid } = currentEntry;
+      const busMsg = {
+        role: "user" as const,
+        content,
+        user_id,
+        user_name,
+        bus_id: busIdForAppend,
+        timestamp,
+        ...(mail_uid !== undefined && { mail_uid }),
+        ...(event_uid && { event_uid }),
+      };
+      if (busIdForAppend === ROOT_BUS_ID) {
+        const rootId = getRootUserIdentifier();
+        appendToBusHistory(ROOT_BUS_ID, { ...busMsg, bus_id: ROOT_BUS_ID, from_identifier: rootId });
+      } else {
+        ensureBus(
+          busIdForAppend,
+          busIdForAppend.startsWith("telegram-")
+            ? `Telegram: ${user_name}`
+            : busIdForAppend.startsWith("email-")
+              ? `Email: ${user_name}`
+              : busIdForAppend.startsWith("caldav-")
+                ? `Calendar: ${busIdForAppend}`
+                : busIdForAppend
+        );
+        const last = getBusHistorySlice(busIdForAppend, 1, 0)[0];
+        const alreadyAppended = last?.role === "user" && last?.content === content;
+        if (!alreadyAppended) appendToBusHistory(busIdForAppend, busMsg);
+      }
+      parts.push(`${busIdForAppend}:${content}`);
+      const label =
+        busIdForAppend.startsWith("telegram-")
+          ? `Telegram (${user_name})`
+          : busIdForAppend.startsWith("email-")
+            ? `Email (${user_name})`
+            : busIdForAppend.startsWith("caldav-")
+              ? `Calendar (${busIdForAppend})`
+              : "Desktop";
+      readableLines.push(`[${label}]: ${content}`);
+      currentEntry = null;
+    };
+
+    for (const line of lines) {
+      try {
+        if (line.startsWith("{")) {
+          flushEntry();
           const parsed = JSON.parse(line) as {
             content?: string;
             user_id?: number;
@@ -941,195 +892,163 @@ async function handleAgentSendMessage(
             mail_uid?: number;
             event_uid?: string;
           };
-          const busIdForAppend = parsed.bus_id && parsed.bus_id !== ROOT_BUS_ID ? parsed.bus_id : ROOT_BUS_ID;
+          const busIdForAppend =
+            parsed.bus_id && parsed.bus_id !== ROOT_BUS_ID && isValidBusIdFormat(parsed.bus_id)
+              ? parsed.bus_id
+              : ROOT_BUS_ID;
           const content = parsed.content ?? line;
-          const busMsg = {
-            role: "user" as const,
-            content,
+          currentEntry = {
+            busId: busIdForAppend,
+            content: [content],
             user_id: parsed.user_id ?? 0,
             user_name: parsed.user_name ?? cfg.userName ?? "",
-            bus_id: busIdForAppend,
             timestamp: parsed.timestamp ?? new Date().toISOString(),
-            ...(parsed.mail_uid !== undefined && { mail_uid: parsed.mail_uid }),
-            ...(parsed.event_uid && { event_uid: parsed.event_uid }),
+            mail_uid: parsed.mail_uid,
+            event_uid: parsed.event_uid,
           };
-          /* Append all queued messages to their buses so they appear in get_bus_history tool results.
-           * For non-root: avoid duplicate if last message in bus already matches (delivery callback may have appended). */
-          if (busIdForAppend === ROOT_BUS_ID) {
-            appendToBusHistory(ROOT_BUS_ID, { ...busMsg, bus_id: ROOT_BUS_ID });
+          flushEntry();
+          continue;
+        }
+        const colonIdx = line.indexOf(":");
+        if (colonIdx > 0) {
+          const maybeBusId = line.slice(0, colonIdx).trim();
+          if (isValidBusIdFormat(maybeBusId)) {
+            flushEntry();
+            currentEntry = {
+              busId: maybeBusId,
+              content: [line.slice(colonIdx + 1).trimStart()],
+              user_id: 0,
+              user_name: cfg.userName ?? "",
+              timestamp: new Date().toISOString(),
+            };
+          } else if (currentEntry) {
+            currentEntry.content.push(line);
           } else {
-            ensureBus(
-              busIdForAppend,
-              busIdForAppend.startsWith("telegram-")
-                ? `Telegram: ${parsed.user_name ?? ""}`
-                : busIdForAppend.startsWith("email-")
-                  ? `Email: ${parsed.user_name ?? ""}`
-                  : busIdForAppend.startsWith("caldav-")
-                    ? `Calendar: ${busIdForAppend}`
-                    : busIdForAppend
-            );
-            const last = getBusHistorySlice(busIdForAppend, 1, 0)[0];
-            const alreadyAppended = last?.role === "user" && last?.content === content;
-            if (!alreadyAppended) {
-              appendToBusHistory(busIdForAppend, busMsg);
-            }
+            currentEntry = {
+              busId: ROOT_BUS_ID,
+              content: [line],
+              user_id: 0,
+              user_name: cfg.userName ?? "",
+              timestamp: new Date().toISOString(),
+            };
+            flushEntry();
           }
-          parts.push(line);
-          const label =
-            busIdForAppend.startsWith("telegram-")
-              ? `Telegram (${parsed.user_name ?? ""})`
-              : busIdForAppend.startsWith("email-")
-                ? `Email (${parsed.user_name ?? ""})`
-                : busIdForAppend.startsWith("caldav-")
-                  ? `Calendar (${busIdForAppend})`
-                  : "Desktop";
-          readableLines.push(`[${label}]: ${content}`);
-        } catch {
-          /* skip malformed line */
-        }
-      }
-      userMsg =
-        readableLines.length > 0
-          ? `New messages received while you were busy:\n\n${readableLines.join("\n\n")}`
-          : "[QUEUED]\n" + parts.join("\n");
-    } else {
-      if (targetBusId === ROOT_BUS_ID) {
-        let parsed: { content?: string; user_id?: number; user_name?: string; bus_id?: string } | null = null;
-        if (typeof message === "string" && message.startsWith("{")) {
-          try {
-            parsed = JSON.parse(message);
-          } catch {
-            /* fall through */
-          }
-        }
-        const content = parsed?.content ?? message;
-        const user_name = parsed?.user_name ?? cfg.userName ?? "";
-        const user_id = parsed?.user_id ?? 0;
-        const bus_id = parsed?.bus_id && parsed.bus_id !== ROOT_BUS_ID ? parsed.bus_id : undefined;
-        appendToBusHistory(ROOT_BUS_ID, {
-          role: "user",
-          content,
-          user_id,
-          user_name,
-          ...(bus_id && { bus_id }),
-        });
-      }
-      userMsg =
-        typeof message === "string" && message.startsWith("{")
-          ? message
-          : JSON.stringify({
-            bus_id: ROOT_BUS_ID,
+        } else if (currentEntry) {
+          currentEntry.content.push(line);
+        } else if (line.trim()) {
+          currentEntry = {
+            busId: ROOT_BUS_ID,
+            content: [line],
             user_id: 0,
             user_name: cfg.userName ?? "",
-            content: message,
-          });
-    }
-    const tag = recipeStore.getSessionTag();
-    const { messages: busHistory, trimmedCount } = getRootLogForModel();
-    const history: { role: "user" | "assistant"; content: string; wrap?: boolean }[] = busHistory.map((m) => {
-      const busId = m.bus_id ?? ROOT_BUS_ID;
-      const wrap = getBusTrustLevel(busId) === "root" && !!tag;
-      if (m.role === "user") {
-        return {
-          role: "user" as const,
-          content: JSON.stringify({
-            bus_id: busId,
-            user_id: m.user_id ?? 0,
-            user_name: m.user_name ?? "",
-            content: m.content,
-          }),
-          wrap,
-        };
+            timestamp: new Date().toISOString(),
+          };
+          flushEntry();
+        }
+      } catch {
+        /* skip malformed line */
       }
-      return { role: "assistant" as const, content: m.content, wrap };
-    });
-    recipeStore.setInitialPrompt(message);
-    if (targetBusId !== ROOT_BUS_ID) {
-      currentTargetBusIdForRun = targetBusId;
-      sentToTargetBusDuringRun = false;
-    } else {
-      currentTargetBusIdForRun = null;
     }
-    const doSend = async () =>
-      sendMessage(
-        userMsg,
-        (chunk) => event.sender.send("agent-stream-chunk", String(chunk ?? "")),
-        history,
-        targetBusId,
-        trimmedCount
-      );
-
-    let result: { text: string };
-    try {
-      result = await doSend();
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (
-        msg.includes("Session not found") &&
-        mcpHttpServer &&
-        !mainWindow?.isDestroyed()
-      ) {
+    flushEntry();
+    userMsg =
+      readableLines.length > 0
+        ? `New messages received while you were busy:\n\n${readableLines.join("\n\n")}`
+        : "[QUEUED]\n" + parts.join("\n");
+  } else {
+    let content = message;
+    if (targetBusId === ROOT_BUS_ID) {
+      let parsed: { content?: string; user_id?: number; user_name?: string; bus_id?: string } | null = null;
+      if (typeof message === "string" && message.startsWith("{")) {
         try {
-          const cfg = loadConfig();
-          const mcpPort = getMcpServerPort(mcpHttpServer);
-          await startAgent({
-            mcpPort,
-            aiProvider: cfg.aiProvider ?? "claude",
-            claudeApiKey: cfg.claudeApiKey ?? "",
-            claudeModel: cfg.claudeModel ?? "claude-sonnet-4-6",
-            openrouterApiKey: cfg.openrouterApiKey ?? "",
-            openrouterModel: cfg.openrouterModel ?? "google/gemini-2.5-flash",
-          });
-          console.log("[YAAIA] Reconnected agent after session loss");
-          result = await doSend();
-        } catch (retryErr) {
-          const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr);
-          throw new Error(`Session lost. Please exit and restart the chat. (${retryMsg})`);
+          parsed = JSON.parse(message);
+        } catch {
+          /* fall through */
         }
-      } else {
-        throw new Error(msg);
       }
+      content = parsed?.content ?? message;
+      const user_name = parsed?.user_name ?? cfg.userName ?? "";
+      const user_id = parsed?.user_id ?? 0;
+      const parsedBusId = parsed?.bus_id && parsed.bus_id !== ROOT_BUS_ID ? parsed.bus_id : undefined;
+      const bus_id = parsedBusId && isValidBusIdFormat(parsedBusId) ? parsedBusId : undefined;
+      const rootId = getRootUserIdentifier();
+      appendToBusHistory(ROOT_BUS_ID, {
+        role: "user",
+        content,
+        user_id,
+        user_name,
+        from_identifier: rootId,
+        ...(bus_id && { bus_id }),
+      });
     }
+    userMsg = `${targetBusId}:${content}`;
+  }
+  const tag = recipeStore.getSessionTag();
+  const { messages: busHistory, trimmedCount } = getRootLogForModelWithMessageLimit(30);
+  const history: { role: "user" | "assistant"; content: string; wrap?: boolean }[] = busHistory.map((m) => {
+    const busId = m.bus_id ?? ROOT_BUS_ID;
+    const wrap = getBusTrustLevel(busId) === "root" && !!tag;
+    const prefixContent = `${busId}:${m.content}`;
+    return { role: m.role as "user" | "assistant", content: prefixContent, wrap };
+  });
+  recipeStore.setInitialPrompt(message);
+  if (targetBusId !== ROOT_BUS_ID) {
+    currentTargetBusIdForRun = targetBusId;
+  } else {
+    currentTargetBusIdForRun = null;
+  }
+  const doSend = async () =>
+    sendMessage(
+      userMsg,
+      (chunk) => event.sender.send("agent-stream-chunk", String(chunk ?? "")),
+      history,
+      targetBusId,
+      trimmedCount
+    );
 
-    try {
-      const finalizeInfo = recipeStore.completeFinalizeWithReport(result.text ?? "");
-      if (finalizeInfo) {
-        mainWindow?.webContents?.send("finalize-task-popup", finalizeInfo);
+  let result: { text: string };
+  try {
+    result = await doSend();
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (
+      msg.includes("Session not found") &&
+      mcpHttpServer &&
+      !mainWindow?.isDestroyed()
+    ) {
+      try {
+        const cfg = loadConfig();
+        const mcpPort = getEvalServerPort(mcpHttpServer);
+        await startAgent({
+          mcpPort,
+          aiProvider: cfg.aiProvider ?? "claude",
+          claudeApiKey: cfg.claudeApiKey ?? "",
+          claudeModel: cfg.claudeModel ?? "claude-sonnet-4-6",
+          openrouterApiKey: cfg.openrouterApiKey ?? "",
+          openrouterModel: cfg.openrouterModel ?? "google/gemini-2.5-flash",
+          codexModel: cfg.codexModel ?? "gpt-5.4-codex",
+        });
+        console.log("[YAAIA] Reconnected agent after session loss");
+        result = await doSend();
+      } catch (retryErr) {
+        const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr);
+        throw new Error(`Session lost. Please exit and restart the chat. (${retryMsg})`);
       }
-      const fallbackText = result.text?.trim();
-      if (targetBusId === ROOT_BUS_ID && fallbackText) {
-        const rootOnly = getRootBusHistoryOnly();
-        const lastAssistant = [...rootOnly].reverse().find((m) => m.role === "assistant");
-        if (lastAssistant?.content !== fallbackText) {
-          appendToBusHistory(ROOT_BUS_ID, { role: "assistant", content: fallbackText });
-        }
-      }
-      if (
-        targetBusId !== ROOT_BUS_ID &&
-        !sentToTargetBusDuringRun &&
-        fallbackText &&
-        fallbackText !== "Done." &&
-        fallbackText !== "Stopped by user."
-      ) {
-        const peerId = parseInt(targetBusId.replace("telegram-", ""), 10);
-        if (!isNaN(peerId)) {
-          try {
-            await telegramSendText(peerId, fallbackText);
-            appendToBusHistory(targetBusId, { role: "assistant", content: fallbackText });
-          } catch (err) {
-            console.warn("[YAAIA] Fallback send to Telegram failed:", err);
-          }
-        }
-      }
-      ensureHistoryCollection()
-        .then(() => runQmdCli(["update"]))
-        .then(() => runQmdCli(["embed"]))
-        .catch((err) => console.warn("[YAAIA] History index update failed:", err));
-      return safeForIPC(String(result.text ?? ""));
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
+    } else {
       throw new Error(msg);
     }
+  }
+
+  try {
+    const finalizeInfo = recipeStore.completeFinalizeWithReport(result.text ?? "");
+    if (finalizeInfo) {
+      mainWindow?.webContents?.send("finalize-task-popup", finalizeInfo);
+    }
+    ensureHistoryCollection();
+    return safeForIPC(String(result.text ?? ""));
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(msg);
+  }
 }
 
 ipcMain.handle("agent-abort", () => {
@@ -1152,7 +1071,41 @@ ipcMain.handle("finalize-task-reply", (_, isSuccess: boolean) => {
   return undefined;
 });
 
-ipcMain.handle("get-config", () => safeForIPC(loadConfig()));
+ipcMain.handle("get-config", () =>
+  safeForIPC({ ...loadConfig(), rootUserIdentifierDefined: getRootUserIdentifier() !== "user" })
+);
+
+ipcMain.handle("codex-auth-status", () =>
+  safeForIPC({ authenticated: !!loadCodexAuth()?.access })
+);
+
+ipcMain.handle("codex-login", async () => {
+  try {
+    const { url, state, verifier } = createAuthorizationFlow();
+    const server = await startCodexOAuthServer();
+    await shell.openExternal(url);
+    const result = await server.waitForCode(state);
+    server.close();
+    if (!result) {
+      return safeForIPC({ ok: false, error: "Login timed out or was cancelled." });
+    }
+    const exchange = await exchangeAuthorizationCode(result.code, verifier);
+    if (!exchange.ok) {
+      return safeForIPC({ ok: false, error: exchange.error });
+    }
+    return safeForIPC({ ok: true });
+  } catch (err) {
+    return safeForIPC({
+      ok: false,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+});
+
+ipcMain.handle("codex-logout", () => {
+  clearCodexAuth();
+  return undefined;
+});
 
 let pendingTelegramLoginResolve: ((value: string) => void) | null = null;
 ipcMain.handle("telegram-login-reply", (_event, value: string) => {
@@ -1169,69 +1122,87 @@ ipcMain.handle("open-external", async (_event, url: string) => {
   }
 });
 
-ipcMain.handle("secrets-list-full", () => safeForIPC(secretsListFull()));
+ipcMain.handle("open-storage-folder", async () => {
+  const storageDir = join(YAAIA_DIR, "storage");
+  mkdirSync(storageDir, { recursive: true });
+  await shell.openPath(storageDir);
+});
+
+ipcMain.handle("passwords-list-full", () => safeForIPC(passwordsListFull()));
 ipcMain.handle(
-  "secrets-set",
+  "passwords-set",
   (
     _,
     args: {
-      detailed_description: string;
-      first_factor: string;
-      first_factor_type: string;
+      description: string;
+      type: "string" | "totp";
       value: string;
-      totp_secret?: string;
       force?: boolean;
+      uuid?: string;
     }
   ) => {
     try {
-      validateSecretsDesc(args.detailed_description);
-      return secretsSet(
-        args.detailed_description,
-        args.first_factor,
-        args.first_factor_type,
+      return passwordsSet(
+        args.description,
+        args.type,
         args.value,
         args.force ?? false,
-        args.totp_secret
+        args.uuid
       );
     } catch (err) {
       throw err instanceof Error ? err : new Error(String(err));
     }
   }
 );
-ipcMain.handle("secrets-delete", (_, id: string) => {
-  secretsDelete(id);
+ipcMain.handle("passwords-delete", (_, id: string) => {
+  passwordsDelete(id);
   return undefined;
 });
-ipcMain.handle("wipe-secrets", () => {
-  secretsWipe();
+ipcMain.handle("wipe-passwords", () => {
+  passwordsWipe();
   return undefined;
 });
 
-ipcMain.handle("agent-config-list", () => safeForIPC(agentConfigList()));
+ipcMain.handle("identity-list", () => safeForIPC(identityList()));
+ipcMain.handle("identity-get", (_, idOrIdentifier: string) => safeForIPC(identityGet(idOrIdentifier)));
 ipcMain.handle(
-  "agent-config-set",
+  "identity-create",
   (
     _,
-    args: {
-      detailed_description: string;
-      value: string;
-      force?: boolean;
-    }
+    args: { name: string; identifier: string; trust_level?: "root" | "normal"; bus_ids?: string[] }
   ) => {
     try {
-      validateConfigDesc(args.detailed_description);
-      return agentConfigSet(args.detailed_description, args.value, args.force ?? false);
+      return identityCreate(args);
     } catch (err) {
       throw err instanceof Error ? err : new Error(String(err));
     }
   }
 );
-ipcMain.handle("agent-config-delete", (_, id: string) => {
-  agentConfigDelete(id);
-  return undefined;
+ipcMain.handle(
+  "identity-update",
+  (
+    _,
+    idOrIdentifier: string,
+    args: { name?: string; identifier?: string; trust_level?: "root" | "normal"; bus_ids?: string[] }
+  ) => {
+    try {
+      identityUpdate(idOrIdentifier, args);
+      return undefined;
+    } catch (err) {
+      throw err instanceof Error ? err : new Error(String(err));
+    }
+  }
+);
+ipcMain.handle("identity-delete", (_, idOrIdentifier: string) => {
+  try {
+    identityDelete(idOrIdentifier);
+    return undefined;
+  } catch (err) {
+    throw err instanceof Error ? err : new Error(String(err));
+  }
 });
-ipcMain.handle("wipe-configs", () => {
-  agentConfigWipe();
+ipcMain.handle("identity-set-note", (_, identifier: string, content: string) => {
+  identitySetNote(identifier, content);
   return undefined;
 });
 
@@ -1245,41 +1216,20 @@ ipcMain.handle("message-bus-delete", async (_, busId: string) => {
   return undefined;
 });
 ipcMain.handle("message-bus-get-history", (_, busId: string) => safeForIPC(getBusHistory(busId)));
+ipcMain.handle(
+  "message-bus-get-history-slice",
+  (_, busId: string, limit: number, offset: number) => {
+    if (busId === ROOT_BUS_ID) {
+      return safeForIPC(getRootHistorySliceWithTotal(limit, offset));
+    }
+    const messages = getBusHistorySlice(busId, limit, offset);
+    return safeForIPC({ messages, total: messages.length });
+  }
+);
 ipcMain.handle("message-bus-wipe-root", () => {
   wipeRootHistory();
   busesDeliveredSinceRootWipe.clear();
   return undefined;
-});
-
-ipcMain.handle("kb-list", (_, path: string, recursive: boolean) =>
-  safeForIPC(kbList(path ?? ".", recursive ?? true))
-);
-ipcMain.handle("kb-read", (_, path: string) => {
-  try {
-    return kbRead(path);
-  } catch (err) {
-    throw err instanceof Error ? err : new Error(String(err));
-  }
-});
-ipcMain.handle("kb-write", async (_, path: string, content: string) => {
-  try {
-    kbWrite(path, content);
-    await runQmdCli(["update"]);
-    await runQmdCli(["embed"]);
-    return undefined;
-  } catch (err) {
-    throw err instanceof Error ? err : new Error(String(err));
-  }
-});
-ipcMain.handle("kb-delete", async (_, path: string) => {
-  try {
-    kbDelete(path);
-    await runQmdCli(["update"]);
-    await runQmdCli(["embed"]);
-    return undefined;
-  } catch (err) {
-    throw err instanceof Error ? err : new Error(String(err));
-  }
 });
 
 ipcMain.handle("schedule-list", () => safeForIPC(listSchedules()));
@@ -1297,6 +1247,43 @@ ipcMain.handle("schedule-update", (_, id: string, props: { at?: string; title?: 
   return safeForIPC(updated);
 });
 ipcMain.handle("schedule-delete", (_, id: string) => safeForIPC(deleteSchedule(id)));
+
+ipcMain.handle("vm-list", async () => safeForIPC(await listVms()));
+ipcMain.handle(
+  "vm-create",
+  async (_event, options?: CreateVmOptions) => safeForIPC(await createVm(options))
+);
+ipcMain.handle("vm-start", async (_event, vmId: string) => safeForIPC(await startVm(vmId)));
+ipcMain.handle("vm-stop", async (_event, vmId: string) => safeForIPC(await stopVm(vmId)));
+ipcMain.handle("vm-delete", async (_event, vmId: string) => safeForIPC(await deleteVm(vmId)));
+ipcMain.handle("vm-show-console", async (_event, vmId: string) =>
+  safeForIPC(await showConsoleVm(vmId))
+);
+ipcMain.handle("vm-pick-iso", async () => {
+  const result = await dialog.showOpenDialog(mainWindow!, {
+    title: "Select Linux ISO",
+    filters: [{ name: "ISO images", extensions: ["iso"] }],
+    properties: ["openFile"],
+  });
+  if (result.canceled || result.filePaths.length === 0) return { ok: false, path: null };
+  return { ok: true, path: result.filePaths[0] };
+});
+
+ipcMain.handle("vm-open-serial-console", async () => {
+  const vms = await listVms();
+  const running = vms.find((v) => v.status === "running");
+  if (!running) return { ok: false, error: "No VM running" };
+  let port = await getVmSerialPort(running.id);
+  if (port == null) port = getVmSerialPortFromFile(running.id);
+  if (port == null) return { ok: false, error: "Serial bridge not available. Restart the VM to enable it." };
+  return new Promise((resolve) => {
+    const cmd = `osascript -e 'tell application "Terminal" to do script "nc localhost ${port}"'`;
+    exec(cmd, (err) => {
+      if (err) resolve({ ok: false, error: err.message });
+      else resolve({ ok: true });
+    });
+  });
+});
 
 const RECIPE_PORT = 17892;
 let recipeServer: ReturnType<typeof createServer> | null = null;
@@ -1380,25 +1367,37 @@ ipcMain.handle("recipe-load", async () => {
 
 ipcMain.handle("agent-queue-message", (_, msg: string) => {
   addToAgentInjectedQueue(msg);
-  /* Append to history so message appears in refreshMessagesFromRoot and get_bus_history */
-  let parsed: { content?: string; user_id?: number; user_name?: string; bus_id?: string } | null = null;
-  if (typeof msg === "string" && msg.startsWith("{")) {
+  let content = msg;
+  let bus_id = ROOT_BUS_ID;
+  let user_name = loadConfig().userName ?? "";
+  let user_id = 0;
+  if (msg.startsWith("{")) {
     try {
-      parsed = JSON.parse(msg);
+      const parsed = JSON.parse(msg) as { content?: string; user_id?: number; user_name?: string; bus_id?: string };
+      content = parsed.content ?? msg;
+      const parsedBusId = parsed.bus_id && parsed.bus_id !== ROOT_BUS_ID ? parsed.bus_id : ROOT_BUS_ID;
+      bus_id = isValidBusIdFormat(parsedBusId) ? parsedBusId : ROOT_BUS_ID;
+      user_name = parsed.user_name ?? user_name;
+      user_id = parsed.user_id ?? 0;
     } catch {
       /* ignore */
     }
+  } else {
+    const colonIdx = msg.indexOf(":");
+    if (colonIdx > 0) {
+      const maybeBusId = msg.slice(0, colonIdx).trim();
+      bus_id = isValidBusIdFormat(maybeBusId) ? maybeBusId : ROOT_BUS_ID;
+      content = msg.slice(colonIdx + 1).trim();
+    }
   }
-  const content = parsed?.content ?? msg;
-  const user_name = parsed?.user_name ?? loadConfig().userName ?? "";
-  const user_id = parsed?.user_id ?? 0;
-  const bus_id = parsed?.bus_id && parsed.bus_id !== ROOT_BUS_ID ? parsed.bus_id : undefined;
-  appendToBusHistory(ROOT_BUS_ID, {
+  const rootId = getRootUserIdentifier();
+  appendToBusHistory(bus_id === ROOT_BUS_ID ? ROOT_BUS_ID : bus_id, {
     role: "user",
     content,
     user_id,
     user_name,
-    ...(bus_id && { bus_id }),
+    ...(bus_id === ROOT_BUS_ID && { from_identifier: rootId }),
+    ...(bus_id !== ROOT_BUS_ID && { bus_id }),
   });
   return undefined;
 });
@@ -1406,27 +1405,38 @@ ipcMain.handle("agent-queue-message", (_, msg: string) => {
 ipcMain.handle("agent-inject-message", (_, msg: string, placeAfterAskUser?: boolean) => {
   recipeStore.appendUserInjection(msg, placeAfterAskUser ?? false);
   setPendingInjectMessage(msg);
-  let parsed: { content?: string; user_id?: number; user_name?: string; bus_id?: string } | null = null;
-  if (typeof msg === "string" && msg.startsWith("{")) {
+  let content = msg;
+  let busId = ROOT_BUS_ID;
+  let user_name = loadConfig().userName ?? "";
+  let user_id = 0;
+  if (msg.startsWith("{")) {
     try {
-      parsed = JSON.parse(msg);
+      const parsed = JSON.parse(msg) as { content?: string; user_id?: number; user_name?: string; bus_id?: string };
+      content = parsed.content ?? msg;
+      const parsedBusId = parsed.bus_id && parsed.bus_id !== ROOT_BUS_ID ? parsed.bus_id : ROOT_BUS_ID;
+      busId = isValidBusIdFormat(parsedBusId) ? parsedBusId : ROOT_BUS_ID;
+      user_name = parsed.user_name ?? user_name;
+      user_id = parsed.user_id ?? 0;
     } catch {
       /* ignore */
     }
+  } else {
+    const colonIdx = msg.indexOf(":");
+    if (colonIdx > 0) {
+      const maybeBusId = msg.slice(0, colonIdx).trim();
+      busId = isValidBusIdFormat(maybeBusId) ? maybeBusId : ROOT_BUS_ID;
+      content = msg.slice(colonIdx + 1).trim();
+    }
   }
-  const busId = parsed?.bus_id;
-  if (busId?.startsWith("telegram-")) {
-    return undefined;
-  }
-  const content = parsed?.content ?? msg;
-  const user_name = parsed?.user_name ?? loadConfig().userName ?? "";
-  const user_id = parsed?.user_id ?? 0;
-  appendToBusHistory(busId === "root" || !busId ? ROOT_BUS_ID : busId, {
+  if (busId.startsWith("telegram-")) return undefined;
+  const rootId = getRootUserIdentifier();
+  appendToBusHistory(busId === ROOT_BUS_ID ? ROOT_BUS_ID : busId, {
     role: "user",
     content,
     user_id,
     user_name,
-    ...(busId && busId !== "root" && { bus_id: busId }),
+    ...(busId === ROOT_BUS_ID && { from_identifier: rootId }),
+    ...(busId !== ROOT_BUS_ID && { bus_id: busId }),
   });
   return undefined;
 });

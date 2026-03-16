@@ -13,11 +13,26 @@ import { pipeline } from "node:stream/promises";
 import { Readable } from "node:stream";
 
 const YAAIA_DIR = join(homedir(), "yaaia");
-const DOWNLOADS_DIR = join(YAAIA_DIR, "downloads");
+const SHARED_DIR = join(YAAIA_DIR, "storage", "shared");
 const INBOX = "INBOX";
 
 function sanitizeAccountForBusId(user: string): string {
   return user.replace(/@/g, "-").replace(/\./g, "-");
+}
+
+/** Extract a human-readable message from imapflow errors (auth, server response, etc.). */
+export function formatImapError(err: unknown): string {
+  const e = err as Record<string, unknown> | undefined;
+  if (!e) return String(err);
+  // imapflow logs pass { err: {...} }; thrown errors may have props on err or e.err
+  const inner = (e.err as Record<string, unknown>) ?? e;
+  const responseText = (inner.responseText as string) ?? (e.responseText as string);
+  const response = (inner.response as string) ?? (e.response as string);
+  const serverResponseCode = (inner.serverResponseCode as string) ?? (e.serverResponseCode as string);
+  if (responseText) return responseText;
+  if (serverResponseCode) return `${serverResponseCode}: ${(response ?? inner.message ?? e.message) || "Unknown"}`;
+  if (response && typeof response === "string") return response.replace(/^\d+ (NO|BAD) /i, "").trim() || String(response);
+  return (e.message as string) ?? (inner.message as string) ?? String(err);
 }
 
 export type MailMessagePayload = {
@@ -28,6 +43,8 @@ export type MailMessagePayload = {
   timestamp?: string;
   /** IMAP UID for deletion on bus cleanup */
   mail_uid?: number;
+  /** Sender email for identity resolution */
+  sender_email?: string;
 };
 
 export type OnMailMessageCallback = (payload: MailMessagePayload, opts?: { deliverToModel?: boolean }) => void;
@@ -40,8 +57,22 @@ let onMailMessage: OnMailMessageCallback | null = null;
 let currentAccount: string | null = null;
 let reconnectTimeoutHandle: ReturnType<typeof setTimeout> | null = null;
 let idleAbortController: AbortController | null = null;
+let idleScheduled = false;
+let idleInProgress = false;
 
 const RECONNECT_DELAY_MS = 5_000;
+
+/** Enable IMAP debug logging. Set YAAIA_IMAP_DEBUG=1 in env or pass true to mailConnect. */
+const IMAP_DEBUG = process.env.YAAIA_IMAP_DEBUG === "1" || process.env.YAAIA_IMAP_DEBUG === "true";
+
+const imapLogger = IMAP_DEBUG
+  ? {
+      debug: (obj: unknown) => console.log("[YAAIA IMAP debug]", typeof obj === "object" ? JSON.stringify(obj) : obj),
+      info: (obj: unknown) => console.info("[YAAIA IMAP info]", typeof obj === "object" ? JSON.stringify(obj) : obj),
+      warn: (obj: unknown) => console.warn("[YAAIA IMAP warn]", typeof obj === "object" ? JSON.stringify(obj) : obj),
+      error: (obj: unknown) => console.error("[YAAIA IMAP error]", typeof obj === "object" ? JSON.stringify(obj) : obj),
+    }
+  : false;
 
 export interface MailConnectParams {
   host: string;
@@ -123,7 +154,9 @@ export async function mailConnect(params: MailConnectParams): Promise<void> {
     secure,
     auth: { user, pass },
     socketTimeout: 10 * 60 * 1000,
-    logger: false,
+    logger: imapLogger,
+    logRaw: IMAP_DEBUG,
+    disableAutoIdle: true, // We manage IDLE manually; prevents conflict when running mail.list etc. while idling
   });
   client.on("error", (err: Error) => {
     console.error("[YAAIA Mail] IMAP error:", err.message);
@@ -158,6 +191,8 @@ export async function mailDisconnect(): Promise<void> {
   }
   storedParams = null;
   currentAccount = null;
+  idleScheduled = false;
+  idleInProgress = false;
   if (currentLock) {
     try {
       currentLock.release();
@@ -184,8 +219,9 @@ export async function mailDisconnect(): Promise<void> {
 /** Delete messages from INBOX by UID. Call when cleaning up an email bus. Requires mail to be connected. */
 export async function mailDeleteMessagesByUids(uids: number[]): Promise<void> {
   const c = client;
-  if (!c) throw new Error("Not connected. Call mail__connect first.");
+  if (!c) throw new Error("Not connected. Call mail.connect first.");
   if (uids.length === 0) return;
+  await pauseIdleForCommand();
   await c.mailboxOpen(INBOX, { readOnly: false });
   const lock = await c.getMailboxLock(INBOX);
   try {
@@ -198,7 +234,7 @@ export async function mailDeleteMessagesByUids(uids: number[]): Promise<void> {
 /** Open INBOX, fetch all or delta, populate bus, set up IDLE for new messages. Call after mailConnect. */
 export async function mailInitInboxAndWatch(account: string): Promise<{ busId: string; messageCount: number }> {
   const c = client;
-  if (!c) throw new Error("Not connected. Call mail__connect first.");
+  if (!c) throw new Error("Not connected. Call mail.connect first.");
   currentAccount = account;
   const busId = `email-${sanitizeAccountForBusId(account)}`;
   await c.mailboxOpen(INBOX, { readOnly: false });
@@ -219,6 +255,7 @@ export async function mailInitInboxAndWatch(account: string): Promise<{ busId: s
         for await (const m of messages) {
           list.push({ uid: m.uid, internalDate: m.internalDate, envelope: m.envelope as never, source: m.source });
         }
+        await c.messageFlagsAdd(uidList.join(","), ["\\Seen"], { uid: true });
         for (const m of list) {
           let body = "";
           const src = m.source;
@@ -227,7 +264,7 @@ export async function mailInitInboxAndWatch(account: string): Promise<{ busId: s
               const parsed = await simpleParser(typeof src === "string" ? src : Buffer.from(src));
               body = String(parsed.text ?? parsed.html ?? "");
             } catch {
-              body = String(src).slice(0, 100000);
+              body = String(src);
             }
           }
           const content = formatMessageContent(m.envelope, body);
@@ -236,7 +273,8 @@ export async function mailInitInboxAndWatch(account: string): Promise<{ busId: s
           const timestamp = id instanceof Date ? id.toISOString() : (typeof id === "string" ? new Date(id).toISOString() : (m.envelope?.date instanceof Date ? m.envelope.date.toISOString() : undefined));
           const from = m.envelope?.from?.[0];
           const userName = from ? (from.name ?? from.address ?? account) : account;
-          const payload: MailMessagePayload = { bus_id: busId, user_id: 0, user_name: userName, content, timestamp, mail_uid: m.uid };
+          const senderEmail = from?.address;
+          const payload: MailMessagePayload = { bus_id: busId, user_id: 0, user_name: userName, content, timestamp, mail_uid: m.uid, sender_email: senderEmail };
           /* deliverToModel: false — init fetch during connect. Messages go to bus history; agent can get_bus_history to see them. Only IDLE deliverToModel: true for live arrivals. */
           onMailMessage?.(payload, { deliverToModel: false });
           messageCount++;
@@ -253,6 +291,10 @@ export async function mailInitInboxAndWatch(account: string): Promise<{ busId: s
         for await (const m of messages) {
           list.push({ uid: m.uid, internalDate: m.internalDate, envelope: m.envelope as never, source: m.source });
         }
+        const uidList = list.map((m) => m.uid).filter((u): u is number => u != null);
+        if (uidList.length > 0) {
+          await c.messageFlagsAdd(uidList.join(","), ["\\Seen"], { uid: true });
+        }
         for (const m of list) {
           let body = "";
           const src = m.source;
@@ -261,7 +303,7 @@ export async function mailInitInboxAndWatch(account: string): Promise<{ busId: s
               const parsed = await simpleParser(typeof src === "string" ? src : Buffer.from(src));
               body = String(parsed.text ?? parsed.html ?? "");
             } catch {
-              body = String(src).slice(0, 100000);
+              body = String(src);
             }
           }
           const content = formatMessageContent(m.envelope, body);
@@ -270,7 +312,8 @@ export async function mailInitInboxAndWatch(account: string): Promise<{ busId: s
           const timestamp = id instanceof Date ? id.toISOString() : (typeof id === "string" ? new Date(id).toISOString() : (m.envelope?.date instanceof Date ? m.envelope.date.toISOString() : undefined));
           const from = m.envelope?.from?.[0];
           const userName = from ? (from.name ?? from.address ?? account) : account;
-          const payload: MailMessagePayload = { bus_id: busId, user_id: 0, user_name: userName, content, timestamp, mail_uid: m.uid };
+          const senderEmail = from?.address;
+          const payload: MailMessagePayload = { bus_id: busId, user_id: 0, user_name: userName, content, timestamp, mail_uid: m.uid, sender_email: senderEmail };
           onMailMessage?.(payload, { deliverToModel: false });
           messageCount++;
           if (date > maxDate) maxDate = date;
@@ -282,12 +325,24 @@ export async function mailInitInboxAndWatch(account: string): Promise<{ busId: s
     lock.release();
   }
 
+  const scheduleStartIdle = (): void => {
+    if (idleScheduled || !client || !currentAccount) return;
+    idleScheduled = true;
+    setTimeout(() => {
+      idleScheduled = false;
+      startIdle();
+    }, 1000);
+  };
+
   const startIdle = async (): Promise<void> => {
     if (!client || !currentAccount) return;
+    if (idleInProgress) return;
+    idleInProgress = true;
     try {
       await c.mailboxOpen(INBOX, { readOnly: false });
       lastOpenedMailbox = INBOX;
     } catch (err) {
+      idleInProgress = false;
       const msg = err instanceof Error ? err.message : String(err);
       console.warn("[YAAIA Mail] Failed to open INBOX for IDLE:", msg);
       const isConnectionError =
@@ -305,13 +360,14 @@ export async function mailInitInboxAndWatch(account: string): Promise<{ busId: s
         }
         scheduleReconnect();
       } else if (client && currentAccount) {
-        setTimeout(startIdle, 5000);
+        scheduleStartIdle();
       }
       return;
     }
     idleAbortController = new AbortController();
-    const handleExists = async (): Promise<void> => {
+    const handleExists = async (data: { path: string; count: number; prevCount: number }): Promise<void> => {
       if (!onMailMessage) return;
+      if (data.count <= data.prevCount) return;
       try {
         const unseenUids = await c.search({ seen: false }, { uid: true });
         const uidList = Array.isArray(unseenUids) ? unseenUids : [];
@@ -323,6 +379,10 @@ export async function mailInitInboxAndWatch(account: string): Promise<{ busId: s
           for await (const m of messages) {
             list.push({ uid: m.uid, internalDate: m.internalDate, envelope: m.envelope as never, source: m.source });
           }
+          // Mark as read before delivering so inbox shows read by the time user sees it
+          if (uidList.length > 0) {
+            await c.messageFlagsAdd(uidList.join(","), ["\\Seen"], { uid: true });
+          }
           for (const m of list) {
             let body = "";
             const src = m.source;
@@ -331,7 +391,7 @@ export async function mailInitInboxAndWatch(account: string): Promise<{ busId: s
                 const parsed = await simpleParser(typeof src === "string" ? src : Buffer.from(src));
                 body = String(parsed.text ?? parsed.html ?? "");
               } catch {
-                body = String(src).slice(0, 100000);
+                body = String(src);
               }
             }
             const content = formatMessageContent(m.envelope, body);
@@ -340,13 +400,10 @@ export async function mailInitInboxAndWatch(account: string): Promise<{ busId: s
             const timestamp = id instanceof Date ? id.toISOString() : (typeof id === "string" ? new Date(id).toISOString() : (m.envelope?.date instanceof Date ? m.envelope.date.toISOString() : undefined));
             const from = m.envelope?.from?.[0];
             const userName = from ? (from.name ?? from.address ?? account) : account;
-            const payload: MailMessagePayload = { bus_id: busId, user_id: 0, user_name: userName, content, timestamp, mail_uid: m.uid };
+            const senderEmail = from?.address;
+            const payload: MailMessagePayload = { bus_id: busId, user_id: 0, user_name: userName, content, timestamp, mail_uid: m.uid, sender_email: senderEmail };
             onMailMessage?.(payload, { deliverToModel: true });
             if (date > maxDate) maxDate = date;
-          }
-          // Mark as \Seen when model receives content (same as mailFetchAll/mailFetchOne)
-          if (uidList.length > 0) {
-            await c.messageFlagsAdd(uidList.join(","), ["\\Seen"], { uid: true });
           }
           saveLastTimestamp(account, maxDate);
         } finally {
@@ -370,7 +427,6 @@ export async function mailInitInboxAndWatch(account: string): Promise<{ busId: s
           return;
         }
       }
-      if (client && currentAccount) setTimeout(startIdle, 1000);
     };
     c.once("exists", handleExists);
     try {
@@ -384,22 +440,34 @@ export async function mailInitInboxAndWatch(account: string): Promise<{ busId: s
       /* aborted or closed */
     }
     idleAbortController = null;
-    if (client && currentAccount) setTimeout(startIdle, 1000);
+    idleInProgress = false;
+    scheduleStartIdle();
   };
-  startIdle();
+  // Defer IDLE so mail.list etc. can run immediately after connect without needing to break IDLE
+  scheduleStartIdle();
 
   return { busId, messageCount };
 }
 
 function getClient(): ImapFlow {
-  if (!client) throw new Error("Not connected. Call mail__connect first.");
+  if (!client) throw new Error("Not connected. Call mail.connect first.");
   return client;
+}
+
+/** Break IDLE so other commands can run. Must be called before any mail command when IDLE may be active. */
+async function pauseIdleForCommand(): Promise<void> {
+  const c = client;
+  if (!c) return;
+  if (typeof (c as unknown as { preCheck?: () => Promise<void> }).preCheck === "function") {
+    await (c as unknown as { preCheck: () => Promise<void> }).preCheck();
+  }
 }
 
 export async function ensureMailbox(path?: string): Promise<string> {
   const mailbox = path ?? lastOpenedMailbox;
-  if (!mailbox) throw new Error("No mailbox selected. Provide mailbox path or call mail__mailbox_open first.");
+  if (!mailbox) throw new Error("No mailbox selected. Provide mailbox path or call mail.mailbox_open first.");
   const c = getClient();
+  await pauseIdleForCommand();
   if (currentLock) {
     currentLock.release();
     currentLock = null;
@@ -421,6 +489,7 @@ export async function mailList(options?: {
   statusQuery?: { messages?: boolean; unseen?: boolean; uidNext?: boolean; uidValidity?: boolean; recent?: boolean; highestModseq?: boolean };
 }): Promise<unknown> {
   const c = getClient();
+  await pauseIdleForCommand();
   const list = await c.list(options);
   releaseMailboxLock();
   return list.map((m) => ({
@@ -433,6 +502,7 @@ export async function mailList(options?: {
 
 export async function mailListTree(options?: object): Promise<unknown> {
   const c = getClient();
+  await pauseIdleForCommand();
   const tree = await c.listTree(options);
   releaseMailboxLock();
   return tree;
@@ -440,6 +510,7 @@ export async function mailListTree(options?: object): Promise<unknown> {
 
 export async function mailMailboxOpen(path: string, readOnly?: boolean): Promise<void> {
   const c = getClient();
+  await pauseIdleForCommand();
   if (currentLock) {
     currentLock.release();
     currentLock = null;
@@ -450,6 +521,7 @@ export async function mailMailboxOpen(path: string, readOnly?: boolean): Promise
 
 export async function mailMailboxClose(): Promise<void> {
   const c = getClient();
+  await pauseIdleForCommand();
   await c.mailboxClose();
   releaseMailboxLock();
   lastOpenedMailbox = null;
@@ -457,6 +529,7 @@ export async function mailMailboxClose(): Promise<void> {
 
 export async function mailMailboxCreate(path: string): Promise<unknown> {
   const c = getClient();
+  await pauseIdleForCommand();
   const result = await c.mailboxCreate(path);
   releaseMailboxLock();
   return result;
@@ -464,24 +537,28 @@ export async function mailMailboxCreate(path: string): Promise<unknown> {
 
 export async function mailMailboxRename(oldPath: string, newPath: string): Promise<void> {
   const c = getClient();
+  await pauseIdleForCommand();
   await c.mailboxRename(oldPath, newPath);
   releaseMailboxLock();
 }
 
 export async function mailMailboxDelete(path: string): Promise<void> {
   const c = getClient();
+  await pauseIdleForCommand();
   await c.mailboxDelete(path);
   releaseMailboxLock();
 }
 
 export async function mailMailboxSubscribe(path: string): Promise<void> {
   const c = getClient();
+  await pauseIdleForCommand();
   await c.mailboxSubscribe(path);
   releaseMailboxLock();
 }
 
 export async function mailMailboxUnsubscribe(path: string): Promise<void> {
   const c = getClient();
+  await pauseIdleForCommand();
   await c.mailboxUnsubscribe(path);
   releaseMailboxLock();
 }
@@ -495,6 +572,7 @@ export async function mailStatus(path: string, query: {
   highestModseq?: boolean;
 }): Promise<unknown> {
   const c = getClient();
+  await pauseIdleForCommand();
   const status = await c.status(path, query);
   releaseMailboxLock();
   return status;
@@ -502,6 +580,7 @@ export async function mailStatus(path: string, query: {
 
 export async function mailGetQuota(path: string): Promise<unknown> {
   const c = getClient();
+  await pauseIdleForCommand();
   const quota = await c.getQuota(path);
   releaseMailboxLock();
   return quota;
@@ -513,8 +592,9 @@ export async function mailFetchAll(
   options: { uid?: boolean; mailbox?: string } = {}
 ): Promise<unknown[]> {
   const mailbox = options.mailbox ?? lastOpenedMailbox;
-  if (!mailbox) throw new Error("No mailbox selected. Provide mailbox or call mail__mailbox_open first.");
+  if (!mailbox) throw new Error("No mailbox selected. Provide mailbox or call mail.mailbox_open first.");
   const c = getClient();
+  await pauseIdleForCommand();
   const lock = await c.getMailboxLock(mailbox);
   try {
     const messages = await c.fetchAll(range, query as object, { uid: options.uid });
@@ -536,7 +616,7 @@ export async function mailFetchAll(
       flags: m.flags,
       internalDate: m.internalDate,
       size: m.size,
-      ...(m.source && { source: String(m.source).slice(0, 50000) }),
+      ...(m.source && { source: String(m.source) }),
       ...(m.labels && { labels: m.labels }),
       ...(m.threadId && { threadId: m.threadId }),
     }));
@@ -551,7 +631,7 @@ export async function mailFetchOne(
   options: { uid?: boolean; mailbox?: string } = {}
 ): Promise<unknown> {
   const mailbox = options.mailbox ?? lastOpenedMailbox;
-  if (!mailbox) throw new Error("No mailbox selected. Provide mailbox or call mail__mailbox_open first.");
+  if (!mailbox) throw new Error("No mailbox selected. Provide mailbox or call mail.mailbox_open first.");
   const c = getClient();
   const lock = await c.getMailboxLock(mailbox);
   try {
@@ -570,7 +650,7 @@ export async function mailFetchOne(
       flags: msg.flags,
       internalDate: msg.internalDate,
       size: msg.size,
-      ...(msg.source && { source: String(msg.source).slice(0, 50000) }),
+      ...(msg.source && { source: String(msg.source) }),
       ...(msg.labels && { labels: msg.labels }),
       ...(msg.threadId && { threadId: msg.threadId }),
     };
@@ -585,7 +665,7 @@ export async function mailDownload(
   options: { uid?: boolean; mailbox?: string } = {}
 ): Promise<string> {
   const mailbox = options.mailbox ?? lastOpenedMailbox;
-  if (!mailbox) throw new Error("No mailbox selected. Provide mailbox or call mail__mailbox_open first.");
+  if (!mailbox) throw new Error("No mailbox selected. Provide mailbox or call mail.mailbox_open first.");
   const c = getClient();
   const lock = await c.getMailboxLock(mailbox);
   try {
@@ -593,8 +673,8 @@ export async function mailDownload(
     const { meta, content } = await c.download(range, partOpt, { uid: options.uid });
     const filename = meta.filename || `mail-part-${range}-${part}-${Date.now()}`;
     const safeName = filename.replace(/[^a-zA-Z0-9._-]/g, "_");
-    mkdirSync(DOWNLOADS_DIR, { recursive: true });
-    const filepath = join(DOWNLOADS_DIR, safeName);
+    mkdirSync(SHARED_DIR, { recursive: true });
+    const filepath = join(SHARED_DIR, safeName);
     const writable = createWriteStream(filepath);
     const stream = content instanceof Readable ? content : Readable.from(content);
     await pipeline(stream, writable);
@@ -609,7 +689,7 @@ export async function mailSearch(
   options: { uid?: boolean; mailbox?: string } = {}
 ): Promise<number[]> {
   const mailbox = options.mailbox ?? lastOpenedMailbox;
-  if (!mailbox) throw new Error("No mailbox selected. Provide mailbox or call mail__mailbox_open first.");
+  if (!mailbox) throw new Error("No mailbox selected. Provide mailbox or call mail.mailbox_open first.");
   const c = getClient();
   const lock = await c.getMailboxLock(mailbox);
   try {

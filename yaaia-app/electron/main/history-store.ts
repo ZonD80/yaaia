@@ -1,14 +1,48 @@
 /**
- * Message bus history stored in kb/history/{mb_id}/{date}/{seq}.md
- * Bus properties in kb/history/{mb_id}/properties.md
- * Format: YAML frontmatter + content per message. 50K char limit per file.
+ * Message bus history stored in SQLite.
+ * Schema: from_identifier, to_identifier, bus_id, text, received_at(utc), message_id
+ * Bus properties remain in kb/history/{mb_id}/properties.md
  */
 
+import BetterSqlite3 from "better-sqlite3";
+import { join } from "node:path";
+import { homedir } from "node:os";
+import { mkdirSync, existsSync } from "node:fs";
 import { kbList, kbRead, kbWrite, kbDelete, kbEnsureCollection } from "./mcp-server/kb-client.js";
+
+const YAAIA_DIR = join(homedir(), "yaaia");
+const HISTORY_DB_PATH = join(YAAIA_DIR, "storage", "history.db");
 
 const HISTORY_BASE = "history";
 const PROPERTIES_FILE = "properties.md";
-const MAX_FILE_CHARS = 50_000;
+
+let db: InstanceType<typeof BetterSqlite3> | null = null;
+
+function getDb(): InstanceType<typeof BetterSqlite3> {
+  if (!db) {
+    const dir = join(YAAIA_DIR, "storage");
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    db = new BetterSqlite3(HISTORY_DB_PATH);
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        from_identifier TEXT NOT NULL,
+        to_identifier TEXT NOT NULL,
+        bus_id TEXT NOT NULL,
+        text TEXT NOT NULL,
+        received_at TEXT NOT NULL,
+        message_id TEXT,
+        role TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
+        mail_uid INTEGER,
+        event_uid TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_messages_bus_id ON messages(bus_id);
+      CREATE INDEX IF NOT EXISTS idx_messages_received_at ON messages(received_at);
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_bus_message_id ON messages(bus_id, message_id) WHERE message_id IS NOT NULL;
+    `);
+  }
+  return db;
+}
 
 export type HistoryMessage = {
   role: "user" | "assistant";
@@ -17,9 +51,7 @@ export type HistoryMessage = {
   user_name?: string;
   bus_id?: string;
   timestamp: string;
-  /** IMAP UID for email bus cleanup (delete from mailbox) */
   mail_uid?: number;
-  /** CalDAV event UID for calendar event cleanup (delete from history when event deleted) */
   event_uid?: string;
 };
 
@@ -38,6 +70,16 @@ function busIdToPathSegment(busId: string): string {
 
 function pathSegmentToBusId(segment: string): string {
   return segment.replace(/__f__/g, "/").replace(/__b__/g, "\\");
+}
+
+/** Check if bus_id matches expected format (root, telegram-*, email-*, caldav-*). Used to filter bogus buses from UI. */
+export function isValidBusIdFormat(busId: string): boolean {
+  if (!busId?.trim()) return false;
+  if (busId === "root") return true;
+  if (/^telegram-\d+$/.test(busId)) return true;
+  if (/^email-[a-zA-Z0-9_-]+$/.test(busId)) return true;
+  if (/^caldav-[a-zA-Z0-9_-]+-[a-zA-Z0-9_-]+$/.test(busId)) return true;
+  return false;
 }
 
 /** Parse simple YAML block (key: value lines only) */
@@ -61,57 +103,6 @@ function parseYamlBlock(block: string): Record<string, string | number> {
   return out;
 }
 
-/** Serialize message to YAML + content block */
-function messageToBlock(m: HistoryMessage): string {
-  const lines = [
-    "---",
-    `role: ${m.role}`,
-    `bus_id: ${m.bus_id ?? "root"}`,
-    `timestamp: ${m.timestamp}`,
-  ];
-  if (m.user_id !== undefined) lines.push(`user_id: ${m.user_id}`);
-  if (m.user_name !== undefined) lines.push(`user_name: ${m.user_name}`);
-  if (m.mail_uid !== undefined) lines.push(`mail_uid: ${m.mail_uid}`);
-  if (m.event_uid !== undefined) lines.push(`event_uid: ${m.event_uid}`);
-  lines.push("---", "", m.content, "");
-  return lines.join("\n");
-}
-
-/** Parse a single .md file into messages */
-function parseHistoryFile(content: string, busId: string): HistoryMessage[] {
-  const out: HistoryMessage[] = [];
-  const parts = content.split(/\n---\n/);
-  let i = 0;
-  while (i < parts.length) {
-    const yamlBlock = parts[i]?.trim();
-    const body = parts[i + 1]?.trimEnd() ?? "";
-    if (!yamlBlock || !yamlBlock.startsWith("role:")) {
-      i++;
-      continue;
-    }
-    const meta = parseYamlBlock(yamlBlock);
-    const role = meta.role === "assistant" ? "assistant" : "user";
-    const timestamp = typeof meta.timestamp === "string" ? meta.timestamp : new Date().toISOString();
-    out.push({
-      role,
-      content: body,
-      user_id: typeof meta.user_id === "number" ? meta.user_id : undefined,
-      user_name: typeof meta.user_name === "string" ? meta.user_name : undefined,
-      bus_id: typeof meta.bus_id === "string" ? meta.bus_id : busId,
-      timestamp,
-      mail_uid: typeof meta.mail_uid === "number" ? meta.mail_uid : undefined,
-      event_uid: typeof meta.event_uid === "string" ? meta.event_uid : undefined,
-    });
-    i += 2;
-  }
-  return out;
-}
-
-/** Get today's date as YYYY-MM-DD */
-function today(): string {
-  return new Date().toISOString().slice(0, 10);
-}
-
 /** Path to mb dir: history/{mb_id} */
 function mbDirPath(mbId: string): string {
   return `${HISTORY_BASE}/${busIdToPathSegment(mbId)}`;
@@ -122,52 +113,9 @@ function propertiesPath(mbId: string): string {
   return `${mbDirPath(mbId)}/${PROPERTIES_FILE}`;
 }
 
-/** Path to date dir: history/{mb_id}/{date} */
-function dateDirPath(mbId: string, date: string): string {
-  return `${mbDirPath(mbId)}/${date}`;
-}
-
-/** List .md files in history/{mb_id}/{date}/ sorted by seq */
-function listBusFiles(mbId: string, date?: string): string[] {
-  const segment = busIdToPathSegment(mbId);
-  const base = date ? `${HISTORY_BASE}/${segment}/${date}` : HISTORY_BASE;
-  try {
-    const all = kbList(base, true);
-    const prefix = date ? `${HISTORY_BASE}/${segment}/${date}/` : `${HISTORY_BASE}/${segment}/`;
-    const filtered = all.filter((p) => p.startsWith(prefix) && p.endsWith(".md") && !p.endsWith(`/${PROPERTIES_FILE}`));
-    return filtered.sort();
-  } catch {
-    return [];
-  }
-}
-
-/** List date dirs (YYYY-MM-DD) for an mb */
-function listDateDirs(mbId: string): string[] {
-  const segment = busIdToPathSegment(mbId);
-  const base = `${HISTORY_BASE}/${segment}`;
-  try {
-    const entries = kbList(base, false);
-    return entries
-      .map((e) => (e.endsWith("/") ? e.slice(0, -1) : e).split("/").pop() ?? "")
-      .filter((d) => /^\d{4}-\d{2}-\d{2}$/.test(d))
-      .sort();
-  } catch {
-    return [];
-  }
-}
-
-/** Ensure history collection exists for qmd indexing (call before update/embed) */
-export async function ensureHistoryCollection(): Promise<void> {
-  await kbEnsureCollection("history");
-}
-
-/** Get next sequence number for a bus on a given date */
-function getNextSeq(mbId: string, date: string): number {
-  const files = listBusFiles(mbId, date);
-  if (files.length === 0) return 1;
-  const last = files[files.length - 1];
-  const match = last.match(/(\d+)\.md$/);
-  return match ? parseInt(match[1], 10) + 1 : 1;
+/** Ensure history collection directory exists. */
+export function ensureHistoryCollection(): void {
+  kbEnsureCollection("history");
 }
 
 /** Load bus properties from history/{mb_id}/properties.md */
@@ -181,7 +129,7 @@ export function loadBusProperties(mbId: string): BusProperties | null {
         bus_id: String(meta.bus_id),
         description: String(meta.description ?? ""),
         trust_level: meta.trust_level === "root" ? "root" : "normal",
-        is_banned: meta.is_banned === true || meta.is_banned === "true",
+        is_banned: String(meta.is_banned ?? "") === "true",
         url: meta.url ? String(meta.url) : undefined,
       };
     }
@@ -208,7 +156,7 @@ export function saveBusProperties(props: BusProperties): void {
 }
 
 /** Ensure mb dir exists (creates properties.md if missing) */
-function ensureMbDir(mbId: string, props?: Partial<BusProperties>): void {
+export function ensureMbDir(mbId: string, props?: Partial<BusProperties>): void {
   const existing = loadBusProperties(mbId);
   if (!existing) {
     saveBusProperties({
@@ -222,65 +170,73 @@ function ensureMbDir(mbId: string, props?: Partial<BusProperties>): void {
   }
 }
 
-/** Append message to bus history. Creates new file if current exceeds 50K. Uses message.timestamp for path when provided. */
+function toFromIdentifier(msg: { role: string; user_id?: number; user_name?: string; from_identifier?: string }): string {
+  if (msg.role === "assistant") return "assistant";
+  return (msg as { from_identifier?: string }).from_identifier ?? msg.user_name ?? (msg.user_id != null ? String(msg.user_id) : "user");
+}
+
+function toToIdentifier(busId: string): string {
+  return busId;
+}
+
+/** Append message to bus history. */
 export function appendToHistory(busId: string, message: Omit<HistoryMessage, "timestamp"> & { timestamp?: string }): void {
-  const ts = message.timestamp ?? new Date().toISOString();
-  const full: HistoryMessage = {
-    ...message,
-    timestamp: ts,
+  const receivedAt = message.timestamp ?? new Date().toISOString();
+  const fromId = toFromIdentifier(message);
+  const toId = toToIdentifier(message.bus_id ?? busId);
+  const messageId =
+    message.mail_uid != null
+      ? String(message.mail_uid)
+      : message.event_uid ?? (message as { message_id?: string }).message_id ?? undefined;
+
+  const stmt = getDb().prepare(`
+    INSERT INTO messages (from_identifier, to_identifier, bus_id, text, received_at, message_id, role, mail_uid, event_uid)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  stmt.run(
+    fromId,
+    toId,
+    message.bus_id ?? busId,
+    message.content,
+    receivedAt,
+    messageId ?? null,
+    message.role,
+    message.mail_uid ?? null,
+    message.event_uid ?? null
+  );
+}
+
+function rowToHistoryMessage(row: {
+  from_identifier: string;
+  bus_id: string;
+  text: string;
+  received_at: string;
+  role: string;
+  mail_uid: number | null;
+  event_uid: string | null;
+}): HistoryMessage {
+  const role = row.role === "assistant" ? "assistant" : "user";
+  const user_id = role === "user" && /^\d+$/.test(row.from_identifier) ? parseInt(row.from_identifier, 10) : undefined;
+  const user_name = role === "user" && row.from_identifier !== "user" && !user_id ? row.from_identifier : undefined;
+  return {
+    role,
+    content: row.text,
+    user_id,
+    user_name,
+    bus_id: row.bus_id,
+    timestamp: row.received_at,
+    mail_uid: row.mail_uid ?? undefined,
+    event_uid: row.event_uid ?? undefined,
   };
-  const date = message.timestamp ? ts.slice(0, 10) : today();
-  const dir = dateDirPath(busId, date);
-
-  const files = listBusFiles(busId, date);
-  let targetPath: string;
-  let existingContent = "";
-
-  if (files.length > 0) {
-    const lastFile = files[files.length - 1];
-    try {
-      existingContent = kbRead(lastFile);
-    } catch {
-      /* file may have been deleted */
-    }
-    if (existingContent.length < MAX_FILE_CHARS) {
-      targetPath = lastFile;
-    } else {
-      const nextSeq = getNextSeq(busId, date);
-      targetPath = `${dir}/${String(nextSeq).padStart(3, "0")}.md`;
-      const lastMessages = parseHistoryFile(existingContent, busId);
-      const latest = lastMessages[lastMessages.length - 1];
-      if (latest) {
-        existingContent = messageToBlock(latest);
-      } else {
-        existingContent = "";
-      }
-    }
-  } else {
-    targetPath = `${dir}/001.md`;
-  }
-
-  const newContent = existingContent ? existingContent + "\n" + messageToBlock(full) : messageToBlock(full);
-  kbWrite(targetPath, newContent);
 }
 
 /** Get all messages for a bus, chronologically */
 export function getBusHistory(busId: string): HistoryMessage[] {
-  const all: HistoryMessage[] = [];
-  const dates = listDateDirs(busId);
-  for (const date of dates) {
-    const files = listBusFiles(busId, date);
-    for (const f of files) {
-      try {
-        const content = kbRead(f);
-        all.push(...parseHistoryFile(content, busId));
-      } catch {
-        /* skip */
-      }
-    }
-  }
-  all.sort((a, b) => a.timestamp.localeCompare(b.timestamp));
-  return all;
+  const stmt = getDb().prepare(
+    "SELECT from_identifier, bus_id, text, received_at, role, mail_uid, event_uid FROM messages WHERE bus_id = ? ORDER BY received_at ASC"
+  );
+  const rows = stmt.all(busId) as Parameters<typeof rowToHistoryMessage>[0][];
+  return rows.map(rowToHistoryMessage);
 }
 
 /** Get slice of bus history. offset=0, limit=N = last N. offset>0 = from start. offset<0 = from end. */
@@ -296,54 +252,40 @@ export function getBusHistorySlice(
   return full.slice(from, from + limit);
 }
 
-/** Get list of mb_ids (buses) from history/ subdirs */
+/** Get list of mb_ids (buses) from messages. Root always included. */
 export function getActiveBuses(): string[] {
-  const buses = new Set<string>();
-  try {
-    const entries = kbList(HISTORY_BASE, false);
-    for (const e of entries) {
-      const segment = (e.endsWith("/") ? e.slice(0, -1) : e).split("/").pop() ?? "";
-      if (segment && !segment.includes(".")) {
-        buses.add(pathSegmentToBusId(segment));
-      }
-    }
-  } catch {
-    /* no history */
-  }
-  return Array.from(buses);
+  const stmt = getDb().prepare("SELECT DISTINCT bus_id FROM messages");
+  const rows = stmt.all() as { bus_id: string }[];
+  const buses = new Set(rows.map((r) => r.bus_id));
+  buses.add("root");
+  return Array.from(buses).filter(isValidBusIdFormat);
 }
 
 export type RootLogResult = { messages: HistoryMessage[]; trimmedCount: number };
+
+function estimateMessageSize(m: HistoryMessage): number {
+  return (m.content?.length ?? 0) + 200;
+}
 
 /** Get full root log (all messages, no trim). For get_bus_history with offset. */
 export function getRootLogFull(): HistoryMessage[] {
   const buses = getActiveBuses();
   const all: HistoryMessage[] = [];
   for (const busId of buses) {
-    for (const m of getBusHistory(busId)) {
-      all.push(m);
-    }
+    all.push(...getBusHistory(busId));
   }
   all.sort((a, b) => a.timestamp.localeCompare(b.timestamp));
   return all;
 }
 
-/** Get root log: merged messages from all active buses, trimmed to latest that fit in maxChars. Returns messages and count of trimmed (older) messages. */
+/** Get root log: merged messages from all active buses, trimmed to latest that fit in maxChars. */
 export function getRootLog(maxChars: number = 50_000): RootLogResult {
-  const buses = getActiveBuses();
-  const all: HistoryMessage[] = [];
-  for (const busId of buses) {
-    for (const m of getBusHistory(busId)) {
-      all.push(m);
-    }
-  }
-  all.sort((a, b) => a.timestamp.localeCompare(b.timestamp));
-
+  const all = getRootLogFull();
   let total = 0;
   const result: HistoryMessage[] = [];
   for (let i = all.length - 1; i >= 0; i--) {
     const m = all[i];
-    const size = messageToBlock(m).length;
+    const size = estimateMessageSize(m);
     if (total + size > maxChars && result.length > 0) break;
     result.unshift(m);
     total += size;
@@ -375,81 +317,50 @@ export function toBusMessage(m: HistoryMessage): {
   };
 }
 
-/** Wipe root bus history (delete all root message files, keep properties) */
+/** Wipe root bus history (delete all root messages) */
 export function wipeRootHistory(): void {
   deleteBusHistory("root");
 }
 
-/** Remove messages with given mail_uids from bus history. Used when deleting mail messages from mailbox. */
+/** Check if a message with this message_id already exists in bus history (Telegram msg.id, etc.). */
+export function hasMessageIdInBusHistory(busId: string, messageId: string): boolean {
+  const stmt = getDb().prepare("SELECT 1 FROM messages WHERE bus_id = ? AND message_id = ? LIMIT 1");
+  const row = stmt.get(busId, messageId);
+  return !!row;
+}
+
+/** Check if a message with this mail_uid already exists in bus history. */
+export function hasMailUidInBusHistory(busId: string, mailUid: number): boolean {
+  const stmt = getDb().prepare("SELECT 1 FROM messages WHERE bus_id = ? AND mail_uid = ? LIMIT 1");
+  const row = stmt.get(busId, mailUid);
+  return !!row;
+}
+
+/** Remove messages with given mail_uids from bus history. */
 export function removeMessagesFromBusHistoryByMailUids(busId: string, uids: number[]): void {
   if (uids.length === 0) return;
-  const uidSet = new Set(uids);
-  const dates = listDateDirs(busId);
-  for (const date of dates) {
-    const files = listBusFiles(busId, date);
-    for (const f of files) {
-      try {
-        const content = kbRead(f);
-        const messages = parseHistoryFile(content, busId);
-        const remaining = messages.filter((m) => !(m.mail_uid !== undefined && uidSet.has(m.mail_uid)));
-        if (remaining.length === 0) {
-          kbDelete(f);
-        } else {
-          const newContent = remaining.map((m) => messageToBlock(m)).join("\n");
-          kbWrite(f, newContent);
-        }
-      } catch {
-        /* skip */
-      }
-    }
-  }
+  const stmt = getDb().prepare("DELETE FROM messages WHERE bus_id = ? AND mail_uid = ?");
+  for (const uid of uids) stmt.run(busId, uid);
 }
 
-function extractEventUidFromContent(content: string): string | undefined {
-  const m = content.match(/Event UID:\s*(.+)$/m);
-  return m ? m[1].trim() : undefined;
-}
-
-/** Check if an event with this event_uid already exists in bus history. Used to avoid duplicate CalDAV events on reconnect. */
+/** Check if an event with this event_uid already exists in bus history. */
 export function hasEventInBusHistory(busId: string, eventUid: string): boolean {
-  const messages = getBusHistory(busId);
   if (eventUid.length === 0) return false;
-  return messages.some((m) => {
-    const uid = m.event_uid ?? extractEventUidFromContent(m.content);
-    return uid === eventUid;
-  });
+  const stmt = getDb().prepare("SELECT 1 FROM messages WHERE bus_id = ? AND event_uid = ? LIMIT 1");
+  const row = stmt.get(busId, eventUid);
+  return !!row;
 }
 
-/** Remove messages with given event_uids from bus history. Used when deleting CalDAV events. */
+/** Remove messages with given event_uids from bus history. */
 export function removeMessagesFromBusHistoryByEventUids(busId: string, eventUids: string[]): void {
   if (eventUids.length === 0) return;
-  const uidSet = new Set(eventUids);
-  const dates = listDateDirs(busId);
-  for (const date of dates) {
-    const files = listBusFiles(busId, date);
-    for (const f of files) {
-      try {
-        const content = kbRead(f);
-        const messages = parseHistoryFile(content, busId);
-        const remaining = messages.filter((m) => {
-          const uid = m.event_uid ?? extractEventUidFromContent(m.content);
-          return !(uid !== undefined && uidSet.has(uid));
-        });
-        if (remaining.length === 0) {
-          kbDelete(f);
-        } else {
-          const newContent = remaining.map((m) => messageToBlock(m)).join("\n");
-          kbWrite(f, newContent);
-        }
-      } catch {
-        /* skip */
-      }
-    }
-  }
+  const placeholders = eventUids.map(() => "?").join(",");
+  getDb().prepare(`DELETE FROM messages WHERE bus_id = ? AND event_uid IN (${placeholders})`).run(busId, ...eventUids);
 }
 
-/** Delete all history and properties for a bus */
+/** Delete all history for a bus */
 export function deleteBusHistory(busId: string): void {
+  getDb().prepare("DELETE FROM messages WHERE bus_id = ?").run(busId);
   const segment = busIdToPathSegment(busId);
   const base = `${HISTORY_BASE}/${segment}`;
   try {
@@ -462,8 +373,6 @@ export function deleteBusHistory(busId: string): void {
       }
     }
   } catch {
-    /* no history for this bus */
+    /* no history dir for this bus */
   }
 }
-
-export { ensureMbDir };

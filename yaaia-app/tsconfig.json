@@ -1,5 +1,6 @@
 {
   "compilerOptions": {
+    "typeRoots": ["./node_modules/@types", "./types"],
     "target": "ES2022",
     "module": "ESNext",
     "moduleResolution": "bundler",
@@ -10,5 +11,5 @@
     "isolatedModules": true,
     "noEmit": true
   },
-  "include": ["src/**/*", "electron/**/*"]
+  "include": ["src/**/*", "electron/**/*", "types/**/*"]
 }

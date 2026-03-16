@@ -27,7 +27,7 @@ const YAAIA_DIR = join(homedir(), "yaaia");
 const TELEGRAM_STORAGE = join(YAAIA_DIR, "telegram-session");
 const TELEGRAM_LAST_SEEN_PATH = join(YAAIA_DIR, "telegram-last-seen.json");
 
-export type MissedMessagePayload = { bus_id: string; user_id: number; user_name: string; content: string; timestamp?: string };
+export type MissedMessagePayload = { bus_id: string; user_id: number; user_name: string; content: string; timestamp?: string; message_id?: number };
 
 function loadLastReceivedTimestamp(): number {
   try {
@@ -67,6 +67,8 @@ export type OnTelegramMessageCallback = (
     content: string;
     /** ISO timestamp of the message; used for history file path */
     timestamp?: string;
+    /** Telegram message ID for database duplicate check */
+    message_id?: number;
   },
   opts?: { deliverToModel?: boolean }
 ) => void;
@@ -281,6 +283,7 @@ async function handleNewMessage(msg: Message): Promise<void> {
     user_name: userName,
     content,
     timestamp,
+    message_id: msg.id,
   });
   if (client) {
     try {
@@ -342,8 +345,8 @@ export async function telegramFetchMissedMessages(opts?: { deliverToModel?: bool
     const userName = sender.type === "user" ? (sender.username ?? sender.displayName ?? String(userId)) : "unknown";
     const content = msg.text?.trim() ?? "";
     const timestamp = msg.date instanceof Date ? msg.date.toISOString() : undefined;
-    delivered.push({ bus_id: busId, user_id: userId, user_name: userName, content, timestamp });
-    onMessageCallback?.({ bus_id: busId, user_id: userId, user_name: userName, content, timestamp }, opts);
+    delivered.push({ bus_id: busId, user_id: userId, user_name: userName, content, timestamp, message_id: msg.id });
+    onMessageCallback?.({ bus_id: busId, user_id: userId, user_name: userName, content, timestamp, message_id: msg.id }, opts);
     if (date > maxDate) maxDate = date;
   }
   if (maxDate > since) saveLastReceivedTimestamp(maxDate);

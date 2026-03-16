@@ -12,7 +12,7 @@ import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
-import { getActiveBuses, deleteBusHistory } from "./history-store.js";
+import { getActiveBuses, deleteBusHistory, hasEventInBusHistory } from "./history-store.js";
 
 const YAAIA_DIR = join(homedir(), "yaaia");
 const POLL_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
@@ -53,7 +53,7 @@ export type CaldavConnectParamsBasic = {
 export type CaldavConnectParamsOAuth = {
   authMethod: "OAuth";
   provider: "google";
-  /** From secrets or config. If missing, OAuth flow will run. */
+  /** From passwords or config. If missing, OAuth flow will run. */
   refreshToken?: string;
   username?: string;
   clientId?: string;
@@ -262,7 +262,7 @@ export async function startGoogleOAuthBrowserServer(
       res.end(
         `<!DOCTYPE html><html><head><meta charset="utf-8"><title>CalDAV OAuth</title></head><body>` +
           `<h2>Authorization complete</h2>` +
-          `<p>Copy the tokens below and save via <strong>secrets_set</strong>. Then call <strong>caldav__connect</strong> with credentials_secret_id.</p>` +
+          `<p>Copy the tokens below and save via <strong>passwords.set</strong>. Then call <strong>caldav.connect</strong> with credentials_password_id.</p>` +
           `<pre id="caldav-tokens">${tokensJson.replace(/</g, "&lt;").replace(/>/g, "&gt;")}</pre>` +
           `</body></html>`
       );
@@ -319,7 +319,7 @@ export async function caldavConnect(
 
     if (!refreshToken) {
       throw new Error(
-        "No refreshToken. Run caldav__oauth_browser first: it opens the OAuth URL in Chrome, user signs in, redirect page shows tokens. Save tokens via secrets_set, then call caldav__connect with credentials_secret_id."
+        "No refreshToken. Run caldav.oauth_browser first: it returns the OAuth URL; user opens it in a browser, signs in, redirect page shows tokens. Save tokens via passwords.set, then call caldav.connect with credentials_password_id."
       );
     }
 
@@ -372,7 +372,7 @@ export async function caldavDisconnect(): Promise<void> {
 /** Fetch calendars, create buses, start polling. Call after caldavConnect. */
 export async function caldavInitAndWatch(account: string): Promise<{ calendars: { busId: string; displayName: string }[] }> {
   const c = client;
-  if (!c) throw new Error("Not connected. Call caldav__connect first.");
+  if (!c) throw new Error("Not connected. Call caldav.connect first.");
 
   const calendars = await c.fetchCalendars();
   const accountSanitized = sanitizeForBusId(account);
@@ -384,15 +384,18 @@ export async function caldavInitAndWatch(account: string): Promise<{ calendars: 
 
   lastKnownEvents = new Map(Object.entries(loadLastEvents(account)));
 
-  // Wipe stale caldav-* buses (renamed or removed calendars).
+  // Wipe stale caldav-* buses (renamed or removed calendars). Only when we got a non-empty
+  // calendar list — empty list may mean fetch failed (e.g. 401), not that calendars were removed.
   const newBusIds = new Set(currentCalendars.map((c) => c.busId));
-  for (const b of getActiveBuses()) {
-    if (b.startsWith("caldav-") && !newBusIds.has(b)) {
-      console.log("[YAAIA CalDAV] Wiping stale bus:", b);
-      deleteBusHistory(b);
-      // Also purge lastKnownEvents entries so events re-download under new bus ID.
-      for (const [url, entry] of lastKnownEvents) {
-        if (entry.busId === b) lastKnownEvents.delete(url);
+  if (newBusIds.size > 0) {
+    for (const b of getActiveBuses()) {
+      if (b.startsWith("caldav-") && !newBusIds.has(b)) {
+        console.log("[YAAIA CalDAV] Wiping stale bus:", b);
+        deleteBusHistory(b);
+        // Also purge lastKnownEvents entries so events re-download under new bus ID.
+        for (const [url, entry] of lastKnownEvents) {
+          if (entry.busId === b) lastKnownEvents.delete(url);
+        }
       }
     }
   }
@@ -436,6 +439,10 @@ export async function caldavInitAndWatch(account: string): Promise<{ calendars: 
                 lastKnownEvents.delete(oldUrl);
                 lastKnownEvents.set(url, { etag, dataHash, eventUid: uid, busId });
                 continue; // already delivered, skip
+              }
+              if (hasEventInBusHistory(busId, uid) && !isChanged) {
+                lastKnownEvents.set(url, { etag, dataHash, eventUid: uid, busId });
+                continue; // already in history and unchanged, skip
               }
 
               lastKnownEvents.set(url, { etag, dataHash, eventUid: uid, busId });
@@ -505,12 +512,19 @@ export async function caldavInitAndWatch(account: string): Promise<{ calendars: 
 
 export async function caldavListCalendars(): Promise<Array<{ url: string; displayName: string }>> {
   const c = client;
-  if (!c) throw new Error("Not connected. Call caldav__connect first.");
+  if (!c) throw new Error("Not connected. Call caldav.connect first.");
   const calendars = await c.fetchCalendars();
   return calendars.map((cal) => ({
     url: cal.url ?? "",
     displayName: (cal.displayName as string) ?? cal.url ?? "",
   }));
+}
+
+/** Get calendar URL for a caldav bus_id. Returns null if not found or not connected. */
+export function caldavGetCalendarUrlForBusId(busId: string): string | null {
+  if (!busId.startsWith("caldav-")) return null;
+  const match = currentCalendars.find((c) => c.busId === busId);
+  return match ? (match.calendar.url ?? null) : null;
 }
 
 export async function caldavListEvents(
@@ -519,7 +533,7 @@ export async function caldavListEvents(
   end: string
 ): Promise<DAVCalendarObject[]> {
   const c = client;
-  if (!c) throw new Error("Not connected. Call caldav__connect first.");
+  if (!c) throw new Error("Not connected. Call caldav.connect first.");
   const calendars = await c.fetchCalendars();
   const cal = calendars.find((x) => x.url === calendarUrl);
   if (!cal) throw new Error(`Calendar not found: ${calendarUrl}`);
@@ -531,7 +545,7 @@ export async function caldavListEvents(
 
 export async function caldavGetEvent(calendarUrl: string, objectUrl: string): Promise<DAVCalendarObject | null> {
   const c = client;
-  if (!c) throw new Error("Not connected. Call caldav__connect first.");
+  if (!c) throw new Error("Not connected. Call caldav.connect first.");
   const calendars = await c.fetchCalendars();
   const cal = calendars.find((x) => x.url === calendarUrl);
   if (!cal) throw new Error(`Calendar not found: ${calendarUrl}`);
@@ -548,7 +562,7 @@ export async function caldavCreateEvent(
   iCalString: string
 ): Promise<Response> {
   const c = client;
-  if (!c) throw new Error("Not connected. Call caldav__connect first.");
+  if (!c) throw new Error("Not connected. Call caldav.connect first.");
   const calendars = await c.fetchCalendars();
   const cal = calendars.find((x) => x.url === calendarUrl);
   if (!cal) throw new Error(`Calendar not found: ${calendarUrl}`);
@@ -561,7 +575,7 @@ export async function caldavCreateEvent(
 
 export async function caldavUpdateEvent(calendarObject: DAVCalendarObject, iCalString: string): Promise<Response> {
   const c = client;
-  if (!c) throw new Error("Not connected. Call caldav__connect first.");
+  if (!c) throw new Error("Not connected. Call caldav.connect first.");
   return c.updateCalendarObject({
     calendarObject: { ...calendarObject, data: iCalString },
   });
@@ -569,7 +583,7 @@ export async function caldavUpdateEvent(calendarObject: DAVCalendarObject, iCalS
 
 export async function caldavDeleteEvent(calendarObject: DAVCalendarObject): Promise<Response> {
   const c = client;
-  if (!c) throw new Error("Not connected. Call caldav__connect first.");
+  if (!c) throw new Error("Not connected. Call caldav.connect first.");
   return c.deleteCalendarObject({
     calendarObject,
   });

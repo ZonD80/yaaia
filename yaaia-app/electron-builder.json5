@@ -17,12 +17,7 @@
     "!**/*.tsbuildinfo",
     "SYSTEM_PROMPT.md",
   ],
-  extraResources: [
-    {
-      from: "dist-electron/resources/agent-browser-placeholder.html",
-      to: "agent-browser-placeholder.html",
-    },
-  ],
+  extraResources: [],
   asar: true,
   asarUnpack: [
     "**/node_modules/archiver/**",

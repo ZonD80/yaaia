@@ -6,6 +6,9 @@ echo "[launch] Building YAAIA..."
 cd yaaia-app
 npm install
 npm run build
+npm run build:vm
 
 echo "[launch] Launching YAAIA..."
+export DEBUG="${DEBUG:-yaaia:*,tsdav:*}"
+export YAAIA_IMAP_DEBUG="${YAAIA_IMAP_DEBUG:-1}"
 exec npx electron .

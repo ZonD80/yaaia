@@ -2,7 +2,6 @@
   <div class="app" @click="onAppLinkClick">
     <header class="header">
       <h1>YAAIA <span class="version">v{{ appVersion }}</span></h1>
-      <p v-if="agentBrowserError" class="error">{{ agentBrowserError }}</p>
     </header>
     <div v-if="taskSummary" class="floating-task"
       :class="{ finalized: taskFinalized, failed: taskFinalized && !taskSuccess }">
@@ -17,6 +16,7 @@
           <select v-model="config.aiProvider">
             <option value="claude">Claude</option>
             <option value="openrouter">OpenRouter</option>
+            <option value="codex">Codex (ChatGPT Plus/Pro)</option>
           </select>
         </div>
         <div class="field" v-if="config.aiProvider === 'claude'">
@@ -35,9 +35,70 @@
           <label>OpenRouter Model</label>
           <input v-model="config.openrouterModel" placeholder="google/gemini-2.5-flash" />
         </div>
+        <div class="field" v-if="config.aiProvider === 'codex'">
+          <label>Codex (ChatGPT Plus/Pro)</label>
+          <div class="codex-auth-row">
+            <span v-if="codexAuthenticated" class="codex-status">✓ Logged in</span>
+            <span v-else class="codex-status muted">Not logged in</span>
+            <button type="button" class="btn secondary" @click="codexLogin" :disabled="codexLoggingIn">
+              {{ codexLoggingIn ? "Logging in…" : codexAuthenticated ? "Re-login" : "Login with ChatGPT" }}
+            </button>
+            <button v-if="codexAuthenticated" type="button" class="btn secondary" @click="codexLogout">Logout</button>
+          </div>
+        </div>
+        <div class="field" v-if="config.aiProvider === 'codex'">
+          <label>Codex Model</label>
+          <input v-model="config.codexModel" placeholder="gpt-5.4-codex" />
+        </div>
         <div class="field">
           <label>Your name (root bus)</label>
           <input v-model="config.userName" placeholder="e.g. Alice" />
+        </div>
+        <div class="field">
+          <label>Who uses root chat (identifier)</label>
+          <input v-model="config.rootUserIdentifier" placeholder="e.g. aleksei (empty = use identity)" />
+          <p class="editor-hint">from_identifier for your messages. Assistant replies use "assistant".</p>
+        </div>
+        <div class="field vm-section">
+          <label>Linux VM</label>
+          <p v-if="vmMessage" class="vm-message" :class="{ error: vmMessageError }">{{ vmMessage }}</p>
+          <template v-if="vms.length === 0">
+            <button type="button" class="btn secondary small" @click="refreshVmList" :disabled="vmRefreshing" style="margin-bottom: 0.5rem;">Refresh</button>
+            <div class="vm-create-form">
+              <div class="field-inline">
+                <label>ISO file</label>
+                <input v-model="vmCreateForm.isoPath" placeholder="Path to Linux ISO (arm64)" readonly class="iso-path" />
+                <button type="button" class="btn secondary small" @click="pickIso">Browse…</button>
+              </div>
+              <div class="field-inline">
+                <label>Disk (GB)</label>
+                <input v-model.number="vmCreateForm.diskGb" type="number" min="8" max="512" placeholder="20" />
+              </div>
+              <div class="field-inline">
+                <label>RAM (MB)</label>
+                <input v-model.number="vmCreateForm.ramMb" type="number" min="2048" max="65536" placeholder="4096" />
+              </div>
+              <button type="button" class="btn secondary" @click="createVm" :disabled="vmCreating">
+                {{ vmCreating ? "Creating…" : "Create VM" }}
+              </button>
+            </div>
+          </template>
+          <template v-else>
+            <button type="button" class="btn secondary small" @click="refreshVmList" :disabled="vmRefreshing" style="margin-bottom: 0.5rem;">Refresh</button>
+            <div class="vm-actions">
+              <span class="vm-info">{{ vms[0].name }} — {{ vms[0].ramMb }} MB RAM, {{ vms[0].diskGb }} GB disk ({{ vms[0].status }})</span>
+              <button type="button" class="btn secondary small" @click="startVm(vms[0].id)" :disabled="vms[0].status === 'running' || vmStarting">
+                {{ vmStarting ? "Starting…" : "Start" }}
+              </button>
+              <button type="button" class="btn secondary small" @click="stopVm(vms[0].id)" :disabled="vms[0].status !== 'running'">
+                Stop
+              </button>
+              <button type="button" class="btn secondary small" @click="showConsoleVm(vms[0].id)" :disabled="vms[0].status !== 'running'">
+                Show console
+              </button>
+              <button type="button" class="btn secondary small" @click="deleteVm(vms[0].id)">Delete</button>
+            </div>
+          </template>
         </div>
         <ul v-if="startupSteps.length" class="startup-progress">
           <li v-for="(step, i) in startupSteps" :key="i"
@@ -47,12 +108,27 @@
                 <span class="text">{{ step }}</span>
           </li>
         </ul>
+        <div class="field-inline" style="margin-bottom: 0.5rem;">
+          <input v-model="skipInitialTask" type="checkbox" id="skip-initial-task" />
+          <label for="skip-initial-task">Do not send initial task</label>
+        </div>
         <button class="btn primary" @click="startChat" :disabled="starting">
           {{ starting ? "Starting..." : "Start chat" }}
         </button>
       </section>
       <section class="chat" v-else>
+        <div v-if="agentReady && !config.rootUserIdentifierDefined && !rootIdentifierWarningDismissed"
+          class="root-identifier-warning">
+          <span>Root chat history is not saved. Set "Who uses root chat (identifier)" in config.</span>
+          <button type="button" class="root-identifier-warning-close" @click="rootIdentifierWarningDismissed = true"
+            title="Dismiss">×</button>
+        </div>
         <div class="chat-messages" ref="messagesRef">
+          <div v-if="rootHistoryLoadedCount < rootHistoryTotal" class="chat-load-older">
+            <button type="button" class="btn secondary small" @click="loadOlderMessages">
+              Load older messages ({{ rootHistoryTotal - rootHistoryLoadedCount }} more)
+            </button>
+          </div>
           <div v-if="messages.length === 0" class="chat-placeholder">Agent is ready. Type your message below.</div>
           <div v-for="(msg, i) in messages" :key="`${msg.timestamp ?? ''}-${msg.role}-${i}`"
             :class="['msg', msg.role, { error: msg.isError, report: msg.isReport }, msg.type]">
@@ -74,12 +150,17 @@
                   'Clarification' }}</span>
                 <div class="msg-markdown" v-html="renderMarkdown(msg.content)"></div>
               </template>
+              <template v-else-if="msg.type === 'memory'">
+                <span class="msg-type-label">Memory</span>
+                <div class="msg-markdown" v-html="renderMarkdown(msg.content)"></div>
+              </template>
               <template v-else-if="msg.type === 'tool_running'">
                 <span class="msg-type-label">Tool: {{ msg.name }}</span>
                 <span class="msg-running">Running…</span>
               </template>
               <template v-else-if="msg.type === 'tool_call' && msg.accordion">
                 <span class="msg-type-label">Tool: {{ msg.name }}</span>
+                <div v-if="msg.name === 'eval' && msg.content" class="eval-output-visible"><pre>{{ msg.content }}</pre></div>
                 <div class="msg-markdown" v-html="msg.accordion"></div>
               </template>
               <template v-else-if="msg.isReport && msg.content">
@@ -112,6 +193,7 @@
               </template>
               <template v-else-if="p.type === 'tool_call' && p.accordion">
                 <span class="msg-type-label">Tool: {{ p.name }}</span>
+                <div v-if="p.name === 'eval' && p.content" class="eval-output-visible"><pre>{{ p.content }}</pre></div>
                 <div class="msg-markdown" v-html="p.accordion"></div>
               </template>
               <div v-else-if="p.content" class="msg-markdown" v-html="renderMarkdown(p.content)"></div>
@@ -136,14 +218,15 @@
         </div>
       </section>
       <aside class="sidebar">
-        <button class="btn secondary" @click="openSecretsEditor">Secrets Editor</button>
-        <button class="btn secondary" @click="openConfigsEditor">Configs Editor</button>
-        <button class="btn secondary" @click="openKbEditor">KB Editor</button>
+        <button class="btn secondary" @click="openPasswordsEditor">Passwords Editor</button>
+        <button class="btn secondary" @click="openIdentitiesEditor">Identities Editor</button>
         <button class="btn secondary" @click="openScheduleEditor">Schedules</button>
         <button class="btn secondary" @click="viewRecipe">View recipe</button>
         <button class="btn secondary" @click="saveRecipe">Save recipe</button>
         <button class="btn secondary" @click="loadRecipe">Load recipe</button>
         <button class="btn secondary" @click="openBusStatuses">Bus statuses</button>
+        <button class="btn secondary" @click="openVmSerialConsole">VM Serial Console</button>
+        <button class="btn secondary" @click="openStorageFolder">Open storage folder</button>
         <button class="btn secondary" @click="exitChat">Exit chat</button>
       </aside>
     </main>
@@ -191,114 +274,91 @@
         </div>
       </div>
     </div>
-    <div v-if="showSecretsEditor" class="ask-user-overlay editor-overlay" @click.self="showSecretsEditor = false">
+    <div v-if="showPasswordsEditor" class="ask-user-overlay editor-overlay" @click.self="showPasswordsEditor = false">
       <div class="ask-user-modal editor-modal">
-        <h3>Secrets Editor</h3>
-        <p v-if="secretsError" class="editor-error">{{ secretsError }}</p>
+        <h3>Passwords Editor</h3>
+        <p class="editor-hint">Passwords and TOTPs only. Description can be dot notation (e.g. database.password, github.totp). Usernames, hosts, ports go in KB md files.</p>
+        <p v-if="passwordsError" class="editor-error">{{ passwordsError }}</p>
         <div class="editor-form">
-          <input v-model="secretsForm.detailed_description" type="text" placeholder="Description"
-            class="editor-input" />
-          <input v-model="secretsForm.first_factor" type="text" placeholder="First factor (e.g. user)"
-            class="editor-input" />
-          <input v-model="secretsForm.first_factor_type" type="text" placeholder="First factor type (e.g. username)"
-            class="editor-input" />
-          <input v-model="secretsForm.value" type="text" placeholder="Value (plaintext)" class="editor-input" />
-          <input v-model="secretsForm.totp_secret" type="text" placeholder="TOTP seed (Base32, optional)"
+          <input v-model="passwordsForm.description" type="text" placeholder="Description (e.g. database.password, github.totp)" class="editor-input" />
+          <select v-model="passwordsForm.type" class="editor-input">
+            <option value="string">Password</option>
+            <option value="totp">TOTP</option>
+          </select>
+          <input v-model="passwordsForm.value" type="text"
+            :placeholder="passwordsForm.type === 'totp' ? 'TOTP seed (Base32)' : 'Value (plaintext)'"
             class="editor-input" />
           <div class="editor-form-actions">
-            <button class="btn primary" @click="saveSecret">{{ secretsEditingId ? "Update" : "Add" }}</button>
-            <button v-if="secretsEditingId" class="btn secondary" @click="startAddSecret">Cancel edit</button>
+            <button class="btn primary" @click="savePassword">{{ passwordsEditingId ? "Update" : "Add" }}</button>
+            <button v-if="passwordsEditingId" class="btn secondary" @click="startAddPassword">Cancel edit</button>
           </div>
         </div>
         <div class="editor-list">
-          <div v-for="item in secretsItems" :key="item.id" class="editor-row">
+          <div v-for="item in passwordsItems" :key="item.uuid" class="editor-row">
             <div class="editor-row-fields">
-              <span class="editor-row-desc">{{ item.detailed_description }}</span>
-              <span class="editor-row-factor">{{ item.first_factor }}</span>
-              <span class="editor-row-type">{{ item.first_factor_type }}</span>
-              <span class="editor-row-value">{{ item.value }}</span>
-              <span v-if="item.totp_secret" class="editor-row-badge">2FA</span>
+              <span class="editor-row-desc">{{ item.description }}</span>
+              <span class="editor-row-type">{{ item.type }}</span>
+              <span v-if="item.type === 'totp'" class="editor-row-badge">TOTP</span>
             </div>
             <div class="editor-row-actions">
-              <button class="btn secondary small" @click="startEditSecret(item)">Edit</button>
-              <button class="btn secondary small" @click="deleteSecret(item.id)">Delete</button>
+              <button class="btn secondary small" @click="startEditPassword(item)">Edit</button>
+              <button class="btn secondary small" @click="deletePassword(item.uuid)">Delete</button>
             </div>
           </div>
         </div>
         <div class="editor-modal-actions">
-          <button class="btn secondary" @click="startAddSecret">Add new</button>
-          <button class="btn secondary" @click="showSecretsEditor = false">Close</button>
+          <button class="btn secondary" @click="startAddPassword">Add new</button>
+          <button class="btn secondary" @click="showPasswordsEditor = false">Close</button>
         </div>
       </div>
     </div>
-    <div v-if="showConfigsEditor" class="ask-user-overlay editor-overlay" @click.self="showConfigsEditor = false">
+    <div v-if="showIdentitiesEditor" class="ask-user-overlay editor-overlay" @click.self="showIdentitiesEditor = false">
       <div class="ask-user-modal editor-modal">
-        <h3>Configs Editor</h3>
-        <p v-if="configsError" class="editor-error">{{ configsError }}</p>
+        <h3>Identities Editor</h3>
+        <p class="editor-hint">Identities map buses to memory partitions. identifier = memory key. bus_ids = comma-separated (e.g. telegram-123, email-account).</p>
+        <p v-if="identitiesError" class="editor-error">{{ identitiesError }}</p>
         <div class="editor-form">
-          <input v-model="configsForm.detailed_description" type="text" placeholder="Description"
-            class="editor-input" />
-          <input v-model="configsForm.value" type="text" placeholder="Value (plaintext)" class="editor-input" />
+          <input v-model="identitiesForm.name" type="text" placeholder="Name" class="editor-input" />
+          <input v-model="identitiesForm.identifier" type="text" placeholder="Identifier (e.g. self, email@example.com, caldav-account-cal_id)" class="editor-input" />
+          <select v-model="identitiesForm.trust_level" class="editor-input">
+            <option value="normal">normal</option>
+            <option value="root">root</option>
+          </select>
+          <input v-model="identitiesForm.bus_ids_str" type="text" placeholder="bus_ids (comma-separated)" class="editor-input" />
           <div class="editor-form-actions">
-            <button class="btn primary" @click="saveConfigEntry">{{ configsEditingId ? "Update" : "Add" }}</button>
-            <button v-if="configsEditingId" class="btn secondary" @click="startAddConfig">Cancel edit</button>
+            <button class="btn primary" @click="saveIdentity">{{ identitiesEditingId ? "Update" : "Add" }}</button>
+            <button v-if="identitiesEditingId" class="btn secondary" @click="startAddIdentity">Cancel edit</button>
           </div>
         </div>
         <div class="editor-list">
-          <div v-for="item in configsItems" :key="item.id" class="editor-row">
+          <div v-for="item in identitiesItems" :key="item.id" class="editor-row">
             <div class="editor-row-fields">
-              <span class="editor-row-desc">{{ item.detailed_description }}</span>
-              <span class="editor-row-value">{{ item.value }}</span>
+              <span class="editor-row-desc">{{ item.name }}</span>
+              <span class="editor-row-type">{{ item.identifier }}</span>
+              <span class="editor-row-badge">{{ item.trust_level }}</span>
+              <span class="editor-row-value">{{ item.bus_ids.join(", ") || "—" }}</span>
             </div>
             <div class="editor-row-actions">
-              <button class="btn secondary small" @click="startEditConfig(item)">Edit</button>
-              <button class="btn secondary small" @click="deleteConfigEntry(item.id)">Delete</button>
+              <button class="btn secondary small" @click="startEditIdentity(item)">Edit</button>
+              <button class="btn secondary small" @click="openIdentityNote(item)">Note</button>
+              <button class="btn secondary small" @click="deleteIdentity(item)" :disabled="item.identifier === 'user'">Delete</button>
             </div>
           </div>
         </div>
         <div class="editor-modal-actions">
-          <button class="btn secondary" @click="startAddConfig">Add new</button>
-          <button class="btn secondary" @click="showConfigsEditor = false">Close</button>
+          <button class="btn secondary" @click="startAddIdentity">Add new</button>
+          <button class="btn secondary" @click="showIdentitiesEditor = false">Close</button>
         </div>
       </div>
     </div>
-    <div v-if="showKbEditor" class="ask-user-overlay editor-overlay kb-editor-overlay"
-      @click.self="showKbEditor = false">
-      <div class="ask-user-modal editor-modal kb-editor-modal">
-        <h3>KB Editor</h3>
-        <p v-if="kbError" class="editor-error">{{ kbError }}</p>
-        <div class="kb-editor-layout">
-          <div class="kb-editor-list">
-            <input v-model="kbFilter" type="text" placeholder="Filter files..." class="editor-input kb-filter-input" />
-            <div class="kb-editor-list-scroll">
-              <div v-for="path in filteredKbFiles" :key="path" class="kb-editor-item"
-                :class="{ selected: kbSelectedPath === path }" @click="selectKbFile(path)">
-                {{ path }}
-              </div>
-            </div>
-          </div>
-          <div class="kb-editor-form">
-            <input v-model="kbFormPath" type="text" placeholder="Path (e.g. notes/doc.md)" class="editor-input" />
-            <div v-if="kbEditorPreview" class="kb-editor-preview">
-              <div class="msg-markdown" v-html="renderMarkdown(kbFormContent)"></div>
-            </div>
-            <textarea v-else v-model="kbFormContent" placeholder="Markdown content..." rows="12"
-              class="editor-textarea"></textarea>
-            <div class="editor-form-actions">
-              <button class="btn primary" @click="saveKbFile" :disabled="kbSaving">
-                {{ kbSaving ? "Saving…" : "Save" }}
-              </button>
-              <button class="btn secondary" @click="kbEditorPreview = !kbEditorPreview">
-                {{ kbEditorPreview ? "Edit" : "Preview" }}
-              </button>
-              <button v-if="kbSelectedPath" class="btn secondary" @click="deleteKbFile"
-                :disabled="kbSaving">Delete</button>
-            </div>
-          </div>
-        </div>
-        <div class="editor-modal-actions">
-          <button class="btn secondary" @click="startAddKbFile">Add new</button>
-          <button class="btn secondary" @click="showKbEditor = false">Close</button>
+    <div v-if="showIdentityNoteEditor" class="ask-user-overlay editor-overlay" @click.self="showIdentityNoteEditor = false">
+      <div class="ask-user-modal editor-modal">
+        <h3>Note: {{ identityNoteTarget?.name ?? identityNoteTarget?.identifier }}</h3>
+        <p v-if="identityNoteError" class="editor-error">{{ identityNoteError }}</p>
+        <textarea v-model="identityNoteContent" placeholder="Markdown note..." rows="12" class="editor-textarea"></textarea>
+        <div class="editor-form-actions">
+          <button class="btn primary" @click="saveIdentityNote">Save</button>
+          <button class="btn secondary" @click="showIdentityNoteEditor = false">Close</button>
         </div>
       </div>
     </div>
@@ -372,7 +432,7 @@ type ChatMessage = {
   isError?: boolean;
   isReport?: boolean;
   isTelegram?: boolean;
-  type?: "assessment" | "clarification" | "tool_running" | "tool_call" | "content";
+  type?: "assessment" | "clarification" | "tool_running" | "tool_call" | "content" | "memory";
   name?: string;
   accordion?: string;
   wait_seconds?: number;
@@ -419,7 +479,7 @@ function parseStream(raw: string): { parts: ChatMessage[]; tail: string } {
       } else if (msg.type === "tool_call" && msg.name && msg.accordion) {
         const last = parts[parts.length - 1];
         if (last?.type === "tool_running" && last.name === msg.name) parts.pop();
-        parts.push({ role: "assistant", type: "tool_call", name: msg.name, accordion: msg.accordion, content: "", wait_seconds: msg.wait_seconds });
+        parts.push({ role: "assistant", type: "tool_call", name: msg.name, accordion: msg.accordion, content: msg.content ?? "", wait_seconds: msg.wait_seconds });
       } else if (msg.type === "send_message" && typeof msg.content === "string") {
         parts.push({ role: "assistant", content: msg.content, type: "content" });
       } else if (msg.type === "user_injected" && typeof msg.content === "string") {
@@ -539,103 +599,173 @@ function dismissFinalize() {
   dismissFloatingTask();
 }
 
-async function openSecretsEditor() {
-  showSecretsEditor.value = true;
-  secretsError.value = "";
-  await refreshSecretsList();
+async function openPasswordsEditor() {
+  showPasswordsEditor.value = true;
+  passwordsError.value = "";
+  await refreshPasswordsList();
 }
 
-async function refreshSecretsList() {
+async function refreshPasswordsList() {
   try {
-    const list = (await window.electronAPI?.secretsListFull?.()) ?? [];
-    secretsItems.value = list as typeof secretsItems.value;
+    const list = (await window.electronAPI?.passwordsListFull?.()) ?? [];
+    passwordsItems.value = list as typeof passwordsItems.value;
   } catch (err) {
-    secretsItems.value = [];
-    secretsError.value = err instanceof Error ? err.message : "Failed to load";
+    passwordsItems.value = [];
+    passwordsError.value = err instanceof Error ? err.message : "Failed to load";
   }
 }
 
-function startAddSecret() {
-  secretsEditingId.value = null;
-  secretsForm.value = {
-    detailed_description: "",
-    first_factor: "",
-    first_factor_type: "",
-    value: "",
-    totp_secret: "",
-  };
+function startAddPassword() {
+  passwordsEditingId.value = null;
+  passwordsForm.value = { description: "", type: "string", value: "" };
 }
 
-function startEditSecret(entry: (typeof secretsItems.value)[0]) {
-  secretsEditingId.value = entry.id;
-  secretsForm.value = {
-    detailed_description: entry.detailed_description,
-    first_factor: entry.first_factor,
-    first_factor_type: entry.first_factor_type,
+function startEditPassword(entry: (typeof passwordsItems.value)[0]) {
+  passwordsEditingId.value = entry.uuid;
+  passwordsForm.value = {
+    description: entry.description,
+    type: entry.type,
     value: entry.value,
-    totp_secret: entry.totp_secret ?? "",
   };
 }
 
-async function saveSecret() {
-  secretsError.value = "";
+async function savePassword() {
+  passwordsError.value = "";
   try {
-    if (secretsEditingId.value) {
-      await window.electronAPI?.secretsDelete?.(secretsEditingId.value);
-    }
-    await window.electronAPI?.secretsSet?.({
-      ...secretsForm.value,
+    await window.electronAPI?.passwordsSet?.({
+      description: passwordsForm.value.description,
+      type: passwordsForm.value.type,
+      value: passwordsForm.value.value,
       force: false,
+      uuid: passwordsEditingId.value ?? undefined,
     });
-    await refreshSecretsList();
-    secretsEditingId.value = null;
-    secretsForm.value = {
-      detailed_description: "",
-      first_factor: "",
-      first_factor_type: "",
-      value: "",
-      totp_secret: "",
-    };
+    await refreshPasswordsList();
+    passwordsEditingId.value = null;
+    passwordsForm.value = { description: "", type: "string", value: "" };
   } catch (err) {
-    secretsError.value = err instanceof Error ? err.message : "Failed to save";
+    passwordsError.value = err instanceof Error ? err.message : "Failed to save";
   }
 }
 
-async function deleteSecret(id: string) {
-  if (!confirm("Delete this secret?")) return;
-  secretsError.value = "";
+async function deletePassword(uuid: string) {
+  if (!confirm("Delete this password?")) return;
+  passwordsError.value = "";
   try {
-    await window.electronAPI?.secretsDelete?.(id);
-    await refreshSecretsList();
-    if (secretsEditingId.value === id) {
-      secretsEditingId.value = null;
-      secretsForm.value = {
-        detailed_description: "",
-        first_factor: "",
-        first_factor_type: "",
-        value: "",
-        totp_secret: "",
-      };
+    await window.electronAPI?.passwordsDelete?.(uuid);
+    await refreshPasswordsList();
+    if (passwordsEditingId.value === uuid) {
+      passwordsEditingId.value = null;
+      passwordsForm.value = { description: "", type: "string", value: "" };
     }
   } catch (err) {
-    secretsError.value = err instanceof Error ? err.message : "Failed to delete";
+    passwordsError.value = err instanceof Error ? err.message : "Failed to delete";
   }
 }
 
-async function openConfigsEditor() {
-  showConfigsEditor.value = true;
-  configsError.value = "";
-  await refreshConfigsList();
+async function openIdentitiesEditor() {
+  showIdentitiesEditor.value = true;
+  identitiesError.value = "";
+  await refreshIdentitiesList();
 }
 
-async function openKbEditor() {
-  showKbEditor.value = true;
-  kbError.value = "";
-  await refreshKbList();
+async function refreshIdentitiesList() {
+  try {
+    const list = (await window.electronAPI?.identityList?.()) ?? [];
+    identitiesItems.value = list as typeof identitiesItems.value;
+  } catch (err) {
+    identitiesItems.value = [];
+    identitiesError.value = err instanceof Error ? err.message : "Failed to load";
+  }
+}
+
+function startAddIdentity() {
+  identitiesEditingId.value = null;
+  identitiesForm.value = { name: "", identifier: "", trust_level: "normal", bus_ids_str: "" };
+}
+
+function startEditIdentity(entry: (typeof identitiesItems.value)[0]) {
+  identitiesEditingId.value = entry.id;
+  identitiesForm.value = {
+    name: entry.name,
+    identifier: entry.identifier,
+    trust_level: entry.trust_level,
+    bus_ids_str: entry.bus_ids.join(", "),
+  };
+}
+
+async function saveIdentity() {
+  identitiesError.value = "";
+  const busIds = identitiesForm.value.bus_ids_str
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  try {
+    if (identitiesEditingId.value) {
+      await window.electronAPI?.identityUpdate?.(identitiesEditingId.value, {
+        name: identitiesForm.value.name,
+        identifier: identitiesForm.value.identifier,
+        trust_level: identitiesForm.value.trust_level,
+        bus_ids: busIds,
+      });
+    } else {
+      await window.electronAPI?.identityCreate?.({
+        name: identitiesForm.value.name,
+        identifier: identitiesForm.value.identifier,
+        trust_level: identitiesForm.value.trust_level,
+        bus_ids: busIds,
+      });
+    }
+    await refreshIdentitiesList();
+    identitiesEditingId.value = null;
+    identitiesForm.value = { name: "", identifier: "", trust_level: "normal", bus_ids_str: "" };
+  } catch (err) {
+    identitiesError.value = err instanceof Error ? err.message : "Failed to save";
+  }
+}
+
+async function deleteIdentity(entry: (typeof identitiesItems.value)[0]) {
+  if (!confirm(`Delete identity "${entry.name}"?`)) return;
+  identitiesError.value = "";
+  try {
+    await window.electronAPI?.identityDelete?.(entry.id);
+    await refreshIdentitiesList();
+    if (identitiesEditingId.value === entry.id) {
+      identitiesEditingId.value = null;
+      identitiesForm.value = { name: "", identifier: "", trust_level: "normal", bus_ids_str: "" };
+    }
+  } catch (err) {
+    identitiesError.value = err instanceof Error ? err.message : "Failed to delete";
+  }
+}
+
+async function openIdentityNote(entry: (typeof identitiesItems.value)[0]) {
+  identityNoteTarget.value = entry;
+  identityNoteError.value = "";
+  try {
+    const ident = await window.electronAPI?.identityGet?.(entry.identifier);
+    identityNoteContent.value = (ident && "note" in ident ? ident.note : "") ?? "";
+  } catch (err) {
+    identityNoteContent.value = "";
+    identityNoteError.value = err instanceof Error ? err.message : "Failed to load";
+  }
+  showIdentityNoteEditor.value = true;
+}
+
+async function saveIdentityNote() {
+  if (!identityNoteTarget.value) return;
+  identityNoteError.value = "";
+  try {
+    await window.electronAPI?.identitySetNote?.(identityNoteTarget.value.identifier, identityNoteContent.value);
+    showIdentityNoteEditor.value = false;
+    identityNoteTarget.value = null;
+  } catch (err) {
+    identityNoteError.value = err instanceof Error ? err.message : "Failed to save";
+  }
 }
 
 const BUS_STATUS_POLL_MS = 2000;
 let busStatusPollTimer: ReturnType<typeof setInterval> | null = null;
+let vmPollInterval: ReturnType<typeof setInterval> | null = null;
 
 async function refreshBusStatusList() {
   try {
@@ -781,149 +911,161 @@ async function deleteSchedule() {
   }
 }
 
-const filteredKbFiles = computed(() => {
-  const q = kbFilter.value.trim().toLowerCase();
-  return kbFiles.value.filter((p) => {
-    if (p.includes(".DS_Store")) return false;
-    if (!q) return true;
-    return p.toLowerCase().includes(q);
-  });
-});
-
-async function refreshKbList() {
-  try {
-    const list = (await window.electronAPI?.kbList?.(".", true)) ?? [];
-    kbFiles.value = list.filter((p: string) => !p.endsWith("/") && !p.includes(".DS_Store")) as string[];
-  } catch (err) {
-    kbFiles.value = [];
-    kbError.value = err instanceof Error ? err.message : "Failed to load";
-  }
-}
-
-function selectKbFile(path: string) {
-  kbSelectedPath.value = path;
-  kbFormPath.value = path;
-  kbError.value = "";
-  window.electronAPI?.kbRead?.(path).then((c) => {
-    kbFormContent.value = c;
-  }).catch((err) => {
-    kbError.value = err instanceof Error ? err.message : "Failed to read";
-  });
-}
-
-function startAddKbFile() {
-  kbSelectedPath.value = null;
-  kbFormPath.value = "";
-  kbFormContent.value = "";
-  kbError.value = "";
-}
-
-async function saveKbFile() {
-  const path = kbFormPath.value.trim();
-  if (!path) {
-    kbError.value = "Path is required";
-    return;
-  }
-  if (!path.endsWith(".md") && !path.endsWith(".qmd")) {
-    kbError.value = "Path must end with .md or .qmd";
-    return;
-  }
-  kbError.value = "";
-  kbSaving.value = true;
-  try {
-    await window.electronAPI?.kbWrite?.(path, kbFormContent.value);
-    await refreshKbList();
-    kbSelectedPath.value = path;
-  } catch (err) {
-    kbError.value = err instanceof Error ? err.message : "Failed to save";
-  } finally {
-    kbSaving.value = false;
-  }
-}
-
-async function deleteKbFile() {
-  if (!kbSelectedPath.value || !confirm(`Delete ${kbSelectedPath.value}?`)) return;
-  kbError.value = "";
-  kbSaving.value = true;
-  try {
-    await window.electronAPI?.kbDelete?.(kbSelectedPath.value);
-    await refreshKbList();
-    startAddKbFile();
-  } catch (err) {
-    kbError.value = err instanceof Error ? err.message : "Failed to delete";
-  } finally {
-    kbSaving.value = false;
-  }
-}
-
-async function refreshConfigsList() {
-  try {
-    const list = (await window.electronAPI?.agentConfigList?.()) ?? [];
-    configsItems.value = list as typeof configsItems.value;
-  } catch (err) {
-    configsItems.value = [];
-    configsError.value = err instanceof Error ? err.message : "Failed to load";
-  }
-}
-
-function startAddConfig() {
-  configsEditingId.value = null;
-  configsForm.value = { detailed_description: "", value: "" };
-}
-
-function startEditConfig(entry: (typeof configsItems.value)[0]) {
-  configsEditingId.value = entry.id;
-  configsForm.value = { detailed_description: entry.detailed_description, value: entry.value };
-}
-
-async function saveConfigEntry() {
-  configsError.value = "";
-  try {
-    if (configsEditingId.value) {
-      await window.electronAPI?.agentConfigDelete?.(configsEditingId.value);
-    }
-    await window.electronAPI?.agentConfigSet?.({
-      ...configsForm.value,
-      force: false,
-    });
-    await refreshConfigsList();
-    configsEditingId.value = null;
-    configsForm.value = { detailed_description: "", value: "" };
-  } catch (err) {
-    configsError.value = err instanceof Error ? err.message : "Failed to save";
-  }
-}
-
-async function deleteConfigEntry(id: string) {
-  if (!confirm("Delete this config?")) return;
-  configsError.value = "";
-  try {
-    await window.electronAPI?.agentConfigDelete?.(id);
-    await refreshConfigsList();
-    if (configsEditingId.value === id) {
-      configsEditingId.value = null;
-      configsForm.value = { detailed_description: "", value: "" };
-    }
-  } catch (err) {
-    configsError.value = err instanceof Error ? err.message : "Failed to delete";
-  }
-}
-
 const config = ref({
-  aiProvider: "claude" as "claude" | "openrouter",
+  aiProvider: "claude" as "claude" | "openrouter" | "codex",
   claudeApiKey: "",
   claudeModel: "claude-sonnet-4-6",
   openrouterApiKey: "",
   openrouterModel: "google/gemini-2.5-flash",
+  codexModel: "gpt-5.4-codex",
   userName: "",
+  rootUserIdentifier: "",
+  rootUserIdentifierDefined: true,
 });
+const rootIdentifierWarningDismissed = ref(false);
+const skipInitialTask = ref(false);
+
+type VmInfo = { id: string; name: string; path: string; status: string; ramMb: number; diskGb: number };
+const vms = ref<VmInfo[]>([]);
+const vmMessage = ref("");
+const vmMessageError = ref(false);
+const vmCreateForm = ref({ isoPath: "", diskGb: 20, ramMb: 4096 });
+const vmCreating = ref(false);
+const vmRefreshing = ref(false);
+const vmStarting = ref(false);
+
+async function refreshVmList() {
+  vmMessage.value = "";
+  vmMessageError.value = false;
+  vmRefreshing.value = true;
+  try {
+    const list = (await window.electronAPI?.vmList?.()) ?? [];
+    vms.value = list as VmInfo[];
+  } catch {
+    vms.value = [];
+  } finally {
+    vmRefreshing.value = false;
+  }
+}
+
+async function pickIso() {
+  const r = await window.electronAPI?.vmPickIso?.();
+  if (r?.ok && r.path) vmCreateForm.value.isoPath = r.path;
+}
+
+async function createVm() {
+  vmMessage.value = "";
+  vmMessageError.value = false;
+  vmCreating.value = true;
+  try {
+    const r = await window.electronAPI?.vmCreate?.({
+      isoPath: vmCreateForm.value.isoPath || undefined,
+      diskGb: vmCreateForm.value.diskGb,
+      ramMb: vmCreateForm.value.ramMb,
+    });
+    if (r?.ok) {
+      await refreshVmList();
+      vmCreateForm.value = { isoPath: "", diskGb: 20, ramMb: 4096 };
+    } else {
+      vmMessage.value = r?.error ?? "Failed to create VM";
+      vmMessageError.value = true;
+    }
+  } catch (err) {
+    vmMessage.value = err instanceof Error ? err.message : "Failed to create VM";
+    vmMessageError.value = true;
+  } finally {
+    vmCreating.value = false;
+  }
+}
+
+async function startVm(vmId: string) {
+  vmMessage.value = "";
+  vmMessageError.value = false;
+  vmStarting.value = true;
+  try {
+    const r = await window.electronAPI?.vmStart?.(vmId);
+    if (!r?.ok) {
+      let msg = r?.error ?? "Failed to start VM";
+      if (msg.includes("com.apple.security.virtualization")) {
+        msg = "YaaiaVM needs the virtualization entitlement. Run: npm run build:vm (from yaaia-app), then restart the app.";
+      }
+      vmMessage.value = msg;
+      vmMessageError.value = true;
+    }
+    await refreshVmList();
+  } finally {
+    vmStarting.value = false;
+  }
+}
+
+async function stopVm(vmId: string) {
+  vmMessage.value = "";
+  vmMessageError.value = false;
+  const r = await window.electronAPI?.vmStop?.(vmId);
+  if (!r?.ok) {
+    vmMessage.value = r?.error ?? "Failed to stop VM";
+    vmMessageError.value = true;
+  }
+  await refreshVmList();
+}
+
+async function showConsoleVm(vmId: string) {
+  await window.electronAPI?.vmShowConsole?.(vmId);
+}
+
+async function deleteVm(vmId: string) {
+  if (!confirm("Delete this VM? This cannot be undone.")) return;
+  vmMessage.value = "";
+  vmMessageError.value = false;
+  const r = await window.electronAPI?.vmDelete?.(vmId);
+  if (!r?.ok) {
+    vmMessage.value = r?.error ?? "Failed to delete VM";
+    vmMessageError.value = true;
+  }
+  await refreshVmList();
+}
+
+const codexAuthenticated = ref(false);
+const codexLoggingIn = ref(false);
+
+async function refreshCodexAuthStatus() {
+  try {
+    const r = await window.electronAPI?.codexAuthStatus?.();
+    codexAuthenticated.value = !!r?.authenticated;
+  } catch {
+    codexAuthenticated.value = false;
+  }
+}
+
+async function codexLogin() {
+  codexLoggingIn.value = true;
+  try {
+    const r = await window.electronAPI?.codexLogin?.();
+    if (r?.ok) {
+      codexAuthenticated.value = true;
+    } else {
+      alert(r?.error ?? "Codex login failed");
+    }
+  } catch (err) {
+    alert(err instanceof Error ? err.message : String(err));
+  } finally {
+    codexLoggingIn.value = false;
+  }
+}
+
+async function codexLogout() {
+  await window.electronAPI?.codexLogout?.();
+  codexAuthenticated.value = false;
+}
 
 const agentReady = ref(false);
 const starting = ref(false);
 const startupSteps = ref<string[]>([]);
-const startupMilestones = ["KB ready", "Chrome ready", "Agent ready", "Agent browser ready"];
-const agentBrowserError = ref("");
+const startupMilestones = ["Ready", "Agent ready"];
 const messages = ref<ChatMessage[]>([]);
+const rootHistoryTotal = ref(0);
+const rootHistoryLoadedCount = ref(0);
+const HISTORY_PAGE_SIZE = 100;
 const inputText = ref("");
 const streaming = ref(false);
 const streamBuffer = ref("");
@@ -982,31 +1124,36 @@ let taskTimerInterval: ReturnType<typeof setInterval> | null = null;
 
 const askUserCountdown = ref(60);
 
-// Secrets Editor
-const showSecretsEditor = ref(false);
-const secretsItems = ref<
-  Array<{ id: string; detailed_description: string; first_factor: string; first_factor_type: string; value: string; totp_secret?: string }>
+// Passwords Editor
+const showPasswordsEditor = ref(false);
+const passwordsItems = ref<
+  Array<{ uuid: string; description: string; type: "string" | "totp"; value: string }>
 >([]);
-const secretsError = ref("");
-const secretsEditingId = ref<string | null>(null);
-const secretsForm = ref({
-  detailed_description: "",
-  first_factor: "",
-  first_factor_type: "",
+const passwordsError = ref("");
+const passwordsEditingId = ref<string | null>(null);
+const passwordsForm = ref({
+  description: "",
+  type: "string" as "string" | "totp",
   value: "",
-  totp_secret: "",
 });
 
-// Configs Editor
-const showConfigsEditor = ref(false);
-const configsItems = ref<Array<{ id: string; detailed_description: string; value: string }>>([]);
-const configsError = ref("");
-const configsEditingId = ref<string | null>(null);
-const configsForm = ref({ detailed_description: "", value: "" });
-
-// KB Editor
-const showKbEditor = ref(false);
-const kbEditorPreview = ref(false);
+// Identities Editor
+const showIdentitiesEditor = ref(false);
+const showIdentityNoteEditor = ref(false);
+const identitiesItems = ref<
+  Array<{ id: string; name: string; identifier: string; trust_level: "root" | "normal"; bus_ids: string[] }>
+>([]);
+const identitiesError = ref("");
+const identitiesEditingId = ref<string | null>(null);
+const identitiesForm = ref({
+  name: "",
+  identifier: "",
+  trust_level: "normal" as "root" | "normal",
+  bus_ids_str: "",
+});
+const identityNoteTarget = ref<{ id: string; name: string; identifier: string } | null>(null);
+const identityNoteContent = ref("");
+const identityNoteError = ref("");
 
 // Schedule Editor
 const ZERO_TASK_ID = "zero";
@@ -1027,13 +1174,6 @@ const scheduleFormTitle = ref("");
 const scheduleFormInstructions = ref("");
 const scheduleError = ref("");
 const scheduleSaving = ref(false);
-const kbFiles = ref<string[]>([]);
-const kbFilter = ref("");
-const kbSelectedPath = ref<string | null>(null);
-const kbFormPath = ref("");
-const kbFormContent = ref("");
-const kbError = ref("");
-const kbSaving = ref(false);
 
 let askUserCountdownTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -1042,7 +1182,6 @@ let askUserUnsub: (() => void) | undefined;
 let askUserCloseUnsub: (() => void) | undefined;
 let taskStartUnsub: (() => void) | undefined;
 let finalizeUnsub: (() => void) | undefined;
-let agentBrowserErrorUnsub: (() => void) | undefined;
 let startupProgressUnsub: (() => void) | undefined;
 let startupProgressResetUnsub: (() => void) | undefined;
 let agentMessageUnsub: (() => void) | undefined;
@@ -1151,8 +1290,15 @@ function rootHistoryToMessages(hist: RootHistoryMessage[]): ChatMessage[] {
 
 async function refreshMessagesFromRoot(): Promise<void> {
   try {
-    const rootHistory = ((await window.electronAPI?.messageBusGetHistory?.("root")) ?? []) as RootHistoryMessage[];
+    const sliceRes = (await window.electronAPI?.messageBusGetHistorySlice?.("root", HISTORY_PAGE_SIZE, 0)) ?? {
+      messages: [],
+      total: 0,
+    };
+    const rootHistory = (sliceRes.messages ?? []) as RootHistoryMessage[];
     const fromHistory = rootHistoryToMessages(rootHistory);
+    rootHistoryTotal.value = sliceRes.total ?? 0;
+    rootHistoryLoadedCount.value = fromHistory.length;
+
     const fromQueue: ChatMessage[] = [];
     for (const q of messageQueue.value) {
       try {
@@ -1185,12 +1331,40 @@ async function refreshMessagesFromRoot(): Promise<void> {
   }
 }
 
+async function loadOlderMessages(): Promise<void> {
+  const total = rootHistoryTotal.value;
+  const loaded = rootHistoryLoadedCount.value;
+  if (loaded >= total) return;
+  const offset = Math.max(1, total - loaded - HISTORY_PAGE_SIZE + 1);
+  try {
+    const sliceRes = (await window.electronAPI?.messageBusGetHistorySlice?.("root", HISTORY_PAGE_SIZE, offset)) ?? {
+      messages: [],
+      total: 0,
+    };
+    const olderHistory = (sliceRes.messages ?? []) as RootHistoryMessage[];
+    const older = rootHistoryToMessages(olderHistory);
+    if (older.length === 0) return;
+    rootHistoryLoadedCount.value += older.length;
+    const memCount = messages.value.filter((m) => m.type === "memory").length;
+    messages.value = [
+      ...messages.value.slice(0, memCount),
+      ...older,
+      ...messages.value.slice(memCount),
+    ];
+  } catch {
+    /* ignore */
+  }
+}
+
 async function startChat() {
   starting.value = true;
   try {
-    const plainConfig = JSON.parse(JSON.stringify(config.value));
+    const plainConfig = JSON.parse(JSON.stringify(config.value)) as Record<string, unknown>;
+    plainConfig.skipInitialTask = skipInitialTask.value;
     const result = await window.electronAPI?.startChat?.(plainConfig);
     if (result?.ok) {
+      const cfg = await window.electronAPI?.getConfig?.();
+      if (cfg) config.value = { ...config.value, ...cfg };
       streamBuffer.value = "";
       stopTaskTimer();
       taskSummary.value = "";
@@ -1202,7 +1376,6 @@ async function startChat() {
       finalizeInfo.value = null;
       pendingReportForNextMessage.value = false;
       agentReady.value = true;
-      agentBrowserError.value = "";
       await refreshMessagesFromRoot();
       if (messageQueue.value.length > 0) scheduleDrain();
       await nextTick();
@@ -1215,6 +1388,17 @@ async function startChat() {
   } finally {
     starting.value = false;
   }
+}
+
+async function openVmSerialConsole() {
+  const r = await window.electronAPI?.vmOpenSerialConsole?.();
+  if (!r?.ok) {
+    alert(r?.error ?? "Failed to open VM serial console");
+  }
+}
+
+async function openStorageFolder() {
+  await window.electronAPI?.openStorageFolder?.();
 }
 
 async function exitChat() {
@@ -1234,9 +1418,11 @@ function stopAgent() {
 function buildHistory(msgs: ChatMessage[]): { role: "user" | "assistant"; content: string }[] {
   const out: { role: "user" | "assistant"; content: string }[] = [];
   const include = (x: ChatMessage) =>
-    x.role === "user" ||
-    (x.role === "assistant" &&
-      (x.type === "assessment" || x.type === "clarification" || x.type === "content" || (x.content && x.type !== "tool_call" && x.type !== "tool_running")));
+    x.type === "memory"
+      ? false
+      : x.role === "user" ||
+        (x.role === "assistant" &&
+          (x.type === "assessment" || x.type === "clarification" || x.type === "content" || (x.content && x.type !== "tool_call" && x.type !== "tool_running")));
   const filtered = msgs.filter(include);
   for (const m of filtered) {
     if (m.role === "user") {
@@ -1257,12 +1443,7 @@ async function send() {
   if (sending.value) {
     inputText.value = "";
     messages.value.push({ role: "user", content: text, injected: true, timestamp: new Date().toISOString() });
-    const queuedMsg = JSON.stringify({
-      bus_id: "root",
-      content: text,
-      user_id: 0,
-      user_name: config.value.userName ?? "",
-    });
+    const queuedMsg = `root:${text}`;
     window.electronAPI?.agentQueueMessage?.(queuedMsg);
     scrollToBottomAlways();
     return;
@@ -1338,10 +1519,10 @@ async function loadRecipe() {
 
 watch(streamBuffer, () => scrollToBottomIfFollowing());
 watch(messages, () => scrollToBottomIfFollowing(), { deep: true });
-watch(showKbEditor, (v) => {
-  if (!v) kbEditorPreview.value = false;
-});
 
+watch(() => config.value.aiProvider, (provider) => {
+  if (provider === "codex") refreshCodexAuthStatus();
+});
 watch(showBusStatuses, (open) => {
   if (busStatusPollTimer) {
     clearInterval(busStatusPollTimer);
@@ -1355,6 +1536,21 @@ watch(showBusStatuses, (open) => {
 onMounted(async () => {
   const cfg = await window.electronAPI?.getConfig?.();
   if (cfg) config.value = { ...config.value, ...cfg };
+  await refreshCodexAuthStatus();
+  await refreshVmList();
+  // Poll VM list when empty (YaaiaVM may still be starting)
+  let pollCount = 0;
+  vmPollInterval = setInterval(() => {
+    if (vms.value.length > 0 || pollCount >= 8) {
+      if (vmPollInterval) {
+        clearInterval(vmPollInterval);
+        vmPollInterval = null;
+      }
+      return;
+    }
+    pollCount++;
+    refreshVmList();
+  }, 2000);
 
   streamUnsub = window.electronAPI?.onAgentStreamChunk?.((chunk) => {
     streamBuffer.value += chunk;
@@ -1375,13 +1571,19 @@ onMounted(async () => {
     const msg = typeof payload === "string" ? payload : payload.msg;
     const injectHandled = typeof payload === "object" && payload.injectHandled;
     let displayContent = "⏰ **Scheduled task**";
-    try {
-      const parsed = JSON.parse(msg);
-      if (typeof parsed?.content === "string" && parsed.content.trim()) {
-        displayContent = `⏰ **Scheduled task**\n\n${parsed.content}`;
+    if (typeof msg === "string" && msg.includes(":")) {
+      const colonIdx = msg.indexOf(":");
+      const content = msg.slice(colonIdx + 1).trim();
+      if (content) displayContent = `⏰ **Scheduled task**\n\n${content}`;
+    } else {
+      try {
+        const parsed = JSON.parse(msg);
+        if (typeof parsed?.content === "string" && parsed.content.trim()) {
+          displayContent = `⏰ **Scheduled task**\n\n${parsed.content}`;
+        }
+      } catch {
+        /* use default */
       }
-    } catch {
-      /* use default */
     }
     messages.value.push({ role: "user", content: displayContent, isTelegram: true, timestamp: new Date().toISOString() });
     scrollToBottomAlways();
@@ -1422,7 +1624,7 @@ onMounted(async () => {
   });
 
   telegramMessageUnsub = window.electronAPI?.onTelegramMessage?.((payload) => {
-    const msg = JSON.stringify(payload);
+    const msg = `${payload.bus_id}:${payload.content}`;
     const injectHandled = (payload as { injectHandled?: boolean }).injectHandled;
     const incomingLabel = `📱 **Telegram** (${payload.user_name}): ${payload.content}`;
     const ts = (payload as { timestamp?: string }).timestamp ?? new Date().toISOString();
@@ -1439,7 +1641,7 @@ onMounted(async () => {
   });
 
   emailMessageUnsub = window.electronAPI?.onEmailMessage?.((payload) => {
-    const msg = JSON.stringify(payload);
+    const msg = `${payload.bus_id}:${payload.content}`;
     const injectHandled = (payload as { injectHandled?: boolean }).injectHandled;
     const preview = payload.content.length > 300 ? payload.content.slice(0, 300) + "…" : payload.content;
     const incomingLabel = `📧 **Email** (${payload.user_name}): ${preview}`;
@@ -1457,7 +1659,7 @@ onMounted(async () => {
   });
 
   caldavEventUnsub = window.electronAPI?.onCaldavEvent?.((payload) => {
-    const msg = JSON.stringify(payload);
+    const msg = `${payload.bus_id}:${payload.content}`;
     const injectHandled = (payload as { injectHandled?: boolean }).injectHandled;
     const incomingLabel = `📅 **Calendar** (${payload.bus_id}): ${payload.content}`;
     messages.value.push({ role: "user", content: incomingLabel, timestamp: new Date().toISOString(), isTelegram: true });
@@ -1521,21 +1723,17 @@ onMounted(async () => {
     }
   });
 
-  agentBrowserErrorUnsub = window.electronAPI?.onAgentBrowserError?.((msg) => {
-    agentBrowserError.value = msg;
-  });
-
   startupProgressResetUnsub = window.electronAPI?.onStartupProgressReset?.(() => {
     startupSteps.value = [];
   });
   startupProgressUnsub = window.electronAPI?.onStartupProgress?.((step) => {
     const prev = startupSteps.value;
     const last = prev[prev.length - 1];
-    const isQmdSubstep =
+    const isSubstep =
       last &&
-      (last === "Connecting Knowledge Base..." || last.startsWith("Indexing") || last.includes("%") || /^\d+\/\d+/.test(last));
+      (last === "Preparing storage..." || last.startsWith("Indexing") || last.includes("%") || /^\d+\/\d+/.test(last));
     const isMilestone = startupMilestones.includes(step);
-    if (isQmdSubstep && !isMilestone && step !== last) {
+    if (isSubstep && !isMilestone && step !== last) {
       startupSteps.value = [...prev.slice(0, -1), step];
     } else {
       startupSteps.value = [...prev, step].slice(-15);
@@ -1548,13 +1746,16 @@ onUnmounted(() => {
     clearInterval(busStatusPollTimer);
     busStatusPollTimer = null;
   }
+  if (vmPollInterval) {
+    clearInterval(vmPollInterval);
+    vmPollInterval = null;
+  }
   scrollCleanup?.();
   streamUnsub?.();
   askUserUnsub?.();
   askUserCloseUnsub?.();
   taskStartUnsub?.();
   finalizeUnsub?.();
-  agentBrowserErrorUnsub?.();
   startupProgressUnsub?.();
   startupProgressResetUnsub?.();
   agentMessageUnsub?.();
@@ -1618,6 +1819,69 @@ onUnmounted(() => {
 .config .field {
   margin-bottom: 1rem;
 }
+.codex-auth-row {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+.codex-status {
+  color: #3fb950;
+}
+.codex-status.muted {
+  color: #8b949e;
+}
+
+.vm-section {
+  padding: 0.75rem;
+  background: #161b22;
+  border-radius: 8px;
+  border: 1px solid #30363d;
+}
+.vm-message {
+  margin: 0 0 0.5rem;
+  font-size: 0.9rem;
+}
+.vm-message.error {
+  color: #f85149;
+}
+.vm-create-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+.vm-create-form .field-inline {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.vm-create-form .field-inline label {
+  min-width: 5rem;
+  margin-bottom: 0;
+}
+.vm-create-form .field-inline input {
+  flex: 1;
+}
+.vm-create-form .field-inline input.iso-path {
+  flex: 1;
+  cursor: default;
+}
+.vm-create-form .field-inline input[type="number"] {
+  width: 6rem;
+  flex: none;
+}
+.vm-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+.vm-actions .vm-info {
+  flex: 1;
+  min-width: 12rem;
+  font-size: 0.9rem;
+  color: #8b949e;
+}
 
 .config label {
   display: block;
@@ -1665,6 +1929,39 @@ onUnmounted(() => {
   flex-direction: column;
   min-width: 0;
   min-height: 0;
+}
+
+.root-identifier-warning {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.5rem 1rem;
+  margin-bottom: 0.5rem;
+  background: #2a2518;
+  border: 1px solid #3d3520;
+  border-radius: 6px;
+  font-size: 0.9rem;
+  color: #e6edf3;
+}
+
+.root-identifier-warning-close {
+  flex-shrink: 0;
+  width: 1.5rem;
+  height: 1.5rem;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: #8b949e;
+  font-size: 1.25rem;
+  line-height: 1;
+  cursor: pointer;
+  border-radius: 4px;
+}
+
+.root-identifier-warning-close:hover {
+  background: #3d3520;
+  color: #e6edf3;
 }
 
 .chat-messages {
@@ -1748,6 +2045,27 @@ onUnmounted(() => {
   margin-top: 0.25rem;
 }
 
+.msg-markdown :deep(.eval-section) {
+  margin-top: 0.5rem;
+}
+.msg-markdown :deep(.eval-section:first-child) {
+  margin-top: 0;
+}
+
+.eval-output-visible {
+  margin-top: 0.5rem;
+  padding: 0.5rem;
+  background: #161b22;
+  border-radius: 4px;
+  overflow-x: auto;
+  font-size: 0.9rem;
+}
+.eval-output-visible pre {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 .msg-running {
   color: #58a6ff;
 }
@@ -1759,6 +2077,10 @@ onUnmounted(() => {
 .msg-error,
 .msg.error .msg-text {
   color: #f85149;
+}
+
+.chat-load-older {
+  margin-bottom: 1rem;
 }
 
 .chat-placeholder {
@@ -2132,86 +2454,6 @@ onUnmounted(() => {
   font-size: 0.85rem;
 }
 
-.kb-editor-overlay .kb-editor-modal {
-  width: 95vw !important;
-  max-width: 95vw !important;
-  height: 95vh !important;
-  max-height: 95vh !important;
-  display: flex;
-  flex-direction: column;
-}
-
-.kb-editor-overlay .kb-editor-modal .kb-editor-layout {
-  flex: 1;
-  min-height: 0;
-}
-
-.kb-editor-modal {
-  max-width: 800px;
-}
-
-.kb-editor-layout {
-  display: flex;
-  gap: 1rem;
-  margin-bottom: 1rem;
-  min-height: 280px;
-}
-
-.kb-editor-list {
-  width: 220px;
-  flex-shrink: 0;
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
-  border: 1px solid #30363d;
-  border-radius: 6px;
-  background: #0d1117;
-}
-
-.kb-editor-list .kb-filter-input {
-  flex-shrink: 0;
-  margin: 0.5rem;
-  padding: 0.4rem 0.6rem;
-}
-
-.kb-editor-list-scroll {
-  flex: 1;
-  min-height: 0;
-  overflow-y: auto;
-}
-
-.kb-editor-preview {
-  flex: 1;
-  min-height: 200px;
-  padding: 0.75rem 1rem;
-  border: 1px solid #30363d;
-  border-radius: 6px;
-  background: #0d1117;
-  overflow-y: auto;
-}
-
-.kb-editor-preview .msg-markdown {
-  font-size: 0.95rem;
-  line-height: 1.6;
-}
-
-.kb-editor-item {
-  padding: 0.4rem 0.75rem;
-  font-size: 0.85rem;
-  cursor: pointer;
-  border-bottom: 1px solid #21262d;
-  word-break: break-all;
-}
-
-.kb-editor-item:hover {
-  background: #21262d;
-}
-
-.kb-editor-item.selected {
-  background: #1a3a5c;
-  color: #58a6ff;
-}
-
 .schedule-editor-modal {
   max-width: 700px;
 }
@@ -2268,15 +2510,6 @@ onUnmounted(() => {
 .schedule-editor-form {
   flex: 1;
   min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 0.5rem;
-}
-
-.kb-editor-form {
-  flex: 1;
-  min-width: 0;
-  min-height: 0;
   display: flex;
   flex-direction: column;
   gap: 0.5rem;

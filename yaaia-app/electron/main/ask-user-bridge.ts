@@ -1,5 +1,5 @@
 /**
- * Bridge for send_message(wait_for_answer=true): waits for user reply (via popup or Telegram).
+ * Bridge for ask(): waits for user reply (via popup or Telegram).
  */
 
 const ASK_USER_TIMEOUT_MS = 60_000;
