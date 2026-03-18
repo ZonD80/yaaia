@@ -12,6 +12,7 @@ export interface McpConfig {
   userName: string;
   rootUserIdentifier?: string;
   skipInitialTask?: boolean;
+  enableMdParsing?: boolean;
 }
 
 try {
@@ -94,8 +95,8 @@ try {
       ipcRenderer.on("task-start", fn);
       return () => ipcRenderer.removeListener("task-start", fn);
     },
-    onFinalizeTaskPopup: (callback: (info: { assessment: string; clarification: string; is_successful: boolean; detailed_report: string }) => void) => {
-      const fn = (_: unknown, info: { assessment: string; clarification: string; is_successful: boolean }) => callback(info);
+    onFinalizeTaskPopup: (callback: (info: { is_successful: boolean }) => void) => {
+      const fn = (_: unknown, info: { is_successful: boolean }) => callback(info);
       ipcRenderer.on("finalize-task-popup", fn);
       return () => ipcRenderer.removeListener("finalize-task-popup", fn);
     },
@@ -124,20 +125,15 @@ try {
       ipcRenderer.on("email-message", fn);
       return () => ipcRenderer.removeListener("email-message", fn);
     },
-    onCaldavEvent: (callback: (payload: { bus_id: string; content: string; instruction?: string }) => void) => {
-      const fn = (_: unknown, payload: { bus_id: string; content: string; instruction?: string }) => callback(payload);
-      ipcRenderer.on("caldav-event", fn);
-      return () => ipcRenderer.removeListener("caldav-event", fn);
-    },
-    onCaldavEventDeleted: (callback: (payload: { eventUid: string; busId: string }) => void) => {
-      const fn = (_: unknown, payload: { eventUid: string; busId: string }) => callback(payload);
-      ipcRenderer.on("caldav-event-deleted", fn);
-      return () => ipcRenderer.removeListener("caldav-event-deleted", fn);
-    },
     onScheduleTrigger: (callback: (message: string) => void) => {
       const fn = (_: unknown, message: string) => callback(message);
       ipcRenderer.on("schedule-trigger", fn);
       return () => ipcRenderer.removeListener("schedule-trigger", fn);
+    },
+    onAgentDrain: (callback: (payload?: string) => void) => {
+      const fn = (_: unknown, payload?: string) => callback(payload);
+      ipcRenderer.on("agent-drain", fn);
+      return () => ipcRenderer.removeListener("agent-drain", fn);
     },
     onTelegramLoginRequest: (callback: (info: { step: "phone" | "code" | "password" }) => void) => {
       const fn = (_: unknown, info: { step: "phone" | "code" | "password" }) => callback(info);
@@ -148,6 +144,9 @@ try {
     codexAuthStatus: () => ipcRenderer.invoke("codex-auth-status"),
     codexLogin: () => ipcRenderer.invoke("codex-login"),
     codexLogout: () => ipcRenderer.invoke("codex-logout"),
+    googleApiStatus: () => ipcRenderer.invoke("google-api-status"),
+    googleApiAuthorize: () => ipcRenderer.invoke("google-api-authorize"),
+    googleApiLogout: () => ipcRenderer.invoke("google-api-logout"),
     vmList: () => ipcRenderer.invoke("vm-list"),
     vmCreate: (options?: { isoPath?: string; ramMb?: number; diskGb?: number }) =>
       ipcRenderer.invoke("vm-create", options),

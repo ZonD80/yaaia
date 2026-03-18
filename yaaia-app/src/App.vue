@@ -63,11 +63,13 @@
           <label>Linux VM</label>
           <p v-if="vmMessage" class="vm-message" :class="{ error: vmMessageError }">{{ vmMessage }}</p>
           <template v-if="vms.length === 0">
-            <button type="button" class="btn secondary small" @click="refreshVmList" :disabled="vmRefreshing" style="margin-bottom: 0.5rem;">Refresh</button>
+            <button type="button" class="btn secondary small" @click="refreshVmList" :disabled="vmRefreshing"
+              style="margin-bottom: 0.5rem;">Refresh</button>
             <div class="vm-create-form">
               <div class="field-inline">
                 <label>ISO file</label>
-                <input v-model="vmCreateForm.isoPath" placeholder="Path to Linux ISO (arm64)" readonly class="iso-path" />
+                <input v-model="vmCreateForm.isoPath" placeholder="Path to Linux ISO (arm64)" readonly
+                  class="iso-path" />
                 <button type="button" class="btn secondary small" @click="pickIso">Browse…</button>
               </div>
               <div class="field-inline">
@@ -84,16 +86,21 @@
             </div>
           </template>
           <template v-else>
-            <button type="button" class="btn secondary small" @click="refreshVmList" :disabled="vmRefreshing" style="margin-bottom: 0.5rem;">Refresh</button>
+            <button type="button" class="btn secondary small" @click="refreshVmList" :disabled="vmRefreshing"
+              style="margin-bottom: 0.5rem;">Refresh</button>
             <div class="vm-actions">
-              <span class="vm-info">{{ vms[0].name }} — {{ vms[0].ramMb }} MB RAM, {{ vms[0].diskGb }} GB disk ({{ vms[0].status }})</span>
-              <button type="button" class="btn secondary small" @click="startVm(vms[0].id)" :disabled="vms[0].status === 'running' || vmStarting">
+              <span class="vm-info">{{ vms[0].name }} — {{ vms[0].ramMb }} MB RAM, {{ vms[0].diskGb }} GB disk ({{
+                vms[0].status }})</span>
+              <button type="button" class="btn secondary small" @click="startVm(vms[0].id)"
+                :disabled="vms[0].status === 'running' || vmStarting">
                 {{ vmStarting ? "Starting…" : "Start" }}
               </button>
-              <button type="button" class="btn secondary small" @click="stopVm(vms[0].id)" :disabled="vms[0].status !== 'running'">
+              <button type="button" class="btn secondary small" @click="stopVm(vms[0].id)"
+                :disabled="vms[0].status !== 'running'">
                 Stop
               </button>
-              <button type="button" class="btn secondary small" @click="showConsoleVm(vms[0].id)" :disabled="vms[0].status !== 'running'">
+              <button type="button" class="btn secondary small" @click="showConsoleVm(vms[0].id)"
+                :disabled="vms[0].status !== 'running'">
                 Show console
               </button>
               <button type="button" class="btn secondary small" @click="deleteVm(vms[0].id)">Delete</button>
@@ -104,10 +111,18 @@
           <li v-for="(step, i) in startupSteps" :key="i"
             :class="{ done: i < startupSteps.length - 1 || startupMilestones.includes(step) }">
             <span class="check">{{ (i < startupSteps.length - 1 || startupMilestones.includes(step)) ? "✓" : ""
-                }}</span>
+            }}</span>
                 <span class="text">{{ step }}</span>
           </li>
         </ul>
+        <div class="field-inline" style="margin-bottom: 0.5rem;">
+          <input v-model="config.setupMode" type="checkbox" id="setup-mode" />
+          <label for="setup-mode">Setup mode</label>
+        </div>
+        <div class="field-inline" style="margin-bottom: 0.5rem;">
+          <input v-model="config.enableMdParsing" type="checkbox" id="enable-md-parsing" />
+          <label for="enable-md-parsing">Enable MD parsing</label>
+        </div>
         <div class="field-inline" style="margin-bottom: 0.5rem;">
           <input v-model="skipInitialTask" type="checkbox" id="skip-initial-task" />
           <label for="skip-initial-task">Do not send initial task</label>
@@ -130,94 +145,78 @@
             </button>
           </div>
           <div v-if="messages.length === 0" class="chat-placeholder">Agent is ready. Type your message below.</div>
-          <div v-for="(msg, i) in messages" :key="`${msg.timestamp ?? ''}-${msg.role}-${i}`"
+          <div v-for="(msg, i) in messagesWithPrettified" :key="`${msg.timestamp ?? ''}-${msg.role}-${i}`"
             :class="['msg', msg.role, { error: msg.isError, report: msg.isReport }, msg.type]">
-            <span v-if="msg.timestamp" class="msg-timestamp">{{ formatTimestamp(msg.timestamp) }}</span>
+            <span v-if="msg.timestamp" class="msg-timestamp">
+              {{ formatTimestamp(msg.timestamp) }}{{ (msg.bus_id || msg._prettified.busId) ? ` · ${msg.bus_id || msg._prettified.busId}` : "" }}
+            </span>
             <template v-if="msg.role === 'user'">
-              <span v-if="msg.injected" class="msg-type-label">Injected:</span>
-              <div v-if="msg.isTelegram" class="msg-markdown" v-html="renderMarkdown(msg.content)"></div>
+              <div v-if="msg.isTelegram" class="msg-markdown" v-html="msg._prettified.html || renderContent(msg.content)"></div>
               <span v-else class="msg-text">{{ msg.content }}</span>
             </template>
             <template v-else>
               <div v-if="msg.isError" class="msg-error">{{ msg.content }}</div>
               <template v-else-if="msg.type === 'assessment'">
                 <span class="msg-type-label">{{ msg.bus_id ? `Remote bus (${msg.bus_id}) assessment` : 'Assessment'
-                  }}</span>
-                <div class="msg-markdown" v-html="renderMarkdown(msg.content)"></div>
+                }}</span>
+                <div class="msg-markdown" v-html="msg._prettified.html || renderContent(msg.content)"></div>
               </template>
               <template v-else-if="msg.type === 'clarification'">
                 <span class="msg-type-label">{{ msg.bus_id ? `Remote bus (${msg.bus_id}) clarification` :
                   'Clarification' }}</span>
-                <div class="msg-markdown" v-html="renderMarkdown(msg.content)"></div>
+                <div class="msg-markdown" v-html="msg._prettified.html || renderContent(msg.content)"></div>
               </template>
               <template v-else-if="msg.type === 'memory'">
                 <span class="msg-type-label">Memory</span>
-                <div class="msg-markdown" v-html="renderMarkdown(msg.content)"></div>
-              </template>
-              <template v-else-if="msg.type === 'tool_running'">
-                <span class="msg-type-label">Tool: {{ msg.name }}</span>
-                <span class="msg-running">Running…</span>
-              </template>
-              <template v-else-if="msg.type === 'tool_call' && msg.accordion">
-                <span class="msg-type-label">Tool: {{ msg.name }}</span>
-                <div v-if="msg.name === 'eval' && msg.content" class="eval-output-visible"><pre>{{ msg.content }}</pre></div>
-                <div class="msg-markdown" v-html="msg.accordion"></div>
+                <div class="msg-markdown" v-html="msg._prettified.html || renderContent(msg.content)"></div>
               </template>
               <template v-else-if="msg.isReport && msg.content">
                 <span class="msg-type-label">Detailed report</span>
-                <div class="msg-markdown" v-html="renderMarkdown(msg.content)"></div>
+                <div class="msg-markdown" v-html="msg._prettified.html || renderContent(msg.content)"></div>
               </template>
-              <div v-else-if="msg.content" class="msg-markdown" v-html="renderMarkdown(msg.content)"></div>
+              <div v-else-if="msg.content" class="msg-markdown" v-html="msg._prettified.html || renderContent(msg.content)"></div>
             </template>
           </div>
           <template v-if="streaming">
-            <div v-for="(p, pi) in streamingParsed.parts" :key="'stream-' + pi" :class="['msg', p.role, p.type]">
+            <div v-for="(p, pi) in streamingParsedWithPrettified.parts" :key="'stream-' + pi" :class="['msg', p.role, p.type]">
+              <span v-if="p.bus_id || p._prettified.busId" class="msg-timestamp">· {{ p.bus_id || p._prettified.busId }}</span>
               <template v-if="p.role === 'user'">
-                <span v-if="p.injected" class="msg-type-label">Injected:</span>
-                <div v-else-if="p.isTelegram" class="msg-markdown" v-html="renderMarkdown(p.content)"></div>
+                <div v-if="p.isTelegram" class="msg-markdown" v-html="p._prettified.html || renderContent(p.content)"></div>
                 <span v-else class="msg-text">{{ p.content }}</span>
               </template>
               <template v-else-if="p.type === 'assessment'">
                 <span class="msg-type-label">{{ p.bus_id ? `Remote bus (${p.bus_id}) assessment` : 'Assessment'
-                  }}</span>
-                <div class="msg-markdown" v-html="renderMarkdown(p.content)"></div>
+                }}</span>
+                <div class="msg-markdown" v-html="p._prettified.html || renderContent(p.content)"></div>
               </template>
               <template v-else-if="p.type === 'clarification'">
                 <span class="msg-type-label">{{ p.bus_id ? `Remote bus (${p.bus_id}) clarification` : 'Clarification'
-                  }}</span>
-                <div class="msg-markdown" v-html="renderMarkdown(p.content)"></div>
+                }}</span>
+                <div class="msg-markdown" v-html="p._prettified.html || renderContent(p.content)"></div>
               </template>
-              <template v-else-if="p.type === 'tool_running'">
-                <span class="msg-type-label">Tool: {{ p.name }}</span>
-                <span class="msg-running">Running…</span>
-              </template>
-              <template v-else-if="p.type === 'tool_call' && p.accordion">
-                <span class="msg-type-label">Tool: {{ p.name }}</span>
-                <div v-if="p.name === 'eval' && p.content" class="eval-output-visible"><pre>{{ p.content }}</pre></div>
-                <div class="msg-markdown" v-html="p.accordion"></div>
-              </template>
-              <div v-else-if="p.content" class="msg-markdown" v-html="renderMarkdown(p.content)"></div>
+              <div v-else-if="p.content" class="msg-markdown" v-html="p._prettified.html || renderContent(p.content)"></div>
             </div>
             <div class="msg assistant">
-              <div v-if="streamingParsed.tail" class="msg-markdown" v-html="renderMarkdown(streamingParsed.tail)"></div>
-              <span v-else>Thinking…</span>
+              <div v-if="streamingParsed.tail" class="msg-markdown" v-html="streamingParsedWithPrettified.tailPrettified.html || renderContent(streamingParsed.tail)"></div>
+              <span v-else-if="!streamingParsed.parts.some((p) => p.type === 'thinking')">Thinking…</span>
             </div>
           </template>
           <div ref="scrollAnchor" aria-hidden="true"></div>
         </div>
         <div class="chat-input">
           <div class="chat-input-row">
-            <textarea ref="messageTextareaRef" v-model="inputText" :placeholder="sending ? 'Type to inject message…' : 'Ask the agent...'"
-              rows="2" @keydown.enter.exact.prevent="send" @focus="textareaFocused = true"
-              @blur="textareaFocused = false" />
+            <textarea ref="messageTextareaRef" v-model="inputText"
+              :placeholder="sending ? 'Type to inject message…' : 'Ask the agent...'" rows="2"
+              @keydown.enter.exact.prevent="send" @focus="textareaFocused = true" @blur="textareaFocused = false" />
             <button class="btn secondary" @click="stopAgent" :disabled="!sending">Stop</button>
             <button class="btn primary" @click="send" :disabled="!inputText.trim()">{{ sending ? 'Inject' : 'Send'
-              }}</button>
+            }}</button>
           </div>
           <p class="chat-scroll-hint">Click outside the message box to stop automatic scrolling</p>
         </div>
       </section>
       <aside class="sidebar">
+        <button class="btn secondary" @click="authorizeGoogleApi">Authorize Google API for agent</button>
         <button class="btn secondary" @click="openPasswordsEditor">Passwords Editor</button>
         <button class="btn secondary" @click="openIdentitiesEditor">Identities Editor</button>
         <button class="btn secondary" @click="openScheduleEditor">Schedules</button>
@@ -245,9 +244,9 @@
       <div class="ask-user-modal">
         <h3>Agent needs your input</h3>
         <div v-if="askUserInfo.clarification" class="ask-user-clarification msg-markdown"
-          v-html="renderMarkdown(askUserInfo.clarification)"></div>
+          v-html="renderContent(askUserInfo.clarification)"></div>
         <div v-if="askUserInfo.assessment" class="ask-user-assessment msg-markdown"
-          v-html="renderMarkdown(askUserInfo.assessment)"></div>
+          v-html="renderContent(askUserInfo.assessment)"></div>
         <p class="ask-user-countdown">Reply within {{ askUserCountdown }} seconds</p>
         <textarea v-model="askUserReply" placeholder="Type your reply..." rows="4"
           @keydown.enter.ctrl="submitAskUserReply" />
@@ -261,14 +260,6 @@
       <div class="ask-user-modal finalize-modal"
         :class="{ 'finalize-failed': finalizeInfo && !finalizeInfo.is_successful }">
         <h3>Task {{ finalizeInfo?.is_successful ? 'completed' : 'failed' }}</h3>
-        <p v-if="finalizeInfo?.assessment" class="ask-user-assessment"><strong>Assessment:</strong> {{
-          finalizeInfo.assessment }}</p>
-        <p v-if="finalizeInfo?.clarification" class="ask-user-clarification"><strong>Clarification:</strong> {{
-          finalizeInfo.clarification }}</p>
-        <div v-if="finalizeInfo?.detailed_report" class="ask-user-clarification report-block">
-          <strong>Detailed report:</strong>
-          <div class="msg-markdown report-content" v-html="renderMarkdown(finalizeInfo.detailed_report)"></div>
-        </div>
         <div class="ask-user-actions">
           <button class="btn primary" @click="dismissFinalize">Close</button>
         </div>
@@ -277,10 +268,12 @@
     <div v-if="showPasswordsEditor" class="ask-user-overlay editor-overlay" @click.self="showPasswordsEditor = false">
       <div class="ask-user-modal editor-modal">
         <h3>Passwords Editor</h3>
-        <p class="editor-hint">Passwords and TOTPs only. Description can be dot notation (e.g. database.password, github.totp). Usernames, hosts, ports go in KB md files.</p>
+        <p class="editor-hint">Passwords and TOTPs only. Description can be dot notation (e.g. database.password,
+          github.totp). Usernames, hosts, ports go in KB md files.</p>
         <p v-if="passwordsError" class="editor-error">{{ passwordsError }}</p>
         <div class="editor-form">
-          <input v-model="passwordsForm.description" type="text" placeholder="Description (e.g. database.password, github.totp)" class="editor-input" />
+          <input v-model="passwordsForm.description" type="text"
+            placeholder="Description (e.g. database.password, github.totp)" class="editor-input" />
           <select v-model="passwordsForm.type" class="editor-input">
             <option value="string">Password</option>
             <option value="totp">TOTP</option>
@@ -315,16 +308,20 @@
     <div v-if="showIdentitiesEditor" class="ask-user-overlay editor-overlay" @click.self="showIdentitiesEditor = false">
       <div class="ask-user-modal editor-modal">
         <h3>Identities Editor</h3>
-        <p class="editor-hint">Identities map buses to memory partitions. identifier = memory key. bus_ids = comma-separated (e.g. telegram-123, email-account).</p>
+        <p class="editor-hint">Identities map buses to memory partitions. identifier = memory key. bus_ids =
+          comma-separated
+          (e.g. telegram-123, email-account).</p>
         <p v-if="identitiesError" class="editor-error">{{ identitiesError }}</p>
         <div class="editor-form">
           <input v-model="identitiesForm.name" type="text" placeholder="Name" class="editor-input" />
-          <input v-model="identitiesForm.identifier" type="text" placeholder="Identifier (e.g. self, email@example.com, caldav-account-cal_id)" class="editor-input" />
+          <input v-model="identitiesForm.identifier" type="text"
+            placeholder="Identifier (e.g. self, email@example.com, google-account-calendar_id)" class="editor-input" />
           <select v-model="identitiesForm.trust_level" class="editor-input">
             <option value="normal">normal</option>
             <option value="root">root</option>
           </select>
-          <input v-model="identitiesForm.bus_ids_str" type="text" placeholder="bus_ids (comma-separated)" class="editor-input" />
+          <input v-model="identitiesForm.bus_ids_str" type="text" placeholder="bus_ids (comma-separated)"
+            class="editor-input" />
           <div class="editor-form-actions">
             <button class="btn primary" @click="saveIdentity">{{ identitiesEditingId ? "Update" : "Add" }}</button>
             <button v-if="identitiesEditingId" class="btn secondary" @click="startAddIdentity">Cancel edit</button>
@@ -341,7 +338,7 @@
             <div class="editor-row-actions">
               <button class="btn secondary small" @click="startEditIdentity(item)">Edit</button>
               <button class="btn secondary small" @click="openIdentityNote(item)">Note</button>
-              <button class="btn secondary small" @click="deleteIdentity(item)" :disabled="item.identifier === 'user'">Delete</button>
+              <button class="btn secondary small" @click="deleteIdentity(item)">Delete</button>
             </div>
           </div>
         </div>
@@ -351,11 +348,13 @@
         </div>
       </div>
     </div>
-    <div v-if="showIdentityNoteEditor" class="ask-user-overlay editor-overlay" @click.self="showIdentityNoteEditor = false">
+    <div v-if="showIdentityNoteEditor" class="ask-user-overlay editor-overlay"
+      @click.self="showIdentityNoteEditor = false">
       <div class="ask-user-modal editor-modal">
         <h3>Note: {{ identityNoteTarget?.name ?? identityNoteTarget?.identifier }}</h3>
         <p v-if="identityNoteError" class="editor-error">{{ identityNoteError }}</p>
-        <textarea v-model="identityNoteContent" placeholder="Markdown note..." rows="12" class="editor-textarea"></textarea>
+        <textarea v-model="identityNoteContent" placeholder="Markdown note..." rows="12"
+          class="editor-textarea"></textarea>
         <div class="editor-form-actions">
           <button class="btn primary" @click="saveIdentityNote">Save</button>
           <button class="btn secondary" @click="showIdentityNoteEditor = false">Close</button>
@@ -422,6 +421,8 @@
 import { ref, computed, watch, nextTick, onMounted, onUnmounted } from "vue";
 import { marked } from "marked";
 
+marked.setOptions({ breaks: true });
+
 const appVersion = __APP_VERSION__;
 
 type ChatMessage = {
@@ -432,7 +433,7 @@ type ChatMessage = {
   isError?: boolean;
   isReport?: boolean;
   isTelegram?: boolean;
-  type?: "assessment" | "clarification" | "tool_running" | "tool_call" | "content" | "memory";
+  type?: "assessment" | "clarification" | "tool_running" | "tool_call" | "content" | "memory" | "thinking";
   name?: string;
   accordion?: string;
   wait_seconds?: number;
@@ -475,15 +476,17 @@ function parseStream(raw: string): { parts: ChatMessage[]; tail: string } {
       } else if (msg.type === "clarification" && typeof msg.content === "string") {
         parts.push({ role: "assistant", content: msg.content, type: "clarification", bus_id: msg.bus_id });
       } else if (msg.type === "tool_running" && msg.name) {
-        parts.push({ role: "assistant", type: "tool_running", name: msg.name, content: "", wait_seconds: msg.wait_seconds });
-      } else if (msg.type === "tool_call" && msg.name && msg.accordion) {
+        parts.push({ role: "assistant", content: `Tool: ${msg.name} running…`, type: "content" });
+      } else if (msg.type === "tool_call" && msg.name) {
         const last = parts[parts.length - 1];
-        if (last?.type === "tool_running" && last.name === msg.name) parts.pop();
-        parts.push({ role: "assistant", type: "tool_call", name: msg.name, accordion: msg.accordion, content: msg.content ?? "", wait_seconds: msg.wait_seconds });
-      } else if (msg.type === "send_message" && typeof msg.content === "string") {
-        parts.push({ role: "assistant", content: msg.content, type: "content" });
+        if (last?.content === `Tool: ${msg.name} running…`) parts.pop();
+        parts.push({ role: "assistant", content: msg.content ?? "", type: "content" });
       } else if (msg.type === "user_injected" && typeof msg.content === "string") {
-        parts.push({ role: "user", content: msg.content, injected: true });
+        parts.push({ role: "user", content: msg.content });
+      } else if (msg.type === "thinking") {
+        const last = parts[parts.length - 1];
+        if (last?.type === "thinking") parts.pop();
+        parts.push({ role: "assistant", content: "Thinking…", type: "thinking" });
       }
     } catch {
       contentBuffer += MSG_START + jsonStr + MSG_END;
@@ -495,6 +498,70 @@ function parseStream(raw: string): { parts: ChatMessage[]; tail: string } {
 function renderMarkdown(text: string): string {
   if (!text?.trim()) return "";
   return marked.parse(text) as string;
+}
+
+function escapeHtml(text: string): string {
+  return (text ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/\n/g, "<br>");
+}
+
+/** Valid bus_id pattern (root, telegram-123, email-x, etc.) */
+const BUS_ID_RE = /^([a-zA-Z0-9_-]+):(wait:)?(.*)$/;
+
+/** Parse bbtags [X=ts]...[/X] and [X=vm-bash:N:user]...[/X], replace with accordion. */
+function parseBbtagsToAccordions(text: string): string {
+  const re = /\[([a-zA-Z0-9_-]+)=(ts|vm-bash:\d+:\w+)\]([\s\S]*?)\[\/\1\]/g;
+  return text.replace(re, (_, _tag, type, code) => {
+    const escaped = (code ?? "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+    const label = type === "ts" ? "TypeScript" : type.startsWith("vm-bash:") ? "vm-bash" : type;
+    return `<details class="msg-code-accordion"><summary>${escapeHtml(label)}</summary><pre><code>${escaped}</code></pre></details>`;
+  });
+}
+
+type PrettifiedMessage = {
+  busId?: string;
+  html: string;
+};
+
+/** Prettify chat content: extract bus_id, parse bbtags to accordions, parse markdown. Only when enableMdParsing. */
+function prettifyChatContent(
+  rawContent: string,
+  enableMdParsing: boolean
+): PrettifiedMessage {
+  if (!rawContent?.trim()) return { html: "" };
+  let busId: string | undefined;
+  let body = rawContent;
+
+  const firstNewline = rawContent.indexOf("\n");
+  const firstLine = firstNewline >= 0 ? rawContent.slice(0, firstNewline) : rawContent;
+  const rest = firstNewline >= 0 ? rawContent.slice(firstNewline + 1) : "";
+  const m = firstLine.match(BUS_ID_RE);
+  if (m && m[1]) {
+    busId = m[1];
+    body = (m[3] ?? "").trim();
+    if (rest) body = body ? body + "\n" + rest : rest;
+  }
+
+  if (!enableMdParsing) {
+    return { busId, html: escapeHtml(body || rawContent) };
+  }
+
+  const withAccordions = parseBbtagsToAccordions(body || rawContent);
+  const html = renderMarkdown(withAccordions);
+  return { busId, html };
+}
+
+function renderContent(text: string): string {
+  if (!text?.trim()) return "";
+  return config.value.enableMdParsing ? renderMarkdown(text) : escapeHtml(text);
 }
 
 /** Open links in external browser. Used globally so links in chat, popups, reports, etc. all open externally. */
@@ -597,6 +664,19 @@ function dismissFinalize() {
   showFinalizePopup.value = false;
   finalizeInfo.value = null;
   dismissFloatingTask();
+}
+
+async function authorizeGoogleApi() {
+  try {
+    const r = await window.electronAPI?.googleApiAuthorize?.();
+    if (r?.ok) {
+      alert("Google API authorized. Gmail and Calendar are now available in agent TS eval.");
+    } else {
+      alert(r?.error ?? "Google API authorization failed.");
+    }
+  } catch (err) {
+    alert(err instanceof Error ? err.message : "Google API authorization failed.");
+  }
 }
 
 async function openPasswordsEditor() {
@@ -921,6 +1001,8 @@ const config = ref({
   userName: "",
   rootUserIdentifier: "",
   rootUserIdentifierDefined: true,
+  enableMdParsing: false,
+  setupMode: false,
 });
 const rootIdentifierWarningDismissed = ref(false);
 const skipInitialTask = ref(false);
@@ -1112,7 +1194,7 @@ const telegramLoginPlaceholder = computed(() => {
   return "";
 });
 const showFinalizePopup = ref(false);
-const finalizeInfo = ref<{ assessment: string; clarification: string; is_successful: boolean; detailed_report: string } | null>(null);
+const finalizeInfo = ref<{ is_successful: boolean } | null>(null);
 const pendingReportForNextMessage = ref(false);
 
 const taskSummary = ref("");
@@ -1186,10 +1268,9 @@ let startupProgressUnsub: (() => void) | undefined;
 let startupProgressResetUnsub: (() => void) | undefined;
 let agentMessageUnsub: (() => void) | undefined;
 let scheduleTriggerUnsub: (() => void) | undefined;
+let agentDrainUnsub: (() => void) | undefined;
 let telegramMessageUnsub: (() => void) | undefined;
 let emailMessageUnsub: (() => void) | undefined;
-let caldavEventUnsub: (() => void) | undefined;
-let caldavEventDeletedUnsub: (() => void) | undefined;
 let telegramLoginUnsub: (() => void) | undefined;
 
 /** Queued messages when agent is busy; drained and sent together when agent finishes. */
@@ -1201,15 +1282,35 @@ const DRAIN_DEBOUNCE_MS = 1000;
 
 const streamingParsed = computed(() => parseStream(streamBuffer.value));
 
+const enableMdParsing = computed(() => config.value.enableMdParsing ?? false);
+
+const messagesWithPrettified = computed(() =>
+  messages.value.map((msg) => ({
+    ...msg,
+    _prettified: prettifyChatContent(msg.content, enableMdParsing.value),
+  }))
+);
+
+const streamingParsedWithPrettified = computed(() => {
+  const { parts, tail } = streamingParsed.value;
+  return {
+    parts: parts.map((p) => ({
+      ...p,
+      _prettified: prettifyChatContent(p.content, enableMdParsing.value),
+    })),
+    tailPrettified: prettifyChatContent(tail, enableMdParsing.value),
+  };
+});
+
 function queueMessage(msg: string, bus_id: string): void {
   messageQueue.value.push({ msg, bus_id, timestamp: new Date().toISOString() });
 }
 
 function buildQueuedPayload(): string {
   if (messageQueue.value.length === 0) return "";
-  const lines = messageQueue.value.map((q) => q.msg);
+  const lines = messageQueue.value.map((q) => `${q.bus_id}:${q.msg}`);
   messageQueue.value = [];
-  return "[QUEUED]\n" + lines.join("\n");
+  return lines.join("\n");
 }
 
 /** Schedule a debounced drain so multiple incoming messages (e.g. when agent was offline) are batched into one request. */
@@ -1261,28 +1362,19 @@ function formatTimestamp(ts: string | undefined): string {
   return d.toLocaleString(undefined, { dateStyle: "short", timeStyle: "medium" });
 }
 
-const TOOL_BLOCK_RE = /^\[Tool: ([^\]]+)\]\n([\s\S]*)$/;
-
 function rootHistoryToMessages(hist: RootHistoryMessage[]): ChatMessage[] {
   return hist.map((m) => {
     const role = m.role as "user" | "assistant";
     const busId = m.bus_id;
     const userName = m.user_name ?? "";
-    let content = m.content;
+    let content = m.content ?? "";
     const timestamp = m.timestamp;
-    if (role === "user" && busId) {
+    if (role === "user" && busId && busId !== "root") {
       let emoji = "📱";
       if (busId.startsWith("email-")) emoji = "📧";
-      else if (busId.startsWith("caldav-")) emoji = "📅";
+      else if (busId.startsWith("google-")) emoji = "📅";
       content = `${emoji} **${busId}** (${userName}): ${content}`;
       return { role, content, timestamp, type: undefined, isTelegram: true };
-    }
-    if (role === "assistant") {
-      const match = content.match(TOOL_BLOCK_RE);
-      if (match) {
-        const [, name, accordion] = match;
-        return { role, content: "", timestamp, type: "tool_call", name: name ?? "", accordion };
-      }
     }
     return { role, content, timestamp, type: role === "assistant" ? "content" : undefined };
   });
@@ -1298,34 +1390,7 @@ async function refreshMessagesFromRoot(): Promise<void> {
     const fromHistory = rootHistoryToMessages(rootHistory);
     rootHistoryTotal.value = sliceRes.total ?? 0;
     rootHistoryLoadedCount.value = fromHistory.length;
-
-    const fromQueue: ChatMessage[] = [];
-    for (const q of messageQueue.value) {
-      try {
-        const parsed = JSON.parse(q.msg) as { content?: string; user_name?: string };
-        const content = String(parsed?.content ?? q.msg);
-        const preview = content.length > 300 ? content.slice(0, 300) + "…" : content;
-        let display: string;
-        if (q.bus_id?.startsWith("telegram-")) {
-          display = `📱 **Telegram** (${parsed?.user_name ?? ""}): ${preview}`;
-        } else if (q.bus_id?.startsWith("email-")) {
-          display = `📧 **Email** (${parsed?.user_name ?? ""}): ${preview}`;
-        } else if (q.bus_id?.startsWith("caldav-")) {
-          display = `📅 **Calendar** (${q.bus_id}): ${content}`;
-        } else {
-          display = content;
-        }
-        fromQueue.push({ role: "user", content: display, timestamp: q.timestamp, injected: true, isTelegram: true });
-      } catch {
-        fromQueue.push({ role: "user", content: q.msg, timestamp: q.timestamp, injected: true });
-      }
-    }
-    const merged = [...fromHistory, ...fromQueue].sort((a, b) => {
-      const ta = a.timestamp ?? "";
-      const tb = b.timestamp ?? "";
-      return ta.localeCompare(tb);
-    });
-    messages.value = merged;
+    messages.value = fromHistory;
   } catch {
     /* ignore */
   }
@@ -1377,7 +1442,6 @@ async function startChat() {
       pendingReportForNextMessage.value = false;
       agentReady.value = true;
       await refreshMessagesFromRoot();
-      if (messageQueue.value.length > 0) scheduleDrain();
       await nextTick();
       messageTextareaRef.value?.focus();
     } else {
@@ -1421,8 +1485,8 @@ function buildHistory(msgs: ChatMessage[]): { role: "user" | "assistant"; conten
     x.type === "memory"
       ? false
       : x.role === "user" ||
-        (x.role === "assistant" &&
-          (x.type === "assessment" || x.type === "clarification" || x.type === "content" || (x.content && x.type !== "tool_call" && x.type !== "tool_running")));
+      (x.role === "assistant" &&
+        (x.type === "assessment" || x.type === "clarification" || x.type === "content" || (x.content && x.type !== "tool_call" && x.type !== "tool_running")));
   const filtered = msgs.filter(include);
   for (const m of filtered) {
     if (m.role === "user") {
@@ -1442,22 +1506,23 @@ async function send() {
 
   if (sending.value) {
     inputText.value = "";
-    messages.value.push({ role: "user", content: text, injected: true, timestamp: new Date().toISOString() });
     const queuedMsg = `root:${text}`;
+    messages.value.push({ role: "user", content: queuedMsg, timestamp: new Date().toISOString() });
     window.electronAPI?.agentQueueMessage?.(queuedMsg);
     scrollToBottomAlways();
     return;
   }
 
   inputText.value = "";
-  messages.value.push({ role: "user", content: text, timestamp: new Date().toISOString() });
+  const userMsg = `root:${text}`;
+  messages.value.push({ role: "user", content: userMsg, timestamp: new Date().toISOString() });
   textareaFocused.value = true;
   sending.value = true;
   streaming.value = true;
   streamBuffer.value = "";
   try {
     const history = buildHistory(messages.value.slice(0, -1));
-    const reply = await window.electronAPI?.agentSendMessage?.(text, history);
+    const reply = await window.electronAPI?.agentSendMessage?.(userMsg, history);
     const { parts, tail } = parseStream(streamBuffer.value);
     for (const p of parts) messages.value.push(p);
     let finalContent: string;
@@ -1558,7 +1623,7 @@ onMounted(async () => {
   });
 
   agentMessageUnsub = window.electronAPI?.onAgentMessage?.((content) => {
-    messages.value.push({ role: "assistant", content, type: "content", timestamp: new Date().toISOString() });
+    messages.value.push({ role: "user", content, timestamp: new Date().toISOString() });
     scrollToBottomAlways();
   });
 
@@ -1567,9 +1632,39 @@ onMounted(async () => {
     telegramLoginValue.value = "";
   });
 
+  agentDrainUnsub = window.electronAPI?.onAgentDrain?.((payload) => {
+    if (sending.value) return;
+    sending.value = true;
+    streaming.value = true;
+    streamBuffer.value = "";
+    window.electronAPI
+      ?.agentSendMessage?.(payload ?? "", [], "root")
+      ?.then((reply) => {
+        const { parts, tail } = parseStream(streamBuffer.value);
+        for (const p of parts) messages.value.push(p);
+        const finalContent = reply === "Stopped by user."
+          ? (tail.trim() ? tail.trim() + "\n\n" : "") + "_Stopped by user._"
+          : reply || tail.trim();
+        if (finalContent) messages.value.push({ role: "assistant", content: finalContent, timestamp: new Date().toISOString() });
+      })
+      ?.catch((err) => {
+        const { parts, tail } = parseStream(streamBuffer.value);
+        for (const p of parts) messages.value.push(p);
+        const content = tail.trim() ? `${tail.trim()}\n\n**Error:** ${err}` : `Error: ${err}`;
+        messages.value.push({ role: "assistant", content, isError: true });
+      })
+      ?.finally(async () => {
+        sending.value = false;
+        streaming.value = false;
+        streamBuffer.value = "";
+        await refreshMessagesFromRoot();
+        scrollToBottomAlways();
+        await drainQueueAndSend();
+      });
+  });
+
   scheduleTriggerUnsub = window.electronAPI?.onScheduleTrigger?.((payload) => {
     const msg = typeof payload === "string" ? payload : payload.msg;
-    const injectHandled = typeof payload === "object" && payload.injectHandled;
     let displayContent = "⏰ **Scheduled task**";
     if (typeof msg === "string" && msg.includes(":")) {
       const colonIdx = msg.indexOf(":");
@@ -1587,105 +1682,21 @@ onMounted(async () => {
     }
     messages.value.push({ role: "user", content: displayContent, isTelegram: true, timestamp: new Date().toISOString() });
     scrollToBottomAlways();
-    if (!injectHandled && sending.value) {
-      queueMessage(msg, "root");
-    }
-    if (injectHandled || sending.value) {
-      /* drain will run when current request finishes, or main process already has it */
-    } else {
-      sending.value = true;
-      streaming.value = true;
-      streamBuffer.value = "";
-      window.electronAPI
-        ?.agentSendMessage?.(msg, [], "root")
-        ?.then((reply) => {
-          const { parts, tail } = parseStream(streamBuffer.value);
-          for (const p of parts) messages.value.push(p);
-          const finalContent = reply === "Stopped by user."
-            ? (tail.trim() ? tail.trim() + "\n\n" : "") + "_Stopped by user._"
-            : reply || tail.trim();
-          if (finalContent) messages.value.push({ role: "assistant", content: finalContent, timestamp: new Date().toISOString() });
-        })
-        ?.catch((err) => {
-          const { parts, tail } = parseStream(streamBuffer.value);
-          for (const p of parts) messages.value.push(p);
-          const content = tail.trim() ? `${tail.trim()}\n\n**Error:** ${err}` : `Error: ${err}`;
-          messages.value.push({ role: "assistant", content, isError: true });
-        })
-        ?.finally(async () => {
-          sending.value = false;
-          streaming.value = false;
-          streamBuffer.value = "";
-          await refreshMessagesFromRoot();
-          scrollToBottomAlways();
-          await drainQueueAndSend();
-        });
-    }
   });
 
   telegramMessageUnsub = window.electronAPI?.onTelegramMessage?.((payload) => {
-    const msg = `${payload.bus_id}:${payload.content}`;
-    const injectHandled = (payload as { injectHandled?: boolean }).injectHandled;
     const incomingLabel = `📱 **Telegram** (${payload.user_name}): ${payload.content}`;
     const ts = (payload as { timestamp?: string }).timestamp ?? new Date().toISOString();
     messages.value.push({ role: "user", content: incomingLabel, timestamp: ts, isTelegram: true });
     scrollToBottomAlways();
-    if (!injectHandled) {
-      queueMessage(msg, payload.bus_id);
-      if (sending.value) {
-        /* drain will run when current request finishes */
-      } else {
-        scheduleDrain();
-      }
-    }
   });
 
   emailMessageUnsub = window.electronAPI?.onEmailMessage?.((payload) => {
-    const msg = `${payload.bus_id}:${payload.content}`;
-    const injectHandled = (payload as { injectHandled?: boolean }).injectHandled;
     const preview = payload.content.length > 300 ? payload.content.slice(0, 300) + "…" : payload.content;
     const incomingLabel = `📧 **Email** (${payload.user_name}): ${preview}`;
     const ts = (payload as { timestamp?: string }).timestamp ?? new Date().toISOString();
     messages.value.push({ role: "user", content: incomingLabel, timestamp: ts, isTelegram: true });
     scrollToBottomAlways();
-    if (!injectHandled) {
-      queueMessage(msg, payload.bus_id);
-      if (sending.value) {
-        /* drain will run when current request finishes */
-      } else {
-        scheduleDrain();
-      }
-    }
-  });
-
-  caldavEventUnsub = window.electronAPI?.onCaldavEvent?.((payload) => {
-    const msg = `${payload.bus_id}:${payload.content}`;
-    const injectHandled = (payload as { injectHandled?: boolean }).injectHandled;
-    const incomingLabel = `📅 **Calendar** (${payload.bus_id}): ${payload.content}`;
-    messages.value.push({ role: "user", content: incomingLabel, timestamp: new Date().toISOString(), isTelegram: true });
-    scrollToBottomAlways();
-    if (!injectHandled) {
-      queueMessage(msg, payload.bus_id);
-      if (sending.value) {
-        /* drain will run when current request finishes */
-      } else {
-        scheduleDrain();
-      }
-    }
-  });
-
-  caldavEventDeletedUnsub = window.electronAPI?.onCaldavEventDeleted?.(({ eventUid, busId }) => {
-    const marker = `Event UID: ${eventUid}`;
-    messages.value = messages.value.filter((m) => !(m.role === "user" && m.content?.includes(marker)));
-    messageQueue.value = messageQueue.value.filter((q) => {
-      if (q.bus_id !== busId) return true;
-      try {
-        const parsed = JSON.parse(q.msg) as { event_uid?: string };
-        return parsed?.event_uid !== eventUid;
-      } catch {
-        return true;
-      }
-    });
   });
 
   askUserUnsub = window.electronAPI?.onAskUserPopup?.((info) => {
@@ -1716,11 +1727,6 @@ onMounted(async () => {
     }
     showFinalizePopup.value = true;
     finalizeInfo.value = info;
-    if (info.detailed_report) {
-      pendingReportForNextMessage.value = true;
-      const last = messages.value[messages.value.length - 1];
-      if (last?.role === "assistant" && !last.isReport) last.isReport = true;
-    }
   });
 
   startupProgressResetUnsub = window.electronAPI?.onStartupProgressReset?.(() => {
@@ -1760,10 +1766,9 @@ onUnmounted(() => {
   startupProgressResetUnsub?.();
   agentMessageUnsub?.();
   scheduleTriggerUnsub?.();
+  agentDrainUnsub?.();
   telegramMessageUnsub?.();
   emailMessageUnsub?.();
-  caldavEventUnsub?.();
-  caldavEventDeletedUnsub?.();
   telegramLoginUnsub?.();
   stopAskUserCountdown();
   stopTaskTimer();
@@ -1819,15 +1824,18 @@ onUnmounted(() => {
 .config .field {
   margin-bottom: 1rem;
 }
+
 .codex-auth-row {
   display: flex;
   align-items: center;
   gap: 0.75rem;
   flex-wrap: wrap;
 }
+
 .codex-status {
   color: #3fb950;
 }
+
 .codex-status.muted {
   color: #8b949e;
 }
@@ -1838,44 +1846,54 @@ onUnmounted(() => {
   border-radius: 8px;
   border: 1px solid #30363d;
 }
+
 .vm-message {
   margin: 0 0 0.5rem;
   font-size: 0.9rem;
 }
+
 .vm-message.error {
   color: #f85149;
 }
+
 .vm-create-form {
   display: flex;
   flex-direction: column;
   gap: 0.5rem;
 }
+
 .vm-create-form .field-inline {
   display: flex;
   align-items: center;
   gap: 0.5rem;
 }
+
 .vm-create-form .field-inline label {
   min-width: 5rem;
   margin-bottom: 0;
 }
+
 .vm-create-form .field-inline input {
   flex: 1;
 }
+
 .vm-create-form .field-inline input.iso-path {
   flex: 1;
   cursor: default;
 }
+
 .vm-create-form .field-inline input[type="number"] {
   width: 6rem;
   flex: none;
 }
+
 .vm-actions {
   display: flex;
   align-items: center;
   gap: 0.5rem;
   flex-wrap: wrap;
 }
+
 .vm-actions .vm-info {
   flex: 1;
   min-width: 12rem;
@@ -2003,15 +2021,9 @@ onUnmounted(() => {
 }
 
 .msg.assistant.content,
-.msg.assistant:not(.assessment):not(.clarification):not(.tool_running):not(.tool_call):not(.report) {
+.msg.assistant:not(.assessment):not(.clarification):not(.report) {
   background: #1a1f26;
   border: 1px solid #252b33;
-}
-
-.msg.assistant.tool_running,
-.msg.assistant.tool_call {
-  background: #1e2228;
-  border: 1px solid #2a3038;
 }
 
 .msg.report {
@@ -2045,29 +2057,14 @@ onUnmounted(() => {
   margin-top: 0.25rem;
 }
 
-.msg-markdown :deep(.eval-section) {
+.msg-markdown :deep(.msg-code-accordion) {
   margin-top: 0.5rem;
 }
-.msg-markdown :deep(.eval-section:first-child) {
-  margin-top: 0;
-}
 
-.eval-output-visible {
-  margin-top: 0.5rem;
-  padding: 0.5rem;
-  background: #161b22;
-  border-radius: 4px;
-  overflow-x: auto;
-  font-size: 0.9rem;
-}
-.eval-output-visible pre {
-  margin: 0;
-  white-space: pre-wrap;
-  word-break: break-word;
-}
-
-.msg-running {
-  color: #58a6ff;
+.msg-markdown :deep(.msg-code-accordion summary) {
+  cursor: pointer;
+  color: #8b949e;
+  font-size: 0.85rem;
 }
 
 .msg-text {
@@ -2308,8 +2305,13 @@ onUnmounted(() => {
   flex-shrink: 0;
 }
 
-.bus-status-dot.online { background: #3fb950; }
-.bus-status-dot.offline { background: #8b949e; }
+.bus-status-dot.online {
+  background: #3fb950;
+}
+
+.bus-status-dot.offline {
+  background: #8b949e;
+}
 
 .bus-status-name {
   flex: 1;
@@ -2329,8 +2331,13 @@ onUnmounted(() => {
   text-align: right;
 }
 
-.bus-status-label.online { color: #3fb950; }
-.bus-status-label.offline { color: #8b949e; }
+.bus-status-label.online {
+  color: #3fb950;
+}
+
+.bus-status-label.offline {
+  color: #8b949e;
+}
 
 .editor-modal {
   max-width: 640px;

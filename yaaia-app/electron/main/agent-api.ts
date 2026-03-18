@@ -1,11 +1,12 @@
 /**
  * TypeScript API for agent code execution.
- * TypeScript API for the eval sandbox. Wraps tools and routeMessage.
+ * Messaging: use console.log('bus_id:content') — captured and routed to buses.
  */
 
-import type { ParsedMessage, RouteCallbacks } from "./message-router.js";
-import { parsePrefixedMessages, routeMessage } from "./message-router.js";
-import { ROOT_BUS_ID } from "./message-bus-store.js";
+export type AgentApiRouteCallbacksBase = {
+  onAskUserRequest?: (info: { clarification: string; assessment: string; attempt: number }) => void;
+  onAskUserTimeout?: () => void;
+};
 import {
   connectVmSerial,
   readVmSerial,
@@ -16,7 +17,7 @@ import {
 
 export type AgentApiCallTool = (name: string, args: Record<string, unknown>) => Promise<string>;
 
-export type AgentApiRouteCallbacks = RouteCallbacks & {
+export type AgentApiRouteCallbacks = AgentApiRouteCallbacksBase & {
   emitChunk?: (chunk: string) => void;
 };
 
@@ -24,8 +25,6 @@ export interface AppConfig {
   userName?: string;
   telegramApiId?: number;
   telegramApiHash?: string;
-  caldavGoogleClientId?: string;
-  caldavGoogleClientSecret?: string;
 }
 
 export interface AgentApiDeps {
@@ -38,14 +37,20 @@ export interface AgentApiDeps {
   getInjectedMessages?: () => { formatted: string; raw: string } | null;
   /** Called when eval produces console output (stdout/stderr). Used to stream eval output to chat. */
   onOutputChunk?: (text: string) => void;
+  /** Persistent vm-bash stdout buffer. Append-only, cleared on stop-chat. Use .slice(-n) for last n chars. */
+  vmEvalStdout?: string;
+  /** Persistent vm-bash stderr buffer. Append-only, cleared on stop-chat. */
+  vmEvalStderr?: string;
+  /** Setup mode: expose vm_serial. When false, vm_serial is not available. */
+  setupMode?: boolean;
 }
 
 /**
  * Create the API object to inject into the eval sandbox.
- * Model uses send_message for progress; no assessment/clarification on tool calls.
+ * Messaging: use console.log('bus_id:content') — captured and routed to buses.
  */
 export function createAgentApi(deps: AgentApiDeps): Record<string, unknown> {
-  const { callTool, routeCallbacks } = deps;
+  const { callTool } = deps;
   if (!callTool) throw new Error("callTool required");
 
   const call = async (name: string, args: Record<string, unknown>): Promise<string> => {
@@ -53,74 +58,11 @@ export function createAgentApi(deps: AgentApiDeps): Record<string, unknown> {
     return result;
   };
 
-  const sendMessage = async (content: string): Promise<string> => {
-    const parsed = parsePrefixedMessages(content);
-    const msg = parsed[0];
-    if (!msg) throw new Error("send_message: content must use prefix format bus_id:content");
-
-    const displayContent = msg.busId === ROOT_BUS_ID ? msg.content : `[${msg.busId}] ${msg.content}`;
-    routeCallbacks.emitChunk?.("<<<MSG>>>" + JSON.stringify({ type: "send_message", content: displayContent }) + "<<<END>>>");
-
-    const routed: ParsedMessage = { ...msg, waitForAnswer: false };
-    const res = await routeMessage(routed, routeCallbacks);
-    if (res.error) throw new Error(res.error);
-    return `Sent to ${msg.busId}`;
-  };
-
-  const ask = async (prompt: string): Promise<string> => {
-    const parsed = parsePrefixedMessages(prompt);
-    const msg = parsed[0];
-    if (!msg) throw new Error("ask: prompt must use prefix format bus_id:prompt or bus_id:wait:prompt");
-
-    if (msg.busId !== ROOT_BUS_ID && !msg.busId.startsWith("telegram-")) {
-      throw new Error("ask only supports root or telegram buses");
-    }
-
-    const displayContent = msg.busId === ROOT_BUS_ID ? msg.content : `[${msg.busId}] ${msg.content}`;
-    routeCallbacks.emitChunk?.("<<<MSG>>>" + JSON.stringify({ type: "send_message", content: displayContent }) + "<<<END>>>");
-
-    const routed: ParsedMessage = { ...msg, waitForAnswer: true };
-    const res = await routeMessage(routed, routeCallbacks);
-    if (res.error) throw new Error(res.error);
-    return res.reply ?? "User did not reply in time.";
-  };
-
   const appConfig = deps.appConfig ?? null;
 
   return {
     // App config (Telegram apiId/apiHash, CalDAV Google client id/secret)
     app_config: appConfig,
-
-    // FS (paths relative to fs root /)
-    fs: {
-      /** Read file content. Params: path (required) */
-      read_file: (args: { path: string }) => call("fs.read_file", args),
-      /** Write or overwrite file. Params: path (required), content (required) */
-      write_file: (args: { path: string; content: string }) => call("fs.write_file", args),
-      /** Append content to file. Params: path (required), content (required) */
-      append_file: (args: { path: string; content: string }) => call("fs.append_file", args),
-      /** Replace lines in file. Params: path (required), content (required), from_line (0-based), to_line (-1=end) */
-      replace_file: (args: { path: string; content: string; from_line?: number; to_line?: number }) =>
-        call("fs.replace_file", args),
-      /** Update file content (overwrite). Params: path (required), content (required) */
-      update_file: (args: { path: string; content: string }) => call("fs.update_file", args),
-      /** List files in directory. Params: path (required) */
-      list_files: (args: { path: string }) => call("fs.list_files", args),
-      /** Delete a file. Params: path (required) */
-      delete_file: (args: { path: string }) => call("fs.delete_file", args),
-      /** Delete a directory. Params: path (required) */
-      delete_directory: (args: { path: string }) => call("fs.delete_directory", args),
-      /** Create a directory. Params: path (required) */
-      create_directory: (args: { path: string }) => call("fs.create_directory", args),
-      /** Move file or directory. Params: source (required), destination (required) */
-      move_path: (args: { source: string; destination: string }) => call("fs.move_path", args),
-      /** Copy file or directory. Params: source (required), destination (required) */
-      copy_path: (args: { source: string; destination: string }) => call("fs.copy_path", args),
-    },
-
-    // Messaging
-    send_message: sendMessage,
-    ask,
 
     /** List all message buses. */
     bus: {
@@ -329,91 +271,52 @@ export function createAgentApi(deps: AgentApiDeps): Record<string, unknown> {
         call("mail.append", args),
     },
 
-    // CalDAV
-    caldav: {
-      /** Get OAuth URL for Google CalDAV. Returns URL string; user opens in browser. */
-      oauth_browser: () => call("caldav.oauth_browser", {}),
-      /** Connect to CalDAV. Params: authMethod (Basic|OAuth), serverUrl?, username?, password?, provider?, refreshToken?, credentials_password_id? (for OAuth) */
-      connect: (args: {
-        authMethod: "Basic" | "OAuth";
-        serverUrl?: string;
-        username?: string;
-        password?: string;
-        provider?: string;
-        refreshToken?: string;
-        credentials_password_id?: string;
-      }) => call("caldav.connect", args),
-      /** Disconnect from CalDAV. */
-      disconnect: () => call("caldav.disconnect", {}),
-      /** List calendars. */
-      list_calendars: () => call("caldav.list_calendars", {}),
-      /** List events in range. Params: calendarUrl, start, end (required) */
-      list_events: (args: { calendarUrl: string; start: string; end: string }) =>
-        call("caldav.list_events", args),
-      /** Get event by URL. Params: calendarUrl, objectUrl (required) */
-      get_event: (args: { calendarUrl: string; objectUrl: string }) =>
-        call("caldav.get_event", args),
-      /** Create event. Params: calendarUrl, filename, iCalString (required) */
-      create_event: (args: {
-        calendarUrl: string;
-        filename: string;
-        iCalString: string;
-      }) => call("caldav.create_event", args),
-      /** Update event. Params: calendarObject (required) */
-      update_event: (args: { calendarObject: string }) => call("caldav.update_event", args),
-      /** Delete event. Params: calendarObject (required) */
-      delete_event: (args: { calendarObject: string }) => call("caldav.delete_event", args),
-      /** Get connection status. */
-      status: () => call("caldav.status", {}),
-    },
-
     // Telegram
     /** Connect to Telegram. Params: phone (required) */
     telegram_connect: (args: { phone: string }) => call("telegram_connect", args),
     /** Resolve username to bus_id. Params: username (required) */
     telegram_search: (args: { username: string }) => call("telegram_search", args),
 
-    // VM power control
-    vm: {
+    // VM power control (vmControl avoids conflict with Node's vm module in sandbox)
+    vmControl: {
       /** Power on a VM. Params: vm_id (required) */
       power_on: (args: { vm_id: string }) => call("vm.power_on", args),
       /** Force-kill a VM. Shut down the VM with shutdown -h now (via vm_serial) before killing. Params: vm_id (required) */
       kill: (args: { vm_id: string }) => call("vm.kill", args),
     },
 
-    // VM serial (Linux VM console)
-    vm_serial: {
-      /** Connect to VM serial console. Params: vm_id (required) */
-      connect: async (args: { vm_id: string }) => {
-        const r = await connectVmSerial(args.vm_id);
-        return r.ok ? "Connected to VM serial console." : `Error: ${r.error ?? "Failed"}`;
-      },
-      /** Read buffered output from VM serial. Params: vm_id (required) */
-      read: async (args: { vm_id: string }) =>
-        readVmSerial(args.vm_id, true) || "(no output yet)",
-      /** Write file content to VM serial (raw, no escaping). Path relative to fs root. Use for large bash scripts. Params: vm_id (required), path (required) */
-      write_from_file: async (args: { vm_id: string; path: string }) => {
-        const r = sendFileToVmSerial(args.vm_id, args.path);
-        return r.ok ? "Sent." : `Error: ${r.error ?? "Failed"}`;
-      },
-      /** Send text/keystrokes to VM serial. Use chars for unambiguous control (each element = one char). Params: vm_id (required), data? (string), chars? (string[]), raw? (boolean) */
-      write: async (args: {
-        vm_id: string;
-        data?: string;
-        chars?: string[];
-        raw?: boolean;
-      }) => {
-        const { vm_id, data, chars, raw } = args;
-        const opts = chars != null && chars.length > 0 ? { chars } : data != null ? { data, raw } : undefined;
-        if (!opts) return "Error: data or chars is required";
-        const r = writeVmSerial(vm_id, opts);
-        return r.ok ? "Sent." : `Error: ${r.error ?? "Failed"}`;
-      },
-      /** Disconnect from VM serial. Params: vm_id (required) */
-      disconnect: async (args: { vm_id: string }) => {
-        disconnectVmSerial(args.vm_id);
-        return "Disconnected.";
-      },
-    },
+    // VM serial (Linux VM console) — only in setup mode
+    ...(deps.setupMode
+      ? {
+          vm_serial: {
+            connect: async (args: { vm_id: string }) => {
+              const r = await connectVmSerial(args.vm_id);
+              return r.ok ? "Connected to VM serial console." : `Error: ${r.error ?? "Failed"}`;
+            },
+            read: async (args: { vm_id: string }) =>
+              readVmSerial(args.vm_id, true) || "(no output yet)",
+            write_from_file: async (args: { vm_id: string; path: string }) => {
+              const r = sendFileToVmSerial(args.vm_id, args.path);
+              return r.ok ? "Sent." : `Error: ${r.error ?? "Failed"}`;
+            },
+            write: async (args: {
+              vm_id: string;
+              data?: string;
+              chars?: string[];
+              raw?: boolean;
+            }) => {
+              const { vm_id, data, chars, raw } = args;
+              const opts = chars != null && chars.length > 0 ? { chars } : data != null ? { data, raw } : undefined;
+              if (!opts) return "Error: data or chars is required";
+              const r = writeVmSerial(vm_id, opts);
+              return r.ok ? "Sent." : `Error: ${r.error ?? "Failed"}`;
+            },
+            disconnect: async (args: { vm_id: string }) => {
+              disconnectVmSerial(args.vm_id);
+              return "Disconnected.";
+            },
+          },
+        }
+      : {}),
   };
 }

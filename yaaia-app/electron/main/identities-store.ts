@@ -58,33 +58,11 @@ function sanitizeIdentifier(s: string): string {
   return s.trim().toLowerCase().replace(/[^a-z0-9@._-]/g, "_").slice(0, MAX_IDENTIFIER_LEN) || "unnamed";
 }
 
-/** Ensure default "user" identity exists (root bus, trust root). */
-function ensureDefaultIdentity(): void {
-  const items = loadIdentities();
-  const def = items.find((e) => e.identifier === DEFAULT_IDENTIFIER);
-  if (!def) {
-    const newDef: Identity = {
-      id: randomUUID(),
-      name: "User",
-      identifier: DEFAULT_IDENTIFIER,
-      trust_level: "root",
-      bus_ids: ["root"],
-    };
-    saveIdentities([...items, newDef]);
-    ensureIdentityNoteDir();
-    const notePath = join(IDENTITIES_NOTES_DIR, `${DEFAULT_IDENTIFIER}.md`);
-    if (!existsSync(notePath)) {
-      writeFileSync(notePath, "# User\n\nContacts and relevant information.\n", "utf-8");
-    }
-  }
-}
-
 function ensureIdentityNoteDir(): void {
   mkdirSync(IDENTITIES_NOTES_DIR, { recursive: true });
 }
 
 export function identityList(): Identity[] {
-  ensureDefaultIdentity();
   return loadIdentities();
 }
 
@@ -171,9 +149,6 @@ export function identityDelete(idOrIdentifier: string): void {
   const items = loadIdentities();
   const entry = items.find((e) => e.id === idOrIdentifier || e.identifier === idOrIdentifier);
   if (!entry) throw new Error(`Identity not found: ${idOrIdentifier}`);
-  if (entry.identifier === DEFAULT_IDENTIFIER) {
-    throw new Error("Cannot delete the 'user' identity");
-  }
   saveIdentities(items.filter((e) => e.id !== entry.id));
   const notePath = join(IDENTITIES_NOTES_DIR, `${entry.identifier}.md`);
   if (existsSync(notePath)) {
@@ -205,10 +180,8 @@ export function identitySetNote(identifier: string, content: string): void {
  * - root → "user"
  * - telegram-X → identity with bus_ids containing telegram-X
  * - email-X + sender → identity with identifier=sender and bus_ids containing email-X
- * - caldav-X-Y → identity with identifier=caldav-X-Y or bus_ids containing it
  */
 export function resolveIdentity(busId: string, senderEmail?: string): Identity | null {
-  ensureDefaultIdentity();
   const items = loadIdentities();
 
   if (busId === "root") {
@@ -222,10 +195,6 @@ export function resolveIdentity(busId: string, senderEmail?: string): Identity |
   if (busId.startsWith("email-") && senderEmail) {
     const normalized = senderEmail.trim().toLowerCase();
     return items.find((e) => e.identifier === normalized && e.bus_ids.includes(busId)) ?? null;
-  }
-
-  if (busId.startsWith("caldav-")) {
-    return items.find((e) => e.identifier === busId || e.bus_ids.includes(busId)) ?? null;
   }
 
   return items.find((e) => e.bus_ids.includes(busId)) ?? null;
@@ -242,7 +211,7 @@ export function isBusTrusted(busId: string, senderEmail?: string): boolean {
   return getTrustLevelForBus(busId, senderEmail) === "root";
 }
 
-/** Update trust_level of identity that contains this bus_id. For root/telegram/caldav. Email needs sender. */
+/** Update trust_level of identity that contains this bus_id. For root/telegram. Email needs sender. */
 export function identityUpdateTrustByBusId(busId: string, trust_level: IdentityTrustLevel): boolean {
   const identity = resolveIdentity(busId);
   if (!identity) return false;

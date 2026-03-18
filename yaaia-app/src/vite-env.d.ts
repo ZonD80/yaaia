@@ -56,17 +56,30 @@ interface ElectronAPI {
   onAskUserPopup: (callback: (info: { clarification: string; assessment: string; attempt: number }) => void) => () => void;
   onAskUserPopupClose: (callback: () => void) => () => void;
   onTaskStart: (callback: (info: { summary: string }) => void) => () => void;
-  onFinalizeTaskPopup: (callback: (info: { assessment: string; clarification: string; is_successful: boolean; detailed_report: string }) => void) => () => void;
+  onFinalizeTaskPopup: (callback: (info: { is_successful: boolean }) => void) => () => void;
   onStartupProgress: (callback: (step: string) => void) => () => void;
   onStartupProgressReset: (callback: () => void) => () => void;
   onAgentMessage: (callback: (content: string) => void) => () => void;
   onTelegramMessage: (callback: (payload: { bus_id: string; user_id: number; user_name: string; content: string }) => void) => () => void;
   onEmailMessage: (callback: (payload: { bus_id: string; user_id: number; user_name: string; content: string; instruction?: string }) => void) => () => void;
-  onCaldavEvent: (callback: (payload: { bus_id: string; content: string; instruction?: string }) => void) => () => void;
-  onCaldavEventDeleted: (callback: (payload: { eventUid: string; busId: string }) => void) => () => void;
   onScheduleTrigger: (callback: (payload: { msg: string; injectHandled?: boolean } | string) => void) => () => void;
+  onAgentDrain: (callback: (payload?: string) => void) => () => void;
   onTelegramLoginRequest: (callback: (info: { step: "phone" | "code" | "password" }) => void) => () => void;
   telegramLoginReply: (value: string) => Promise<void>;
+  codexAuthStatus: () => Promise<{ authenticated: boolean }>;
+  codexLogin: () => Promise<{ ok: boolean; error?: string }>;
+  codexLogout: () => Promise<void>;
+  googleApiStatus: () => Promise<{ authorized: boolean }>;
+  googleApiAuthorize: () => Promise<{ ok: boolean; error?: string }>;
+  googleApiLogout: () => Promise<void>;
+  vmList: () => Promise<Array<{ id: string; name: string; path: string; status: string; ramMb: number; diskGb: number }>>;
+  vmCreate: (options?: { isoPath?: string; ramMb?: number; diskGb?: number }) => Promise<{ ok: boolean; vmId?: string; error?: string }>;
+  vmStart: (vmId: string) => Promise<void>;
+  vmStop: (vmId: string) => Promise<void>;
+  vmDelete: (vmId: string) => Promise<void>;
+  vmShowConsole: (vmId: string) => Promise<void>;
+  vmPickIso: () => Promise<string | null>;
+  vmOpenSerialConsole: () => Promise<void>;
 }
 
 declare global {
@@ -75,4 +88,4 @@ declare global {
   }
 }
 
-export {};
+export { };

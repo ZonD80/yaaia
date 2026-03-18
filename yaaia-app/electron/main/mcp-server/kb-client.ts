@@ -1,11 +1,13 @@
 /**
  * Storage client: file operations under ~/yaaia/storage.
- * Plain markdown files only. Used by history-store.
+ * Plain markdown files only. Used by message-db.
  */
 
+import { app } from "electron";
 import { join, resolve, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
-import { mkdirSync, readdirSync, readFileSync, writeFileSync, unlinkSync, statSync, existsSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, writeFileSync, unlinkSync, statSync, existsSync, copyFileSync } from "node:fs";
 
 const YAAIA_DIR = join(homedir(), "yaaia");
 const STORAGE_ROOT = join(YAAIA_DIR, "storage");
@@ -150,9 +152,28 @@ export function kbEnsureCollection(collectionName: string): void {
   mkdirSync(fullPath, { recursive: true });
 }
 
-/** Ensure storage/history, storage/shared, storage/skills exist. */
+/** Ensure storage/history, storage/shared, storage/shared/skills exist. */
 export function ensureStorageDirs(): void {
-  for (const sub of ["history", "shared", "skills"]) {
+  for (const sub of ["history", "shared", "shared/skills"]) {
     mkdirSync(join(STORAGE_ROOT, sub), { recursive: true });
+  }
+}
+
+/** Copy yaaia-vm-agent from app resources to shared if present. VM needs it in shared for virtiofs. */
+export function ensureVmAgentInShared(): void {
+  const __dirname = dirname(fileURLToPath(import.meta.url));
+  const resourcesDir = app.isPackaged
+    ? join(process.resourcesPath)
+    : join(__dirname, "..", "..", "resources");
+  const src = join(resourcesDir, "yaaia-vm-agent");
+  const sharedDir = join(STORAGE_ROOT, "shared");
+  const dest = join(sharedDir, "yaaia-vm-agent");
+  if (existsSync(src)) {
+    mkdirSync(sharedDir, { recursive: true });
+    try {
+      copyFileSync(src, dest);
+    } catch {
+      /* ignore copy errors */
+    }
   }
 }

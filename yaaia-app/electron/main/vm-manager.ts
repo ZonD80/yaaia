@@ -1,7 +1,10 @@
 import { request as httpRequest } from "node:http";
 import { getVmPort } from "./vm-ports.js";
+import { startYaaiaVm } from "./vm-launcher.js";
 
 const VM_HOST = "127.0.0.1";
+
+const CONNECTION_ERROR_RE = /port not found|connection lost|not running|ECONNREFUSED|socket hang up|ECONNRESET|ETIMEDOUT/i;
 
 export interface VmInfo {
   id: string;
@@ -33,6 +36,14 @@ function request<T>(path: string, init?: { method?: string; body?: string }): Pr
       (res) => {
         const chunks: Buffer[] = [];
         res.on("data", (chunk) => chunks.push(chunk));
+        res.on("error", (err) => {
+          const msg = err.message;
+          if (/socket hang up|ECONNRESET|ETIMEDOUT|ECONNREFUSED/i.test(msg)) {
+            reject(new Error("YaaiaVM connection lost. Is YaaiaVM running?"));
+          } else {
+            reject(err);
+          }
+        });
         res.on("end", () => {
           const buf = Buffer.concat(chunks);
           const text = buf.toString("utf-8");
@@ -55,8 +66,8 @@ function request<T>(path: string, init?: { method?: string; body?: string }): Pr
     );
     req.on("error", (err) => {
       const msg = err.message;
-      if (msg.includes("ECONNREFUSED") || msg.includes("connect")) {
-        reject(new Error("YaaiaVM not running. Start YaaiaVM first."));
+      if (/ECONNREFUSED|socket hang up|ECONNRESET|ETIMEDOUT/i.test(msg)) {
+        reject(new Error("YaaiaVM not running or connection lost. Start YaaiaVM first."));
       } else {
         reject(err);
       }
@@ -66,9 +77,22 @@ function request<T>(path: string, init?: { method?: string; body?: string }): Pr
   });
 }
 
+/** Run request; on connection error, try to start YaaiaVM and retry once. */
+async function requestWithAutoStart<T>(path: string, init?: { method?: string; body?: string }): Promise<T> {
+  try {
+    return await request<T>(path, init);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (!CONNECTION_ERROR_RE.test(msg)) throw err;
+    const startResult = await startYaaiaVm();
+    if (!startResult.ok) throw err;
+    return request<T>(path, init);
+  }
+}
+
 export async function listVms(): Promise<VmInfo[]> {
   try {
-    const data = await request<{ ok: boolean; vms?: VmInfo[] }>("/vms");
+    const data = await requestWithAutoStart<{ ok: boolean; vms?: VmInfo[] }>("/vms");
     if (!data.ok || !data.vms) return [];
     return data.vms;
   } catch {
@@ -90,7 +114,7 @@ export async function createVm(options?: CreateVmOptions): Promise<{ ok: boolean
       ram_mb: opts.ramMb ?? undefined,
       disk_gb: opts.diskGb ?? undefined,
     });
-    const data = await request<{ ok: boolean; vm?: VmInfo; error?: string }>("/create", {
+    const data = await requestWithAutoStart<{ ok: boolean; vm?: VmInfo; error?: string }>("/create", {
       method: "POST",
       body,
     });
@@ -106,7 +130,7 @@ export async function createVm(options?: CreateVmOptions): Promise<{ ok: boolean
 
 export async function startVm(vmId: string): Promise<{ ok: boolean; error?: string }> {
   try {
-    const data = await request<{ ok: boolean; error?: string }>("/start/" + encodeURIComponent(vmId), {
+    const data = await requestWithAutoStart<{ ok: boolean; error?: string }>("/start/" + encodeURIComponent(vmId), {
       method: "POST",
     });
     if (data.ok) return { ok: true };
@@ -122,7 +146,7 @@ export async function startVm(vmId: string): Promise<{ ok: boolean; error?: stri
 export async function stopVm(vmId: string, force?: boolean): Promise<{ ok: boolean; error?: string }> {
   try {
     const body = force === true ? JSON.stringify({ force: true }) : undefined;
-    const data = await request<{ ok: boolean; error?: string }>("/stop/" + encodeURIComponent(vmId), {
+    const data = await requestWithAutoStart<{ ok: boolean; error?: string }>("/stop/" + encodeURIComponent(vmId), {
       method: "POST",
       body,
     });
@@ -138,7 +162,7 @@ export async function stopVm(vmId: string, force?: boolean): Promise<{ ok: boole
 
 export async function deleteVm(vmId: string): Promise<{ ok: boolean; error?: string }> {
   try {
-    const data = await request<{ ok: boolean; error?: string }>("/delete/" + encodeURIComponent(vmId), {
+    const data = await requestWithAutoStart<{ ok: boolean; error?: string }>("/delete/" + encodeURIComponent(vmId), {
       method: "POST",
     });
     if (data.ok) return { ok: true };
@@ -153,7 +177,7 @@ export async function deleteVm(vmId: string): Promise<{ ok: boolean; error?: str
 
 export async function showConsoleVm(vmId: string): Promise<{ ok: boolean; error?: string }> {
   try {
-    const data = await request<{ ok: boolean; error?: string }>("/console/" + vmId, { method: "POST" });
+    const data = await requestWithAutoStart<{ ok: boolean; error?: string }>("/console/" + vmId, { method: "POST" });
     if (data.ok) return { ok: true };
     return { ok: false, error: (data as { error?: string }).error ?? "Failed to show console" };
   } catch (err) {
@@ -166,7 +190,7 @@ export async function showConsoleVm(vmId: string): Promise<{ ok: boolean; error?
 
 export async function getVmSerialPort(vmId: string): Promise<number | null> {
   try {
-    const data = await request<{ ok: boolean; port?: number }>("/serial-port/" + encodeURIComponent(vmId));
+    const data = await requestWithAutoStart<{ ok: boolean; port?: number }>("/serial-port/" + encodeURIComponent(vmId));
     if (data.ok && typeof data.port === "number") return data.port;
     return null;
   } catch {

@@ -12,7 +12,7 @@ import {
   ensureBus,
   getBusHistorySlice,
   ROOT_BUS_ID,
-} from "./message-bus-store.js";
+} from "./message-db.js";
 import {
   passwordsList,
   passwordsGet,
@@ -20,7 +20,6 @@ import {
   passwordsDelete,
 } from "./passwords-store.js";
 import { addSchedule, listSchedules, getStartupTask, deleteSchedule } from "./schedule-store.js";
-import { callFsToolDirect } from "./fs-direct.js";
 import {
   mailConnect,
   formatImapError,
@@ -54,26 +53,11 @@ import {
   mailAppend,
 } from "./mail-client.js";
 import {
-  startGoogleOAuthBrowserServer,
-  caldavConnect,
-  caldavDisconnect,
-  caldavInitAndWatch,
-  caldavListCalendars,
-  caldavListEvents,
-  caldavGetEvent,
-  caldavCreateEvent,
-  caldavUpdateEvent,
-  caldavDeleteEvent,
-  caldavRemoveFromLastKnown,
-  parseIcsEventUid,
-} from "./caldav-client.js";
-import { removeEventTaskMapping } from "./caldav-event-tasks-store.js";
-import {
   loadBusProperties,
   saveBusProperties,
   removeMessagesFromBusHistoryByMailUids,
   removeMessagesFromBusHistoryByEventUids,
-} from "./history-store.js";
+} from "./message-db.js";
 import { startVm, stopVm } from "./vm-manager.js";
 import {
   identityList,
@@ -87,12 +71,24 @@ import {
 
 let directToolsConfig: McpServerConfig | null = null;
 
+/** Thrown by vm.power_on in non-setup mode to abort eval. Caught in agent-eval. */
+export class VmPowerOnAbortError extends Error {
+  constructor() {
+    super("vm.power_on abort");
+    this.name = "VmPowerOnAbortError";
+  }
+}
+
 export function setDirectToolsConfig(config: McpServerConfig | null): void {
   directToolsConfig = config;
 }
 
 export function getDirectToolsAppConfig(): McpServerConfig["appConfig"] | null {
   return directToolsConfig?.appConfig ?? null;
+}
+
+export function getDirectToolsSetupMode(): boolean {
+  return directToolsConfig?.setupMode ?? false;
 }
 
 function logToolCall(toolName: string, args: unknown): void {
@@ -107,19 +103,6 @@ function validateUnknownParams(args: unknown, allowedKeys: Set<string>): string 
   const unknown = Object.keys(a).filter((k) => !allowedKeys.has(k));
   if (unknown.length === 0) return null;
   return `Unknown params: ${unknown.join(", ")}`;
-}
-
-/** Ensure assessment/clarification starts with bus_id:. Prepend defaultBus when missing. */
-function ensureBusIdPrefix(s: string, defaultBus: string): string {
-  if (!s.trim()) return s;
-  const colonIdx = s.indexOf(":");
-  if (colonIdx > 0) {
-    const prefix = s.slice(0, colonIdx).trim();
-    if (prefix === ROOT_BUS_ID || /^telegram-\d+$/.test(prefix) || /^email-[a-zA-Z0-9_-]+$/.test(prefix) || /^caldav-[a-zA-Z0-9_-]+-[a-zA-Z0-9_-]+$/.test(prefix)) {
-      return s;
-    }
-  }
-  return `${defaultBus}: ${s}`;
 }
 
 function stripBusIdAssessmentClarification(args: Record<string, unknown>): Record<string, unknown> {
@@ -373,7 +356,7 @@ export function createDirectCallTool(): AgentApiCallTool {
 
         case "task.finalize":
         case "finalize_task": {
-          const allowed = new Set(["is_successful", "assessment", "clarification"]);
+          const allowed = new Set(["is_successful"]);
           const msg = validateUnknownParams(args, allowed);
           if (msg) {
             recipeStore.appendToolCall(name, args, msg);
@@ -386,10 +369,7 @@ export function createDirectCallTool(): AgentApiCallTool {
               : typeof rawSuccess === "string"
                 ? rawSuccess.toLowerCase() !== "false" && rawSuccess.toLowerCase() !== "0"
                 : true;
-          const taskBus = recipeStore.getTaskBusId() ?? ROOT_BUS_ID;
-          const assessment = ensureBusIdPrefix((typeof a.assessment === "string" ? a.assessment : "").trim(), taskBus);
-          const clarification = ensureBusIdPrefix((typeof a.clarification === "string" ? a.clarification : "").trim(), taskBus);
-          recipeStore.finalize(is_successful, assessment, clarification);
+          recipeStore.finalize(is_successful);
           recipeStore.appendToolCall(name, args, "Task finalized");
           return "Task finalized.";
         }
@@ -574,7 +554,17 @@ export function createDirectCallTool(): AgentApiCallTool {
           const powerResult = await startVm(vmId);
           recipeStore.appendToolCall(name, args, powerResult.ok ? "Started" : powerResult.error ?? "Failed");
           if (!powerResult.ok) return finish(`Error: ${powerResult.error ?? "Failed to start VM"}`);
-          return "VM started.";
+          const setupMode = getDirectToolsSetupMode();
+          if (setupMode) {
+            return [
+              "VM started. Setup checklist:",
+              "1. Check if /mnt/shared is mounted in the VM.",
+              "2. If mounted, ensure it is mounted on boot (e.g. /etc/fstab or systemd mount unit).",
+              "3. If mounted on boot, ensure /mnt/shared/yaaia-vm-agent is configured to launch at system boot after mounts (e.g. systemd service).",
+              "See VM_SETUP.md for details.",
+            ].join("\n");
+          }
+          throw new VmPowerOnAbortError();
         }
 
         case "vm.kill": {
@@ -596,21 +586,13 @@ export function createDirectCallTool(): AgentApiCallTool {
 
         default:
           if (name.startsWith("fs.")) {
-            const baseName = name.replace(/^fs\./, "");
-            const forwardArgs = stripBusIdAssessmentClarification(a);
-            const result = await callFsToolDirect(baseName, forwardArgs);
-            const text = contentToText(result.content);
-            recipeStore.appendToolCall(name, args, text);
-            if (result.isError) return finish(`Error: ${text}`);
-            return text;
+            recipeStore.appendToolCall(name, args, "Removed");
+            return finish(
+              "Error: Host fs tools removed. Use vm-bash blocks for file operations in /mnt/shared (host shared folder)."
+            );
           }
-
           if (name.startsWith("mail.")) {
             return await handleMailTool(name, a, finish);
-          }
-
-          if (name.startsWith("caldav.")) {
-            return await handleCaldavTool(name, a, finish);
           }
 
           recipeStore.appendToolCall(name, args, `Unknown tool: ${name}`);
@@ -870,170 +852,4 @@ export function createDirectCallTool(): AgentApiCallTool {
     }
   }
 
-  async function handleCaldavTool(
-    toolName: string,
-    a: Record<string, unknown>,
-    finish: (s: string) => string
-  ): Promise<string> {
-    const config = directToolsConfig;
-    const busId = ROOT_BUS_ID;
-
-    try {
-      switch (toolName) {
-        case "caldav.oauth_browser": {
-          const msg = validateUnknownParams(a, new Set());
-          if (msg) {
-            recipeStore.appendToolCall(toolName, a, msg);
-            return finish(msg);
-          }
-          const clientId = config?.appConfig?.caldavGoogleClientId?.trim();
-          const clientSecret = config?.appConfig?.caldavGoogleClientSecret?.trim();
-          if (!clientId || !clientSecret) {
-            recipeStore.appendToolCall(toolName, a, "Configure CalDAV Google Client ID and Secret");
-            return finish("Error: Configure CalDAV Google Client ID and Secret in app settings first.");
-          }
-          const { url } = await startGoogleOAuthBrowserServer(clientId, clientSecret);
-          recipeStore.appendToolCall(toolName, a, url);
-          return url;
-        }
-        case "caldav.connect": {
-          const allowed = new Set(["authMethod", "serverUrl", "username", "password", "provider", "refreshToken", "credentials_password_id"]);
-          const msg = validateUnknownParams(a, allowed);
-          if (msg) {
-            recipeStore.appendToolCall(toolName, a, msg);
-            return finish(msg);
-          }
-          const conn = a as {
-            authMethod: "Basic" | "OAuth";
-            serverUrl?: string;
-            username?: string;
-            password?: string;
-            provider?: string;
-            refreshToken?: string;
-            credentials_password_id?: string;
-          };
-          const clientId = config?.appConfig?.caldavGoogleClientId?.trim();
-          const clientSecret = config?.appConfig?.caldavGoogleClientSecret?.trim();
-          let account: string;
-          if (conn.authMethod === "OAuth") {
-            if (!clientId || !clientSecret) {
-              recipeStore.appendToolCall(toolName, a, "Configure CalDAV Google Client ID and Secret");
-              return finish("Error: Configure CalDAV Google Client ID and Secret in app settings first.");
-            }
-            let refreshToken = conn.refreshToken;
-            let username = conn.username;
-            if (conn.credentials_password_id) {
-              const pwd = await passwordsGet(conn.credentials_password_id);
-              const pwdValue = typeof pwd === "string" ? pwd : pwd && typeof pwd === "object" && "value" in pwd ? (pwd as { value: string }).value : null;
-              if (pwdValue) {
-                try {
-                  const cred = JSON.parse(pwdValue as string) as { refreshToken?: string; username?: string };
-                  refreshToken = refreshToken ?? cred.refreshToken;
-                  username = username ?? cred.username;
-                } catch {
-                  /* ignore */
-                }
-              }
-            }
-            await caldavConnect(
-              {
-                authMethod: "OAuth",
-                provider: "google",
-                refreshToken: refreshToken ?? "",
-                username: username ?? "",
-                clientId,
-                clientSecret,
-              },
-              { googleClientId: clientId, googleClientSecret: clientSecret }
-            );
-            account = username || "google";
-          } else {
-            if (!conn.serverUrl || !conn.username || !conn.password) {
-              recipeStore.appendToolCall(toolName, a, "Basic auth requires serverUrl, username, password");
-              return finish("Error: Basic auth requires serverUrl, username, password");
-            }
-            await caldavConnect({
-              authMethod: "Basic",
-              serverUrl: conn.serverUrl,
-              username: conn.username,
-              password: conn.password,
-            });
-            account = conn.username!;
-          }
-          const { calendars } = await caldavInitAndWatch(account);
-          for (const cal of calendars) {
-            ensureBus(cal.busId, `Calendar: ${cal.displayName}`);
-            const props = loadBusProperties(cal.busId);
-            if (props) saveBusProperties({ ...props, url: cal.url });
-          }
-          recipeStore.appendToolCall(toolName, a, "Connected");
-          return `Connected. Bus(es): ${calendars.map((c) => c.busId).join(", ")}`;
-        }
-        case "caldav.disconnect": {
-          await caldavDisconnect();
-          recipeStore.appendToolCall(toolName, a, "Disconnected");
-          return "Disconnected.";
-        }
-        case "caldav.list_calendars": {
-          const calList = await caldavListCalendars();
-          const text = JSON.stringify(calList);
-          recipeStore.appendToolCall(toolName, a, text);
-          return text;
-        }
-        case "caldav.list_events": {
-          const events = a as { calendarUrl: string; start: string; end: string };
-          const eventList = await caldavListEvents(events.calendarUrl, events.start, events.end);
-          const text = JSON.stringify(eventList);
-          recipeStore.appendToolCall(toolName, a, text);
-          return text;
-        }
-        case "caldav.get_event": {
-          const getEv = a as { calendarUrl: string; objectUrl: string };
-          const ev = await caldavGetEvent(getEv.calendarUrl, getEv.objectUrl);
-          const text = JSON.stringify(ev);
-          recipeStore.appendToolCall(toolName, a, text);
-          return text;
-        }
-        case "caldav.create_event": {
-          const createEv = a as { calendarUrl: string; filename: string; iCalString: string };
-          await caldavCreateEvent(createEv.calendarUrl, createEv.filename, createEv.iCalString);
-          recipeStore.appendToolCall(toolName, a, "Event created");
-          return "Event created.";
-        }
-        case "caldav.update_event": {
-          const updateEv = a as { calendarObject: string };
-          await caldavUpdateEvent(updateEv.calendarObject);
-          recipeStore.appendToolCall(toolName, a, "Event updated");
-          return "Event updated.";
-        }
-        case "caldav.delete_event": {
-          const deleteEv = a as { calendarObject: string };
-          const obj = JSON.parse(deleteEv.calendarObject) as { url: string; etag?: string; data?: string };
-          await caldavDeleteEvent(obj);
-          const eventUid = typeof obj.data === "string" ? parseIcsEventUid(obj.data) : undefined;
-          if (eventUid) {
-            removeEventTaskMapping(eventUid);
-            removeMessagesFromBusHistoryByEventUids(busId, [eventUid]);
-            config?.onCaldavEventDeleted?.(eventUid, busId);
-          }
-          caldavRemoveFromLastKnown(obj.url);
-          recipeStore.appendToolCall(toolName, a, "Deleted");
-          return "Event deleted.";
-        }
-        case "caldav.status": {
-          const statusResult = await caldavListCalendars();
-          const text = JSON.stringify(statusResult);
-          recipeStore.appendToolCall(toolName, a, text);
-          return text;
-        }
-        default:
-          recipeStore.appendToolCall(toolName, a, `Unknown caldav tool: ${toolName}`);
-          return finish(`Error: Unknown caldav tool: ${toolName}`);
-      }
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      recipeStore.appendToolCall(toolName, a, msg);
-      return finish(`Error: ${msg}`);
-    }
-  }
 }

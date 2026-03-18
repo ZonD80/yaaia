@@ -1,16 +1,27 @@
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import Anthropic from "@anthropic-ai/sdk";
 import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { getSessionTag } from "../recipe-store.js";
-import { appendToBusHistory, ensureBus, getBusTrustLevel, ROOT_BUS_ID } from "../message-bus-store.js";
-import { isValidBusId, parsePrefixedMessages, type ParsedMessage } from "../message-router.js";
+import { getSessionTag, getCodeBoundary } from "../recipe-store.js";
+import {
+  appendToBusHistory,
+  appendMessage,
+  getBusTrustLevel,
+  ROOT_BUS_ID,
+  getMessagesInWindow,
+} from "../message-db.js";
+import { createStreamHandler, parsePrefixedMessages } from "../stream-handler.js";
 import type { AgentApiRouteCallbacks } from "../agent-api.js";
 import { callCodexApi } from "../codex-client.js";
 import { runAgentCode } from "../agent-eval.js";
 import { generateApiDocs } from "../agent-api-docs.js";
+import { getDirectToolsSetupMode } from "../direct-tools.js";
+import {
+  sendVmScript,
+  appendVmEval,
+  getVmEvalStdout,
+  getVmEvalStderr,
+} from "../vm-eval-server.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -31,7 +42,17 @@ function loadSystemPrompt(apiDocs?: string): string {
   try {
     const base = readFileSync(SYSTEM_PROMPT_PATH, "utf-8").trim();
     const tag = getSessionTag();
+    const boundary = getCodeBoundary();
     let out = base;
+    if (boundary) {
+      out += `
+
+## Code block format (bbtag)
+
+**TypeScript:** \`[${boundary}=ts]\` ... \`[/${boundary}]\`
+**vm-bash:** \`[${boundary}=vm-bash:N:user]\` ... \`[/${boundary}]\` (N = timeout seconds, user = run as, e.g. root)
+- Blocks run sequentially in document order: bash1 → ts1 → bash2 → ts2. Content can include any characters (backticks, quotes, etc.).`;
+    }
     if (apiDocs) {
       out += "\n\n" + apiDocs;
     }
@@ -48,7 +69,7 @@ User messages are wrapped in bracket tags. **Current session tag:** \`${tag}\`
     return out + security;
   } catch (err) {
     console.error("[YAAIA Agent] Failed to load SYSTEM_PROMPT.md:", err);
-    return "Write code in ```ts blocks. Always use task.start at the beginning and task.finalize when done.";
+    return "Write code in [{key}=ts]...[/{key}] blocks.";
   }
 }
 
@@ -130,135 +151,128 @@ function emitStructured(emitChunk: (chunk: string) => void, payload: Record<stri
   emitChunk(MSG_START + JSON.stringify(payload) + MSG_END);
 }
 
-/**
- * Creates a streaming chunk processor that buffers until ``` is seen, then:
- * 1) Parses message-before, routes to buses via onRouteParsedMessages
- * 2) Emits the rest (code block + after) as raw stream
- * Returns { processChunk, flush, wasCutDuringStream }.
- */
-const CODE_BLOCK_RE = /^```(?:ts|typescript|js|javascript)?\s*\n/;
-
-function createStreamChunkProcessor(
-  rawEmitChunk: (chunk: string) => void,
-  onRouteParsedMessages: ((
-    messages: ParsedMessage[],
-    emitChunk: (chunk: string) => void,
-    opts?: OnRouteParsedMessagesOpts
-  ) => Promise<void>) | null
-): {
-  processChunk: (chunk: string) => Promise<void>;
-  flush: () => Promise<void>;
-  wasCutDuringStream: () => boolean;
-} {
-  let buffer = "";
-  let cutDone = false;
-  const chunkQueue: string[] = [];
-  let processing = false;
-
-  async function drain(): Promise<void> {
-    if (processing || chunkQueue.length === 0) return;
-    processing = true;
-    while (chunkQueue.length > 0) {
-      const chunk = chunkQueue.shift()!;
-      if (cutDone) {
-        if (chunk) rawEmitChunk(chunk);
-        continue;
-      }
-      buffer += chunk;
-      const idx = buffer.indexOf("```");
-      if (idx >= 0) {
-        cutDone = true;
-        const messageBefore = buffer.slice(0, idx).trim();
-        const rest = buffer.slice(idx);
-        const hasCodeBlock = CODE_BLOCK_RE.test(rest);
-        emitStructured(rawEmitChunk, { type: "content_end" });
-        if (messageBefore) {
-          const parsed = parsePrefixedMessages(messageBefore);
-          if (parsed.length > 0 && onRouteParsedMessages) {
-            await onRouteParsedMessages(parsed, rawEmitChunk, { skipRoute: hasCodeBlock });
-          } else {
-            rawEmitChunk(messageBefore);
-          }
-        }
-        if (rest) rawEmitChunk(rest);
-        buffer = "";
-      }
-    }
-    processing = false;
-  }
-
-  async function processChunk(chunk: string): Promise<void> {
-    chunkQueue.push(chunk);
-    await drain();
-  }
-
-  async function flush(): Promise<void> {
-    await drain();
-    if (!cutDone && buffer.trim()) {
-      cutDone = true;
-      const messageBefore = buffer.trim();
-      emitStructured(rawEmitChunk, { type: "content_end" });
-      const parsed = parsePrefixedMessages(messageBefore);
-      if (parsed.length > 0 && onRouteParsedMessages) {
-        await onRouteParsedMessages(parsed, rawEmitChunk);
-      } else {
-        rawEmitChunk(messageBefore);
-      }
-    }
-    buffer = "";
-  }
-
-  return {
-    processChunk,
-    flush,
-    wasCutDuringStream: () => cutDone,
-  };
-}
-
-let onAssessmentClarification: ((busId: string, assessment: string, clarification: string) => void) | null = null;
-export type OnRouteParsedMessagesOpts = { skipRoute?: boolean };
-
-let onRouteParsedMessages: ((
-  messages: ParsedMessage[],
-  emitChunk: (chunk: string) => void,
-  opts?: OnRouteParsedMessagesOpts
-) => Promise<void>) | null = null;
-
-export function setOnAssessmentClarification(cb: ((busId: string, assessment: string, clarification: string) => void) | null): void {
-  onAssessmentClarification = cb;
-}
-
-export function setOnRouteParsedMessages(
-  cb: ((messages: ParsedMessage[], emitChunk: (chunk: string) => void, opts?: OnRouteParsedMessagesOpts) => Promise<void>) | null
-): void {
-  onRouteParsedMessages = cb;
-}
-
 let routeCallbacksForEval: AgentApiRouteCallbacks | null = null;
 
 export function setRouteCallbacksForEval(cb: AgentApiRouteCallbacks | null): void {
   routeCallbacksForEval = cb;
 }
 
-/** Extract first ```ts or ```typescript code block. Returns { messageBefore, code, messageAfter }. */
+/** Detect boundary from first [X=ts] or [X=vm-bash:N:user] in text. Returns null if none found. */
+function detectBoundaryFromText(text: string): string | null {
+  const tsMatch = text.match(/\[([a-zA-Z0-9_-]+)=ts\]/);
+  if (tsMatch) return tsMatch[1];
+  const vmMatch = text.match(/\[([a-zA-Z0-9_-]+)=vm-bash:\d+:\w+\]/);
+  if (vmMatch) return vmMatch[1];
+  return null;
+}
+
+export type ExtractedBlock =
+  | { type: "vm-bash"; script: string; timeout: number; user: string }
+  | { type: "ts"; code: string };
+
+/** Extract vm-bash and ts blocks in document order. [{key}=ts], [{key}=vm-bash:N:user], [/key]. */
+function extractBlocks(text: string, boundary: string | null): {
+  messageBefore: string;
+  blocks: ExtractedBlock[];
+  messageAfter: string;
+} {
+  const blocks: ExtractedBlock[] = [];
+  let messageBefore = "";
+  let messageAfter = "";
+
+  const effectiveBoundary = boundary ?? detectBoundaryFromText(text);
+  if (!effectiveBoundary) {
+    messageBefore = text.trim();
+    return { messageBefore, blocks, messageAfter };
+  }
+
+  const openTs = `[${effectiveBoundary}=ts]`;
+  const vmBashRe = new RegExp(`\\[${escapeRe(effectiveBoundary)}=vm-bash:(\\d+):(\\w+)\\]`);
+  const closeTag = `[/${effectiveBoundary}]`;
+
+  let i = 0;
+  let beforeParts: string[] = [];
+  let afterParts: string[] = [];
+  let seenAnyBlock = false;
+
+  while (i < text.length) {
+    const tsStart = text.indexOf(openTs, i);
+    const vmMatch = text.slice(i).match(vmBashRe);
+    const vmStart = vmMatch ? i + (vmMatch.index ?? 0) : -1;
+
+    let nextOpen = -1;
+    let type: "ts" | "vm-bash" | null = null;
+    let timeoutSec = NaN;
+    let runAsUser = "";
+    let openLen = 0;
+
+    if (tsStart >= 0 && (vmStart < 0 || tsStart <= vmStart)) {
+      nextOpen = tsStart;
+      type = "ts";
+      openLen = openTs.length;
+    } else if (vmMatch) {
+      nextOpen = vmStart;
+      type = "vm-bash";
+      timeoutSec = parseInt(vmMatch[1], 10);
+      runAsUser = vmMatch[2]?.trim() ?? "";
+      openLen = vmMatch[0].length;
+    }
+
+    if (type === null || nextOpen < 0) {
+      if (!seenAnyBlock) {
+        beforeParts.push(text.slice(i));
+      } else {
+        afterParts.push(text.slice(i));
+      }
+      break;
+    }
+
+    if (nextOpen > i) {
+      const gap = text.slice(i, nextOpen);
+      if (!seenAnyBlock) beforeParts.push(gap);
+      else afterParts.push(gap);
+    }
+
+    const contentStart = nextOpen + openLen;
+    const closeIdx = text.indexOf(closeTag, contentStart);
+    if (closeIdx < 0) {
+      if (!seenAnyBlock) beforeParts.push(text.slice(nextOpen));
+      else afterParts.push(text.slice(nextOpen));
+      break;
+    }
+
+    seenAnyBlock = true;
+    const content = text.slice(contentStart, closeIdx).trim();
+    i = closeIdx + closeTag.length;
+
+    if (type === "ts" && content) {
+      blocks.push({ type: "ts", code: content });
+    } else if (type === "vm-bash" && !isNaN(timeoutSec) && timeoutSec > 0 && runAsUser) {
+      blocks.push({ type: "vm-bash", script: content, timeout: timeoutSec, user: runAsUser });
+    }
+  }
+
+  messageBefore = beforeParts.join("").trim();
+  messageAfter = afterParts.join("").trim();
+
+  if (!blocks.length && boundary) {
+    const detected = detectBoundaryFromText(text);
+    if (detected && detected !== boundary) {
+      return extractBlocks(text, detected);
+    }
+  }
+  return { messageBefore, blocks, messageAfter };
+}
+
+function escapeRe(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** Legacy: extract first ts block only. */
 function extractCodeBlock(text: string): { messageBefore: string; code: string | null; messageAfter: string } {
-  const tsMatch = text.match(/^([\s\S]*?)```(?:ts|typescript)\n?([\s\S]*?)```([\s\S]*)$/);
-  if (tsMatch) {
-    return {
-      messageBefore: tsMatch[1].trim(),
-      code: tsMatch[2].trim() || null,
-      messageAfter: tsMatch[3].trim(),
-    };
-  }
-  const genericMatch = text.match(/^([\s\S]*?)```\n?([\s\S]*?)```([\s\S]*)$/);
-  if (genericMatch) {
-    return {
-      messageBefore: genericMatch[1].trim(),
-      code: genericMatch[2].trim() || null,
-      messageAfter: genericMatch[3].trim(),
-    };
-  }
-  return { messageBefore: text.trim(), code: null, messageAfter: "" };
+  const { messageBefore, blocks, messageAfter } = extractBlocks(text, getCodeBoundary());
+  const firstTs = blocks.find((b) => b.type === "ts");
+  return { messageBefore, code: firstTs?.code ?? null, messageAfter };
 }
 
 function extractBusIdFromPrefix(s: string): { busId: string; rest: string } {
@@ -272,53 +286,6 @@ function extractBusIdFromPrefix(s: string): { busId: string; rest: string } {
   return { busId: ROOT_BUS_ID, rest: trimmed };
 }
 
-function extractBusIdFromArgs(args: Record<string, unknown>): { busId: string; assessment: string; clarification: string } {
-  const a = String((args?.assessment as string) ?? "").trim();
-  const c = String((args?.clarification as string) ?? "").trim();
-  const fromA = extractBusIdFromPrefix(a);
-  const fromC = extractBusIdFromPrefix(c);
-  const busId = fromA.busId !== ROOT_BUS_ID ? fromA.busId : fromC.busId;
-  return { busId: busId || ROOT_BUS_ID, assessment: fromA.rest || a, clarification: fromC.rest || c };
-}
-
-function emitToolBlockStart(toolName: string, args: Record<string, unknown>, emitChunk: (chunk: string) => void): void {
-  const a = String((args?.assessment as string) ?? "").trim();
-  const c = String((args?.clarification as string) ?? "").trim();
-  const fromA = extractBusIdFromPrefix(a);
-  const fromC = extractBusIdFromPrefix(c);
-  const busId = fromA.busId !== ROOT_BUS_ID ? fromA.busId : fromC.busId;
-  const assessment = fromA.rest || a;
-  const clarification = fromC.rest || c;
-  const isRemote = busId && busId !== ROOT_BUS_ID;
-  if (assessment) emitStructured(emitChunk, { type: "assessment", content: assessment, ...(isRemote && { bus_id: busId }) });
-  if (clarification) emitStructured(emitChunk, { type: "clarification", content: clarification, ...(isRemote && { bus_id: busId }) });
-  // Append assessment and clarification to their respective bus histories; deliver per-bus (assessment and clarification can target different buses)
-  if (assessment || clarification) {
-    const byBus = new Map<string, { assessment?: string; clarification?: string }>();
-    if (assessment && fromA.rest) {
-      const prev = byBus.get(fromA.busId) ?? {};
-      prev.assessment = assessment;
-      byBus.set(fromA.busId, prev);
-    }
-    if (clarification && fromC.rest) {
-      const prev = byBus.get(fromC.busId) ?? {};
-      prev.clarification = clarification;
-      byBus.set(fromC.busId, prev);
-    }
-    for (const [bid, { assessment: aContent, clarification: cContent }] of byBus) {
-      if (!isValidBusId(bid)) continue;
-      ensureBus(bid);
-      const parts: string[] = [];
-      if (aContent) parts.push(`**Assessment:** ${aContent}`);
-      if (cContent) parts.push(`**Clarification:** ${cContent}`);
-      appendToBusHistory(bid, { role: "assistant", content: `[Tool: ${toolName}]\n${parts.join("\n")}` });
-      if (onAssessmentClarification && (aContent || cContent)) {
-        onAssessmentClarification(bid, aContent ?? "", cContent ?? "");
-      }
-    }
-  }
-  emitStructured(emitChunk, { type: "tool_running", name: toolName });
-}
 
 function emitToolBlockResult(
   toolName: string,
@@ -361,10 +328,14 @@ export function setPendingInjectMessage(msg: string | null): void {
   if (msg?.trim()) agentInjectedQueue.push(msg.trim());
 }
 
-function getAndClearAgentInjectedQueue(): string[] {
+export function getAndClearAgentInjectedQueue(): string[] {
   const out = [...agentInjectedQueue];
   agentInjectedQueue.length = 0;
   return out;
+}
+
+export function hasAgentInjectedMessages(): boolean {
+  return agentInjectedQueue.length > 0;
 }
 
 function formatInjectedSection(messages: string[]): string {
@@ -408,20 +379,44 @@ function getAndClearPendingInjectMessage(): string | null {
   return queued.join("\n\n");
 }
 
-/** Returns queued injected messages (formatted + raw) and clears queue. For eval result. */
-export function getAndClearInjectedMessages(): { formatted: string; raw: string } | null {
+function parseQueuedToMessages(queued: string[]): { busId: string; content: string }[] {
+  const result: { busId: string; content: string }[] = [];
+  for (const m of queued) {
+    if (m.startsWith("{")) {
+      try {
+        const p = JSON.parse(m) as { content?: string; bus_id?: string; mail_uid?: number };
+        const busId = p.bus_id ?? "root";
+        let content = String(p.content ?? m);
+        if (p.mail_uid != null) content += `\n\n[IMAP UID: ${p.mail_uid}]`;
+        result.push({ busId, content });
+      } catch {
+        const parsed = parsePrefixedMessages(m);
+        if (parsed.length > 0) for (const p of parsed) result.push({ busId: p.busId, content: p.content });
+        else result.push({ busId: "root", content: m });
+      }
+    } else {
+      const parsed = parsePrefixedMessages(m);
+      if (parsed.length > 0) for (const p of parsed) result.push({ busId: p.busId, content: p.content });
+      else result.push({ busId: "root", content: m });
+    }
+  }
+  return result;
+}
+
+/** Returns queued injected messages (formatted + raw + parsed) and clears queue. For eval result. */
+export function getAndClearInjectedMessages(): { formatted: string; raw: string; messages: { busId: string; content: string }[] } | null {
   const queued = getAndClearAgentInjectedQueue();
   if (queued.length === 0) return null;
   return {
     formatted: formatInjectedSection(queued),
     raw: queued.join("\n\n"),
+    messages: parseQueuedToMessages(queued),
   };
 }
 
 export type AiProvider = "claude" | "openrouter" | "codex";
 
 export interface AgentConfig {
-  mcpPort: number;
   aiProvider: AiProvider;
   claudeApiKey: string;
   claudeModel: string;
@@ -430,8 +425,6 @@ export interface AgentConfig {
   codexModel: string;
 }
 
-let mcpClient: Client | null = null;
-let mcpTransport: SSEClientTransport | null = null;
 let agentConfig: AgentConfig | null = null;
 
 let agentAbortRequested = false;
@@ -471,20 +464,10 @@ export async function startAgent(config: AgentConfig): Promise<void> {
     g.__yaaiaOpenRouterModel = config.openrouterModel;
   }
 
-  const sseUrl = new URL(`http://localhost:${config.mcpPort}/sse`);
-  mcpTransport = new SSEClientTransport(sseUrl);
-  mcpClient = new Client({ name: "yaaia-agent", version: "1.0.0" });
-  await mcpClient.connect(mcpTransport);
-
-  console.log("[YAAIA Agent] Connected to MCP server");
+  console.log("[YAAIA Agent] Ready (code-based, bbtag)");
 }
 
 export function stopAgent(): void {
-  if (mcpTransport) {
-    mcpTransport.close();
-    mcpTransport = null;
-  }
-  mcpClient = null;
   agentConfig = null;
 }
 
@@ -528,6 +511,21 @@ function buildUserMessagesWithTag(
   return messages;
 }
 
+/** Merge consecutive same-role messages. API-only, not stored. No synthetic "continue" — eval results are passed as user. */
+function prepareMessagesForApi(messages: { role: string; content: string }[]): { role: "user" | "assistant"; content: string }[] {
+  const merged: { role: "user" | "assistant"; content: string }[] = [];
+  for (const m of messages) {
+    const role = m.role as "user" | "assistant";
+    const last = merged[merged.length - 1];
+    if (last && last.role === role) {
+      last.content = last.content + (last.content ? "\n\n" : "") + m.content;
+    } else {
+      merged.push({ role, content: m.content });
+    }
+  }
+  return merged;
+}
+
 async function runCodeBasedSendMessage(
   userMessage: string,
   onChunk?: StreamChunkCallback,
@@ -540,7 +538,7 @@ async function runCodeBasedSendMessage(
   const provider = useCodex ? "Codex" : useOpenRouter ? "OpenRouter" : "Claude";
   logVerbose("runCodeBasedSendMessage starting, provider:", provider, "user message length:", userMessage.length);
 
-  const apiDocs = generateApiDocs();
+  const apiDocs = generateApiDocs({ setupMode: getDirectToolsSetupMode(), codeBoundary: getCodeBoundary() });
   const systemPrompt = loadSystemPrompt(apiDocs);
   const tag = getSessionTag();
   const rawEmitChunk = (chunk: string) => {
@@ -587,22 +585,27 @@ async function runCodeBasedSendMessage(
       continue;
     }
 
-    const streamProcessor = createStreamChunkProcessor(rawEmitChunk, onRouteParsedMessages);
+    const streamHandler = createStreamHandler({ emitChunk: rawEmitChunk });
+    const processChunk = (chunk: string) => {
+      try {
+        streamHandler.processChunk(chunk);
+      } catch (e) {
+        console.error("[YAAIA] Stream chunk error:", e);
+      }
+    };
+    emitStructured(emitChunk, { type: "thinking" });
     let responseText: string;
     if (useCodex) {
       logVerbose("Calling Codex API, model:", agentConfig!.codexModel || "gpt-5.4-codex");
-      const codexMessages: { role: "user" | "assistant"; content: string }[] = messages.map((m) => ({
-        role: m.role,
-        content: m.content,
-      }));
+      const codexMessages = prepareMessagesForApi(messages);
       const result = await callCodexApi(
         systemPrompt,
         codexMessages,
         agentConfig!.codexModel || "gpt-5.4-codex",
         lastCodexReasoningEncrypted,
-        (chunk) => streamProcessor.processChunk(chunk).catch((e) => console.error("[YAAIA] Codex stream chunk error:", e))
+        (chunk) => processChunk(chunk)
       );
-      await streamProcessor.flush();
+      streamHandler.flush();
       responseText = result.text;
       lastCodexReasoningEncrypted = result.reasoningEncrypted;
       logVerbose("Codex response received, length:", responseText.length);
@@ -618,7 +621,7 @@ async function runCodeBasedSendMessage(
         },
         body: JSON.stringify({
           model,
-          messages: [{ role: "system", content: systemPrompt }, ...messages],
+          messages: [{ role: "system", content: systemPrompt }, ...prepareMessagesForApi(messages)],
           max_tokens: 8192,
           stream: true,
           reasoning: { enabled: true },
@@ -649,14 +652,14 @@ async function runCodeBasedSendMessage(
             const content = delta?.content;
             if (typeof content === "string") {
               responseText += content;
-              await streamProcessor.processChunk(content);
+              processChunk(content);
             }
           } catch {
             /* skip malformed */
           }
         }
       }
-      await streamProcessor.flush();
+      streamHandler.flush();
       logVerbose("OpenRouter response received, content length:", responseText.length);
     } else {
       logVerbose("Calling Claude API, model:", agentConfig!.claudeModel || "claude-sonnet-4-6");
@@ -668,55 +671,67 @@ async function runCodeBasedSendMessage(
           model: agentConfig!.claudeModel || "claude-sonnet-4-6",
           max_tokens: 16384,
           system: systemPrompt,
-          messages: messages as Anthropic.MessageParam[],
+          messages: prepareMessagesForApi(messages) as Anthropic.MessageParam[],
           cache_control: { type: "ephemeral" },
           thinking: { type: "adaptive" },
         },
         { headers: { "anthropic-beta": "context-1m-2025-08-07" } }
       );
-      stream.on("text", (delta) => streamProcessor.processChunk(delta).catch((e) => console.error("[YAAIA] Stream chunk error:", e)));
+      stream.on("text", (delta) => processChunk(delta));
       const message = await stream.finalMessage();
-      await streamProcessor.flush();
+      streamHandler.flush();
       const textBlock = message.content.find((b) => (b as { type?: string }).type === "text") as { text?: string } | undefined;
       responseText = textBlock?.text ?? "";
       logVerbose("Claude response received, length:", responseText.length);
     }
 
     const fullText = responseText.trim();
-    const { messageBefore, code, messageAfter } = extractCodeBlock(fullText);
+    const { blocks } = extractBlocks(fullText, getCodeBoundary());
+    const streamedMsgs = streamHandler.getStreamedMessages();
+    const hasTs = blocks.some((b) => b.type === "ts");
 
-    const alreadyCut = streamProcessor.wasCutDuringStream();
-    if (messageBefore && !alreadyCut) {
-      emitStructured(emitChunk, { type: "content_end" });
-      const parsed = parsePrefixedMessages(messageBefore);
-      if (parsed.length > 0 && onRouteParsedMessages) {
-        await onRouteParsedMessages(parsed, emitChunk);
-      } else {
-        emitChunk(messageBefore);
+    if (!hasTs) {
+      const fromTime = streamedMsgs[0]?.streamingStart ?? new Date().toISOString();
+      const toTime = streamedMsgs[streamedMsgs.length - 1]?.streamingEnd ?? new Date().toISOString();
+      const external = getMessagesInWindow(fromTime, toTime, false, "user");
+      if (external.length === 0) {
+        return { text: fullText || "" };
       }
+      messages.push({ role: "assistant", content: fullText });
+      const wrapUser = tag ? wrapUserContent(external.map((m) => m.content).join("\n\n"), tag) : external.map((m) => m.content).join("\n\n");
+      messages.push({ role: "user", content: wrapUser });
+      emitStructured(emitChunk, { type: "user_injected", content: external.map((m) => m.content).join("\n\n") });
+      continue;
     }
 
-    if (!code) {
-      if (messageAfter) {
-        const parsed = parsePrefixedMessages(messageAfter);
-        if (parsed.length > 0 && onRouteParsedMessages) {
-          await onRouteParsedMessages(parsed, emitChunk);
+    // Run blocks sequentially: bash1 -> ts1 -> bash2 -> ts2 as they appear
+    let evalResult: Awaited<ReturnType<typeof runAgentCode>> | null = null;
+    for (const block of blocks) {
+      if (block.type === "vm-bash") {
+        const entry = sendVmScript(block.script, block.user);
+        if (entry) {
+          await entry.waitOrTimeout(block.timeout);
+          appendVmEval(entry.stdout, entry.stderr);
         } else {
-          emitChunk(messageAfter);
+          const errMsg = "VM not connected, it may be powered off";
+          appendVmEval(errMsg, errMsg);
         }
+      } else {
+        logVerbose("Running ts eval, code length:", block.code.length);
+        if (process.env.DEBUG?.includes("yaaia")) {
+          const stdout = getVmEvalStdout();
+          console.log("[YAAIA vm-bash] vmEvalStdout len=", stdout.length, "stdout=", JSON.stringify(stdout.slice(-500)));
+        }
+        evalResult = await runAgentCode(block.code, {
+          routeCallbacks,
+          getInjectedMessages: getAndClearInjectedMessages,
+          vmEvalStdout: getVmEvalStdout(),
+          vmEvalStderr: getVmEvalStderr(),
+        });
       }
-      const finalText = messageBefore + (messageAfter ? "\n\n" + messageAfter : "");
-      return { text: finalText || "" };
     }
-
-    const toolEncounteredAt = new Date().toISOString();
-    emitStructured(emitChunk, { type: "tool_running", name: "eval" });
-    logVerbose("Running eval, code length:", code.length);
-    const evalResult = await runAgentCode(code, {
-      routeCallbacks,
-      getInjectedMessages: getAndClearInjectedMessages,
-      onOutputChunk: (text) => emitChunk(text),
-    });
+    const evalEndTime = new Date().toISOString();
+    if (!evalResult) evalResult = { ok: true, output: "", injected: undefined, askUserReply: undefined };
 
     const outputText = evalResult.ok
       ? evalResult.output
@@ -724,48 +739,59 @@ async function runCodeBasedSendMessage(
 
     logVerbose("Eval finished, ok:", evalResult.ok, "output length:", outputText.length);
 
+    if (evalResult.vmPowerOnAbort) {
+      return { text: outputText.trim() };
+    }
+
+    const fromTime = streamedMsgs[0]?.streamingStart ?? new Date().toISOString();
+    const streamEndTime = streamedMsgs[streamedMsgs.length - 1]?.streamingEnd ?? fromTime;
+    const toTime = streamEndTime > evalEndTime ? streamEndTime : evalEndTime;
+    const external = getMessagesInWindow(fromTime, toTime, false, "user");
+
     if (evalResult.injected) {
       emitStructured(emitChunk, { type: "user_injected", content: evalResult.injected.raw });
     }
+    if (evalResult.askUserReply != null) {
+      emitStructured(emitChunk, { type: "user_injected", content: evalResult.askUserReply });
+    }
 
-    const escapeHtml = (s: string) =>
-      s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
-    const codeEscaped = escapeHtml(code);
-    const outputEscaped = escapeHtml(outputText);
-    const injectedEscaped = evalResult.injected ? escapeHtml(evalResult.injected.formatted) : "";
+    if (!evalResult.ok && outputText.trim()) {
+      const errContent = `root:${outputText.trim()}`;
+      appendMessage(ROOT_BUS_ID, { role: "user", content: errContent, during_eval: true });
+      const { deliverMessage } = await import("../message-delivery.js");
+      deliverMessage(ROOT_BUS_ID, errContent).catch(() => { });
+      emitChunk(errContent + "\n");
+    }
 
-    const accordionHtml = `<details class="tool-result-debug" open><summary>eval</summary>
-<div class="eval-section"><strong>Code:</strong><pre><code>${codeEscaped}</code></pre></div>
-<div class="eval-section"><strong>Output:</strong><pre>${outputEscaped}</pre></div>${evalResult.injected ? `<div class="eval-section"><strong>Injected:</strong><pre>${injectedEscaped}</pre></div>` : ""}
-</details>`;
-
-    const userContent = `Code output:\n${outputText}${evalResult.injected ? evalResult.injected.formatted : ""}${messageAfter ? `\n\nMessage after code: ${messageAfter}` : ""}`;
-
-    emitStructured(emitChunk, {
-      type: "tool_call",
-      name: "eval",
-      accordion: accordionHtml,
-      content: outputText,
-    });
-
-    appendToBusHistory(ROOT_BUS_ID, {
-      role: "assistant",
-      content: `[Tool: eval]\n${outputText}`,
-      timestamp: toolEncounteredAt,
-    });
-
-    messages.push({ role: "assistant", content: fullText });
-    messages.push({
-      role: "user",
-      content: userContent,
-    });
-
-    if (messageAfter) {
-      const parsed = parsePrefixedMessages(messageAfter);
-      if (parsed.length > 0 && onRouteParsedMessages) {
-        await onRouteParsedMessages(parsed, emitChunk);
+    const parsedOutput = parsePrefixedMessages(outputText);
+    const evalUserParts: string[] = [];
+    for (const msg of parsedOutput) {
+      evalUserParts.push(`${msg.busId}:${msg.content}`);
+    }
+    if (parsedOutput.length === 0 && outputText.trim()) {
+      evalUserParts.push(`root:${outputText.trim()}`);
+    }
+    const injectedMessages = (evalResult.injected as { messages?: { busId: string; content: string }[] } | undefined)?.messages;
+    if (injectedMessages) {
+      for (const { busId, content } of injectedMessages) {
+        evalUserParts.push(`${busId}:${content}`);
       }
     }
+    if (evalResult.askUserReply != null && evalResult.askUserReply.trim()) {
+      evalUserParts.push(evalResult.askUserReply.trim());
+    }
+    if (external.length > 0) {
+      const externalParts = external.map((m) => m.content);
+      evalUserParts.push(...externalParts);
+    }
+    if (evalUserParts.length === 0) {
+      return { text: outputText.trim() || fullText };
+    }
+    messages.push({ role: "assistant", content: fullText });
+    const wrapUser = tag ? wrapUserContent(evalUserParts.join("\n\n"), tag) : evalUserParts.join("\n\n");
+    messages.push({ role: "user", content: wrapUser });
+
+    if (!fullText.trim()) return { text: fullText };
   }
 }
 
@@ -777,7 +803,7 @@ export async function sendMessage(
   trimmedCount?: number
 ): Promise<{ text: string }> {
   logVerbose("sendMessage called, provider:", agentConfig?.aiProvider ?? "?", "targetBusId:", targetBusId ?? "root");
-  if (!mcpClient || !mcpTransport || !agentConfig) {
+  if (!agentConfig) {
     throw new Error("Agent not started. Add API key and click Start chat.");
   }
 

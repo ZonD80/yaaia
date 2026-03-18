@@ -7,6 +7,7 @@ cd yaaia-app
 npm install
 npm run build
 npm run build:vm
+npm run build:vm-agent
 
 echo "[launch] Launching YAAIA..."
 export DEBUG="${DEBUG:-yaaia:*,tsdav:*}"

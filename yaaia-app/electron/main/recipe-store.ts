@@ -15,8 +15,6 @@ const HIDE_RESULT_TOOLS = new Set([
 
 export interface RecipeEntry {
   toolName: string;
-  assessment: string;
-  clarification: string;
   result: string;
   params?: Record<string, unknown>;
   screenshotBase64?: string;
@@ -38,8 +36,6 @@ export interface RecipeState {
   startedAt: number;
   finalizedAt: number | null;
   isSuccess: boolean | null;
-  finalAssessment?: string;
-  detailedReport?: string;
   entries: RecipeEntry[];
   userInjections: UserInjection[];
 }
@@ -48,6 +44,7 @@ let pendingInitialPrompt = "";
 let currentModel = "";
 let recipe: RecipeState | null = null;
 let sessionTag: string | null = null;
+let codeBoundary: string | null = null;
 
 export function setSessionTag(tag: string): void {
   sessionTag = String(tag ?? "").trim() || null;
@@ -61,14 +58,23 @@ export function clearSessionTag(): void {
   sessionTag = null;
 }
 
-export interface FinalizeTaskPopupInfo {
-  assessment: string;
-  clarification: string;
-  is_successful: boolean;
-  detailed_report: string;
+export function setCodeBoundary(boundary: string): void {
+  codeBoundary = String(boundary ?? "").trim() || null;
 }
 
-let pendingFinalizeInfo: { assessment: string; clarification: string; is_successful: boolean } | null = null;
+export function getCodeBoundary(): string | null {
+  return codeBoundary;
+}
+
+export function clearCodeBoundary(): void {
+  codeBoundary = null;
+}
+
+export interface FinalizeTaskPopupInfo {
+  is_successful: boolean;
+}
+
+let pendingFinalizeInfo: { is_successful: boolean } | null = null;
 let taskBusId: string | null = null;
 
 export function setTaskBusId(busId: string | null): void {
@@ -78,7 +84,6 @@ export function setTaskBusId(busId: string | null): void {
 export function getTaskBusId(): string | null {
   return taskBusId;
 }
-let pendingReportFromSendMessage: string | null = null;
 
 export function setInitialPrompt(msg: string): void {
   pendingInitialPrompt = String(msg ?? "").trim();
@@ -124,7 +129,6 @@ function paramsFromArgs(args: unknown): Record<string, unknown> | undefined {
   if (!a || typeof a !== "object") return undefined;
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(a)) {
-    if (k === "assessment" || k === "clarification") continue;
     if (v !== undefined) out[k] = v;
   }
   return Object.keys(out).length > 0 ? out : undefined;
@@ -138,13 +142,8 @@ export function appendToolCall(
 ): void {
   ensureRecipe();
   if (!recipe) return;
-  const a = args as Record<string, unknown> | undefined;
-  const assessment = (typeof a?.assessment === "string" ? a.assessment : "")?.trim() ?? "";
-  const clarification = (typeof a?.clarification === "string" ? a.clarification : "")?.trim() ?? "";
   recipe.entries.push({
     toolName,
-    assessment,
-    clarification,
     result: String(resultText ?? "").trim(),
     params: paramsFromArgs(args),
     ...extra,
@@ -158,47 +157,24 @@ export function appendUserInjection(text: string, placeAfterNextStep = false): v
   recipe.userInjections.push({ text: String(text ?? "").trim(), afterStepIndex });
 }
 
-export function finalize(isSuccess: boolean, assessment = "", clarification = ""): void {
+export function finalize(isSuccess: boolean): void {
   taskBusId = null;
   ensureRecipe();
   if (!recipe) return;
   recipe.finalizedAt = Date.now();
   recipe.isSuccess = isSuccess;
-  recipe.finalAssessment = (typeof assessment === "string" ? assessment : "")?.trim() || undefined;
-  pendingFinalizeInfo = {
-    assessment: (typeof assessment === "string" ? assessment : "")?.trim() ?? "",
-    clarification: (typeof clarification === "string" ? clarification : "")?.trim() ?? "",
-    is_successful: isSuccess,
-  };
+  pendingFinalizeInfo = { is_successful: isSuccess };
 }
 
 export function clearPendingFinalize(): void {
   pendingFinalizeInfo = null;
-  pendingReportFromSendMessage = null;
 }
 
-/** When send_message to root is called after finalize_task, store content as the report */
-export function setPendingReportFromSendMessage(content: string): void {
-  if (pendingFinalizeInfo) pendingReportFromSendMessage = String(content ?? "").trim();
-}
-
-export function completeFinalizeWithReport(report: string): FinalizeTaskPopupInfo | null {
+export function completeFinalize(): FinalizeTaskPopupInfo | null {
   const info = pendingFinalizeInfo;
   pendingFinalizeInfo = null;
-  const fromSendMessage = pendingReportFromSendMessage;
-  pendingReportFromSendMessage = null;
   if (!info || !recipe) return null;
-  const detailedReport =
-    (fromSendMessage && fromSendMessage.length > 0 ? fromSendMessage : null) ??
-    (typeof report === "string" ? report : "")?.trim() ??
-    "";
-  recipe.detailedReport = detailedReport || undefined;
-  return {
-    assessment: info.assessment,
-    clarification: info.clarification,
-    is_successful: info.is_successful,
-    detailed_report: detailedReport,
-  };
+  return { is_successful: info.is_successful };
 }
 
 export function getRecipe(): RecipeState | null {
@@ -267,9 +243,6 @@ export function generateMarkdown(): string {
     const resultMd = hideResult ? "" : `\n**Result:**\n${mdBlock(truncate(e.result, 2000))}\n`;
     return `
 ### ${num}. ${e.toolName}
-
-**Assessment:** ${e.assessment || "(none)"}
-**Clarification:** ${e.clarification || "(none)"}
 ${paramsMd}${imgMd}${clickMd}${visionMd}${resultMd}`;
   }
 
@@ -291,15 +264,6 @@ ${paramsMd}${imgMd}${clickMd}${visionMd}${resultMd}`;
   }
   const stepsMd = stepsParts.join("");
 
-  const finalAssessmentMd =
-    r.finalizedAt != null && r.finalAssessment
-      ? `\n## Final assessment\n\n${r.finalAssessment}\n`
-      : "";
-  const detailedReportMd =
-    r.detailedReport
-      ? `\n## Detailed report\n\n${r.detailedReport}\n`
-      : "";
-
   return `# Recipe: ${r.taskSummary}
 
 **Model:** ${r.model || "(unknown)"} | **Started:** ${new Date(r.startedAt).toLocaleString()} | **Duration:** ${duration}${resultBadge ? ` | **Result:** ${resultBadge}` : ""}
@@ -311,7 +275,7 @@ ${r.goalAssessment ? `\n**Assessment:** ${r.goalAssessment}` : ""}
 
 ## Steps
 
-${stepsMd}${finalAssessmentMd}${detailedReportMd}`;
+${stepsMd}`;
 }
 
 export function generateHtml(embedImages = true): string {
@@ -328,14 +292,6 @@ export function generateHtml(embedImages = true): string {
       : r.isSuccess
         ? '<span style="color:#2ea043">✓ Done</span>'
         : '<span style="color:#f85149">✗ Failed</span>';
-  const finalAssessmentHtml =
-    r.finalizedAt != null && r.finalAssessment
-      ? `<div class="final-assessment" style="color:${r.isSuccess ? "#2ea043" : "#f85149"};margin-top:1.5rem;padding:1rem;border-radius:6px;border:1px solid ${r.isSuccess ? "#238636" : "#da3633"};background:${r.isSuccess ? "rgba(46,160,67,0.1)" : "rgba(248,81,73,0.1)"}"><strong>Final assessment:</strong> ${escapeHtml(r.finalAssessment)}</div>`
-      : "";
-  const detailedReportHtml =
-    r.detailedReport
-      ? `<div class="detailed-report" style="margin-top:1.5rem;padding:1rem;border-radius:6px;border:1px solid #30363d;background:#161b22"><strong>Detailed report:</strong><pre style="white-space:pre-wrap;word-break:break-word;margin-top:0.5rem">${escapeHtml(r.detailedReport)}</pre></div>`
-      : "";
   const duration =
     r.finalizedAt != null ? formatDuration(r.finalizedAt - r.startedAt) : formatDuration(Date.now() - r.startedAt);
 
@@ -359,8 +315,6 @@ export function generateHtml(embedImages = true): string {
     return `
 <div class="entry">
   <h3>${num}. ${escapeHtml(e.toolName)}</h3>
-  <p><strong>Assessment:</strong> ${escapeHtml(e.assessment || "(none)")}</p>
-  <p><strong>Clarification:</strong> ${escapeHtml(e.clarification || "(none)")}</p>
   ${paramsHtml}
   ${imgHtml}
   ${clickHtml}
@@ -424,8 +378,6 @@ export function generateHtml(embedImages = true): string {
 
   <h2>Steps</h2>
   ${stepsHtml}
-  ${finalAssessmentHtml}
-  ${detailedReportHtml}
 
 </body>
 </html>`;

@@ -1,7 +1,7 @@
 /**
  * Declarative return schemas for all tools.
- * Extracted from source: message-bus-store, history-store, passwords-store,
- * schedule-store, mail-client, caldav-client, telegram-client.
+ * Extracted from source: message-db, passwords-store,
+ * schedule-store, mail-client, telegram-client.
  * All tools return Promise<string>; these types describe JSON.parse(result).
  */
 
@@ -50,16 +50,6 @@ export const RETURN_SCHEMAS: Record<string, string> = {
 
   "mail.search": `number[] — UIDs`,
 
-  "caldav.oauth_browser": `string — OAuth URL to open in browser`,
-
-  "caldav.list_calendars": `{ url: string; displayName: string }[]`,
-
-  "caldav.list_events": `{ url: string; etag?: string; data: string }[] — data = iCalendar string`,
-
-  "caldav.get_event": `{ url: string; etag?: string; data: string } — data = full iCalendar string`,
-
-  "caldav.status": `{ connected: boolean }`,
-
   get_datetime: `string — ISO 8601 (e.g. "2025-03-15T12:00:00.000Z")`,
 
   // Status-only returns (no JSON)
@@ -96,25 +86,8 @@ export const RETURN_SCHEMAS: Record<string, string> = {
   "mail.message_labels_add": `"Done."`,
   "mail.message_labels_remove": `"Done."`,
   "mail.message_labels_set": `"Done."`,
-  "caldav.connect": `"Connected. Bus(es): {comma-separated busIds}."`,
-  "caldav.disconnect": `"Disconnected."`,
-  "caldav.create_event": `"Event created."`,
-  "caldav.update_event": `"Event updated."`,
-  "caldav.delete_event": `"Event deleted."`,
-
-  // FS (delegated)
-  "fs.read_file": `string — file content`,
-  "fs.write_file": `string`,
-  "fs.update_file": `string`,
-  "fs.list_files": `string`,
-  "fs.delete_file": `string`,
-  "fs.delete_directory": `string`,
-  "fs.create_directory": `string`,
-  "fs.move_path": `string`,
-  "fs.copy_path": `string`,
-
   // VM power control
-  "vm.power_on": `"VM started." | "Error: ..."`,
+  "vm.power_on": `(non-setup: aborts eval, shows notice) | "Error: ..."`,
   "vm.kill": `"VM killed." | "Error: ..."`,
 
   // vm_serial (Linux VM console)

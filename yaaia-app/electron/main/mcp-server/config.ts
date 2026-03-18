@@ -5,10 +5,7 @@ export interface AskUserPopupInfo {
 }
 
 export interface FinalizeTaskPopupInfo {
-  assessment: string;
-  clarification: string;
   is_successful: boolean;
-  detailed_report: string;
 }
 
 export interface McpServerConfig {
@@ -34,14 +31,12 @@ export interface McpServerConfig {
   }>;
   /** Resolve Telegram username to bus_id. Requires Telegram to be connected. */
   onTelegramSearch?: (username: string) => Promise<{ bus_id: string; display_name?: string }>;
-  /** App config for root bus (userName). Telegram and CalDAV OAuth credentials exposed to eval. */
+  /** App config for root bus (userName). Telegram credentials exposed to eval. */
   appConfig?: {
     userName: string;
     telegramApiId?: number;
     telegramApiHash?: string;
-    caldavGoogleClientId?: string;
-    caldavGoogleClientSecret?: string;
   };
-  /** Called when a CalDAV event is deleted. Notify renderer to remove from timeline. */
-  onCaldavEventDeleted?: (eventUid: string, busId: string) => void;
+  /** Setup mode: expose vm_serial, vm.power_on returns setup checklist. When off: no vm_serial, vm.power_on returns stop-after; model gets bus message when VM connected. */
+  setupMode?: boolean;
 }

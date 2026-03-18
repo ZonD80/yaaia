@@ -25,73 +25,98 @@ function docFromSpec(spec: { name: string; description: string; params?: string;
   return out;
 }
 
-const SECTION_ORDER = ["fs", "top", "mail", "caldav", "vm", "vm_serial"] as const;
+const SECTION_ORDER = ["top", "mail", "vm", "vm_serial"] as const;
 
 function getSection(name: string): (typeof SECTION_ORDER)[number] {
-  if (name.startsWith("fs.")) return "fs";
   if (name.startsWith("mail.")) return "mail";
-  if (name.startsWith("caldav.")) return "caldav";
   if (name.startsWith("vm.")) return "vm";
   if (name.startsWith("vm_serial.")) return "vm_serial";
   return "top";
 }
 
-/** Generate static API docs for the eval runtime. Spec from agent-api.ts. */
-export function generateApiDocs(): string {
+/** Generate static API docs for the eval runtime. Spec from agent-api.ts. setupMode: include vm_serial section. codeBoundary: runtime boundary for bbtag. */
+export function generateApiDocs(options?: { setupMode?: boolean; codeBoundary?: string | null }): string {
+  const setupMode = options?.setupMode ?? false;
+  const boundary = options?.codeBoundary ?? null;
   const bySection = new Map<(typeof SECTION_ORDER)[number], typeof TOOL_SPECS>();
   for (const s of SECTION_ORDER) bySection.set(s, []);
   for (const spec of TOOL_SPECS) {
     const section = getSection(spec.name);
+    if (section === "vm_serial" && !setupMode) continue;
     bySection.get(section)!.push(spec);
   }
 
   const sectionLines: string[] = [];
   for (const section of SECTION_ORDER) {
+    if (section === "vm_serial" && !setupMode) continue;
     const specs = bySection.get(section)!;
     if (specs.length === 0) continue;
     const title = section === "top" ? "Top-level" : section;
     sectionLines.push("### " + title, "");
     if (section === "top") {
       sectionLines.push(
-        "- **send_message**(content): Promise<string> — Send to bus. Content must use prefix format bus_id:content (bus_id mandatory). Returns: 'Sent to {busId}'. Throws on failure. For multiline or special chars, escape strings per system prompt.",
-        "- **ask**(prompt): Promise<string> — Ask user; prompt must use bus_id:prompt or bus_id:wait:prompt (bus_id mandatory). Root or telegram only. Blocks up to 60s. Returns: user reply string.",
+        "- **store** — Persistent object across ts runs. Use `store.x = 1` to persist. Cleared on stop-chat.",
+        "- **console.log('bus_id:content')** — Send to bus. Content must use prefix format bus_id:content (bus_id mandatory). Parsed and routed during execution. Streams to chat. Example: `console.log('root:Connecting...');`",
+        "- **console.log('bus_id:wait:content')** — Ask user; blocks up to 60s. Root or telegram only.",
         "- **wait**(seconds: number): Promise<void> — Pause for n seconds. Use instead of setTimeout (not available in sandbox).",
         "",
       );
     }
     if (section === "vm") {
-      sectionLines.push(
-        "Power on or force-kill VMs. For vm_kill: shut down the VM with `shutdown -h now` via vm_serial before killing.",
-        "",
-      );
+      if (setupMode) {
+        sectionLines.push(
+          "Power on or force-kill VMs. Use vmList for VM ids. vmControl.power_on returns setup checklist (see VM_SETUP.md). vm_serial available for setup.",
+          "",
+        );
+      } else {
+        sectionLines.push(
+          "Power on or force-kill VMs. Use vmList for VM ids. vmControl.power_on (non-setup): powers VM on, aborts eval, shows notice to user. When VM connects, root:VM connected for vm-bash execution is sent. vm_serial not available (use setup mode for VM setup).",
+          "",
+        );
+      }
     }
     if (section === "vm_serial") {
       sectionLines.push(
         "Connect to a running Linux VM's serial console. VM must be started first. Use for shell commands. Output is ANSI-stripped.",
         "",
-        "**Large bash scripts:** Write to fs under shared/ (shared with VM) with template literal, then write_from_file. E.g. `fs.write_file({ path: 'shared/script.sh', content: \`...\` })` then `vm_serial.write_from_file({ vm_id, path: 'script.sh' })`. In template literals escape \`\${VAR}\` as \`\\\${VAR}\` for literal bash vars.",
+        "**Large bash scripts:** Use vm-bash blocks with heredoc: `cat > /mnt/shared/script.sh << 'EOF'` ... `EOF`. write_from_file reads from shared (path relative to shared root).",
         "",
         "**Escaping:** Use `chars: string[]` for unambiguous control — each element is one character sent raw. Or use `data` with `raw: true` to skip escaping.",
         "",
       );
     }
     for (const spec of specs) {
-      sectionLines.push(docFromSpec(spec), "");
+      const displaySpec =
+        section === "vm" && spec.name.startsWith("vm.")
+          ? { ...spec, name: spec.name.replace("vm.", "vmControl.") }
+          : spec;
+      sectionLines.push(docFromSpec(displaySpec), "");
     }
   }
 
+  const blockFormat = boundary
+    ? `Use [${boundary}=ts]...[/${boundary}] for TypeScript and [${boundary}=vm-bash:N:user]...[/${boundary}] for vm-bash (N=timeout sec, user=run as). Content can include any characters.`
+    : "Use [{key}=ts]...[/{key}] and [{key}=vm-bash:N:user]...[/{key}] (key from system prompt).";
   const lines: string[] = [
     "## Agent TypeScript API",
     "",
-    "You write TypeScript code in a single ```ts code block per turn. Always include a plan of execution above the code block (what you will do). Inside the code block, use send_message to explain what is happening — before/after key steps, progress updates. Every message must use prefix format: bus_id:content or bus_id:wait:content. bus_id prefix is mandatory. The code runs in an isolated runtime with access to the following API. All functions are async; use await.",
+    `You write TypeScript code in code blocks per turn. You may add vm-bash blocks; they run sequentially with ts blocks in document order (bash1 → ts1 → bash2 → ts2). ${blockFormat} Each ts block receives vmEvalStdout and vmEvalStderr: persistent strings (append-only, cleared on stop-chat). Use vmEvalStdout.slice(-n) for last n chars. For vm-bash, the VM must be connected: call vmControl.power_on, stop after it; you will receive a message on the bus when the VM is connected for vm-bash execution. Always include a plan of execution above the code block (what you will do). Inside the code block, use console.log('bus_id:content') to send messages — parsed and routed to buses, streams during execution. Every message must use prefix format: bus_id:content or bus_id:wait:content. bus_id prefix is mandatory. The code runs in an isolated runtime with access to the following API. All functions are async; use await.`,
     "",
-    "**Eval output:** Use **console.log**, **console.info**, **console.warn**, **console.error** for all output. That output is captured and fed back to the model as the turn result.",
+    "**Eval output:** Use **console.log**, **console.info**, **console.warn**, **console.error** for output.",
     "",
     "### Return types and errors",
     "",
     "Every API returns **Promise<string>**. Parse with `JSON.parse(result)` when the tool returns JSON. Types below describe the parsed structure.",
     "",
     "**On failure:** All tools throw `Error` with message starting `Error:`. No try/catch = execution stops.",
+    "",
+    "### vmEvalStdout / vmEvalStderr (from vm-bash)",
+    "",
+    "VM must be connected: call vmControl.power_on, stop after it; you will receive a message on the bus when the VM is connected for vm-bash execution. Blocks run sequentially (bash1 → ts1 → bash2 → ts2); output appends to persistent buffers. Cleared on stop-chat.",
+    "```ts",
+    "vmEvalStdout: string;  // e.g. vmEvalStdout.slice(-3000) for last 3k chars",
+    "vmEvalStderr: string;",
+    "```",
     "",
     "### Shared types (for JSON returns)",
     "",
@@ -130,43 +155,47 @@ export function generateApiDocs(): string {
     "  labels?: string[]; threadId?: string;  // Gmail",
     "};",
     "",
-    "// caldav.list_calendars",
-    "type CaldavCalendar = { url: string; displayName: string };",
-    "",
-    "// caldav.list_events / caldav.get_event",
-    "type CaldavEvent = { url: string; etag?: string; data: string };  // data = iCalendar string",
-    "",
     "// telegram_search",
     "type TelegramSearchResult = { bus_id: string; display_name?: string };",
+    "",
+    "// vmList (read-only, available in eval)",
+    "type VmInfo = { id: string; name: string; path: string; status: 'running'|'stopped'; ramMb: number; diskGb: number };",
     "",
     "// app_config (read-only, set at startup)",
     "type AppConfig = {",
     "  userName?: string;",
     "  telegramApiId?: number;",
     "  telegramApiHash?: string;",
-    "  caldavGoogleClientId?: string;",
-    "  caldavGoogleClientSecret?: string;",
     "};",
     "```",
     "",
     "### Read-only globals",
     "",
-    "- **app_config**: AppConfig | null — Telegram apiId/apiHash and CalDAV Google OAuth client id/secret. Use for telegram_connect (credentials come from app) or caldav.connect with OAuth.",
+    "- **vmList**: VmInfo[] — VMs known to YaaiaVM. Use v.id for vmControl.power_on, vmControl.kill, vm_serial.connect. vmControl.power_on: stop after it; you will receive a bus message when VM is connected for vm-bash.",
+    "- **app_config**: AppConfig | null — Telegram apiId/apiHash. Use for telegram_connect (credentials come from app).",
     "",
-    "### Allowed base directories",
+    "### Google API (Gmail, Calendar)",
     "",
-    "- **fs** (read_file, write_file, append_file, replace_file, update_file, list_files, etc.): Paths relative to ~/yaaia/storage. E.g. `lessons_learned/`, `shared/file.txt`. Use shared/ for VM-visible files.",
+    "When authorized via \"Authorize Google API for agent\":",
+    "",
+    "- **gmail**: Gmail API v1 client | null — Use `gmail.users.messages.list({ userId: 'me' })`, `gmail.users.messages.get()`, `gmail.users.messages.send()`, etc. See googleapis.dev/nodejs/googleapis/latest/gmail.",
+    "- **calendar**: Google Calendar API v3 client | null — Use `calendar.events.list({ calendarId: 'primary' })`, `calendar.events.insert()`, etc. See googleapis.dev/nodejs/googleapis/latest/calendar.",
+    "",
+    "Check `if (gmail)` / `if (calendar)` before use. When not authorized, they are null.",
+    "",
+    "### File operations",
+    "",
+    "No host fs API. Shared folder at **/mnt/shared** in VM — empty by default. Build your hierarchy with vm-bash: `cat`, `echo`, `mkdir`, `cp`, `mv`, `rm`, heredocs.",
     "",
     ...sectionLines,
     "### Workflow",
     "",
     "1. Write plan of execution above the code block",
     "2. task.start({ summary }) at beginning of multi-step task",
-    "3. Use send_message inside code to report progress (e.g. before/after key steps)",
-    "4. task.finalize({ is_successful, assessment?, clarification? }) before ending — assessment and clarification must start with bus_id:",
-    "5. send_message(bus_id:content) for final report — bus_id prefix mandatory",
+    "3. Use console.log('bus_id:content') inside code to report progress (e.g. before/after key steps)",
+    "4. task.finalize({ is_successful }) before ending",
     "",
-    "Multi-step tools (e.g. caldav.oauth_browser) return status; use next code block to continue.",
+    "Multi-step tools (e.g. mail.connect) return status; use next code block to continue.",
   ];
 
   return lines.join("\n");
