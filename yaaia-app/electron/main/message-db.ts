@@ -11,7 +11,8 @@ import { mkdirSync, existsSync } from "node:fs";
 import { kbEnsureCollection } from "./mcp-server/kb-client.js";
 import { isTelegramConnected } from "./telegram-client.js";
 import { isMailConnected } from "./mail-client.js";
-import { getTrustLevelForBus, identityUpdateTrustByBusId } from "./identities-store.js";
+import { isGoogleAuthorized } from "./google-auth.js";
+import { getTrustLevelForBus, contactUpdateTrustByBusId } from "./contacts-store.js";
 import { telegramDeleteChatHistory } from "./telegram-client.js";
 import { mailDeleteMessagesByUids } from "./mail-client.js";
 
@@ -126,6 +127,8 @@ export function isValidBusIdFormat(busId: string): boolean {
   if (busId === ROOT_BUS_ID) return true;
   if (/^telegram-\d+$/.test(busId)) return true;
   if (/^email-[a-zA-Z0-9_-]+$/.test(busId)) return true;
+  if (/^gmail-[a-zA-Z0-9_-]+$/.test(busId)) return true;
+  if (/^google-calendar-[a-zA-Z0-9_-]+$/.test(busId)) return true;
   return false;
 }
 
@@ -136,6 +139,8 @@ export function isValidBusId(busId: string): boolean {
   if (buses.some((b) => b.bus_id === busId)) return true;
   if (/^telegram-\d+$/.test(busId)) return true;
   if (/^email-[a-zA-Z0-9_-]+$/.test(busId)) return true;
+  if (/^gmail-[a-zA-Z0-9_-]+$/.test(busId)) return true;
+  if (/^google-calendar-[a-zA-Z0-9_-]+$/.test(busId)) return true;
   return false;
 }
 
@@ -159,6 +164,7 @@ export function isBusConnected(busId: string): boolean {
   if (busId === ROOT_BUS_ID) return true;
   if (busId.startsWith("telegram-")) return isTelegramConnected();
   if (busId.startsWith("email-")) return isMailConnected();
+  if (busId.startsWith("gmail-") || busId.startsWith("google-calendar-")) return isGoogleAuthorized();
   return true;
 }
 
@@ -260,7 +266,7 @@ export function setBusProperties(
   };
   if (props.description !== undefined) existing.description = props.description;
   if (props.trust_level !== undefined) {
-    const updated = identityUpdateTrustByBusId(busId, props.trust_level);
+    const updated = contactUpdateTrustByBusId(busId, props.trust_level);
     if (!updated) {
       existing.trust_level = props.trust_level;
     }
@@ -506,9 +512,9 @@ export function getBusHistorySlice(
 }
 
 export function getActiveBuses(): string[] {
-  const stmt = getDb().prepare("SELECT DISTINCT bus_id FROM messages");
-  const rows = stmt.all() as { bus_id: string }[];
-  const buses = new Set(rows.map((r) => r.bus_id));
+  const fromMessages = getDb().prepare("SELECT DISTINCT bus_id FROM messages").all() as { bus_id: string }[];
+  const fromBuses = getDb().prepare("SELECT bus_id FROM message_buses").all() as { bus_id: string }[];
+  const buses = new Set([...fromMessages.map((r) => r.bus_id), ...fromBuses.map((r) => r.bus_id)]);
   buses.add(ROOT_BUS_ID);
   return Array.from(buses).filter(isValidBusIdFormat);
 }
@@ -598,14 +604,7 @@ export function getRootBusHistoryOnly(): BusMessage[] {
   return getBusHistory(ROOT_BUS_ID).map(toBusMessage);
 }
 
-let _isRootUserIdentifierDefined: () => boolean = () => true;
-
-export function setRootUserIdentifierDefinedCheck(fn: () => boolean): void {
-  _isRootUserIdentifierDefined = fn;
-}
-
 export function appendToBusHistory(busId: string, message: BusMessage): void {
-  if (busId === ROOT_BUS_ID && !_isRootUserIdentifierDefined()) return;
   ensureRootBus();
   ensureMbDir(busId);
   appendMessage(busId, {
@@ -624,9 +623,6 @@ export function appendToBusHistory(busId: string, message: BusMessage): void {
 
 /** Append placeholder with generated message_id. Returns message_id for later replace. */
 export function appendPlaceholderWithId(busId: string, role: "user" | "assistant" = "assistant"): string {
-  if (busId === ROOT_BUS_ID && !_isRootUserIdentifierDefined()) {
-    throw new Error("Root user identifier required");
-  }
   ensureRootBus();
   ensureMbDir(busId);
   const messageId = `${busId}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
@@ -651,6 +647,11 @@ export function deleteBusHistory(busId: string): void {
 
 export function wipeRootHistory(): void {
   deleteBusHistory(ROOT_BUS_ID);
+}
+
+/** Delete all messages from all buses. Keeps bus definitions. */
+export function wipeAllHistory(): void {
+  getDb().prepare("DELETE FROM messages").run();
 }
 
 export function hasMessageIdInBusHistory(busId: string, messageId: string): boolean {

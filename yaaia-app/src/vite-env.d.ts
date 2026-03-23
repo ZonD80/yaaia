@@ -9,9 +9,6 @@ interface ElectronAPI {
     claudeModel: string;
     openrouterApiKey: string;
     openrouterModel: string;
-    userName: string;
-    rootUserIdentifier?: string;
-    rootUserIdentifierDefined?: boolean;
   }>;
   startChat: (config: unknown) => Promise<{ ok: boolean; agentReady?: boolean; message: string }>;
   stopChat: () => Promise<{ ok: boolean }>;
@@ -28,12 +25,12 @@ interface ElectronAPI {
   passwordsSet: (args: unknown) => Promise<string>;
   passwordsDelete: (id: string) => Promise<void>;
   wipePasswords: () => Promise<void>;
-  identityList: () => Promise<Array<{ id: string; name: string; identifier: string; trust_level: string; bus_ids: string[] }>>;
-  identityGet: (idOrIdentifier: string) => Promise<{ id: string; name: string; identifier: string; trust_level: string; bus_ids: string[]; note: string } | null>;
-  identityCreate: (args: { name: string; identifier: string; trust_level?: "root" | "normal"; bus_ids?: string[] }) => Promise<string>;
-  identityUpdate: (idOrIdentifier: string, args: { name?: string; identifier?: string; trust_level?: "root" | "normal"; bus_ids?: string[] }) => Promise<void>;
-  identityDelete: (idOrIdentifier: string) => Promise<void>;
-  identitySetNote: (identifier: string, content: string) => Promise<void>;
+  contactsList: () => Promise<Array<{ id: string; name: string; identifier: string; trust_level: string; bus_ids: string[]; notes: string }>>;
+  contactsSearch: (query: string) => Promise<Array<{ id: string; name: string; identifier: string; trust_level: string; bus_ids: string[]; notes: string }>>;
+  contactsGet: (idOrIdentifier: string) => Promise<{ id: string; name: string; identifier: string; trust_level: string; bus_ids: string[]; notes: string } | null>;
+  contactsCreate: (args: { name: string; identifier: string; trust_level?: "root" | "normal"; bus_ids?: string[]; notes?: string }) => Promise<string>;
+  contactsUpdate: (idOrIdentifier: string, args: { name?: string; identifier?: string; trust_level?: "root" | "normal"; bus_ids?: string[]; notes?: string }) => Promise<void>;
+  contactsDelete: (idOrIdentifier: string) => Promise<void>;
   messageBusList: () => Promise<Array<{ bus_id: string; description: string }>>;
   messageBusSetDescription: (busId: string, description: string) => Promise<void>;
   messageBusDelete: (busId: string) => Promise<void>;
@@ -44,6 +41,7 @@ interface ElectronAPI {
     offset: number
   ) => Promise<{ messages: Array<{ role: string; content: string; user_name?: string; bus_id?: string; timestamp?: string }>; total: number }>;
   messageBusWipeRoot: () => Promise<void>;
+  messageBusWipeAll: () => Promise<void>;
   scheduleList: () => Promise<Array<{ id: string; at: string; title: string; instructions: string; created_at: string }>>;
   scheduleGetStartup: () => Promise<{ title: string; instructions: string }>;
   scheduleSetStartup: (task: { title: string; instructions: string }) => Promise<void>;
@@ -62,6 +60,7 @@ interface ElectronAPI {
   onAgentMessage: (callback: (content: string) => void) => () => void;
   onTelegramMessage: (callback: (payload: { bus_id: string; user_id: number; user_name: string; content: string }) => void) => () => void;
   onEmailMessage: (callback: (payload: { bus_id: string; user_id: number; user_name: string; content: string; instruction?: string }) => void) => () => void;
+  onCalendarEvent: (callback: (payload: { bus_id: string; content: string; instruction?: string; timestamp?: string }) => void) => () => void;
   onScheduleTrigger: (callback: (payload: { msg: string; injectHandled?: boolean } | string) => void) => () => void;
   onAgentDrain: (callback: (payload?: string) => void) => () => void;
   onTelegramLoginRequest: (callback: (info: { step: "phone" | "code" | "password" }) => void) => () => void;
@@ -72,6 +71,7 @@ interface ElectronAPI {
   googleApiStatus: () => Promise<{ authorized: boolean }>;
   googleApiAuthorize: () => Promise<{ ok: boolean; error?: string }>;
   googleApiLogout: () => Promise<void>;
+  telegramConnectStart: (phone: string) => Promise<{ ok: boolean; error?: string }>;
   vmList: () => Promise<Array<{ id: string; name: string; path: string; status: string; ramMb: number; diskGb: number }>>;
   vmCreate: (options?: { isoPath?: string; ramMb?: number; diskGb?: number }) => Promise<{ ok: boolean; vmId?: string; error?: string }>;
   vmStart: (vmId: string) => Promise<void>;

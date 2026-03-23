@@ -26,6 +26,29 @@ let connectionCheckInterval: ReturnType<typeof setInterval> | null = null;
 const YAAIA_DIR = join(homedir(), "yaaia");
 const TELEGRAM_STORAGE = join(YAAIA_DIR, "telegram-session");
 const TELEGRAM_LAST_SEEN_PATH = join(YAAIA_DIR, "telegram-last-seen.json");
+const TELEGRAM_CONNECT_STATE_PATH = join(YAAIA_DIR, "telegram-connect-state.json");
+
+export function saveTelegramConnectPhone(phone: string): void {
+  try {
+    mkdirSync(YAAIA_DIR, { recursive: true });
+    writeFileSync(TELEGRAM_CONNECT_STATE_PATH, JSON.stringify({ phone: phone.trim() }, null, 2), "utf-8");
+  } catch (err) {
+    console.warn("[YAAIA Telegram] Failed to save connect phone:", err);
+  }
+}
+
+export function loadTelegramConnectPhone(): string | null {
+  try {
+    if (existsSync(TELEGRAM_CONNECT_STATE_PATH)) {
+      const raw = JSON.parse(readFileSync(TELEGRAM_CONNECT_STATE_PATH, "utf-8"));
+      const phone = typeof raw?.phone === "string" ? raw.phone.trim() : null;
+      return phone && phone.length > 0 ? phone : null;
+    }
+  } catch (err) {
+    console.warn("[YAAIA Telegram] Failed to load connect phone:", err);
+  }
+  return null;
+}
 
 export type MissedMessagePayload = { bus_id: string; user_id: number; user_name: string; content: string; timestamp?: string; message_id?: number };
 
@@ -336,6 +359,7 @@ export async function telegramFetchMissedMessages(opts?: { deliverToModel?: bool
   let maxDate = since;
   for (const { msg, date } of all) {
     if (date <= since) continue; /* skip last message we already received (minDate is inclusive) */
+    if (!onMessageCallback) continue; /* no handler yet (e.g. chat not started); will retry when fetchMissedMessages is called again */
     const chat = msg.chat;
     const sender = msg.sender;
     const chatId = chat.id;
@@ -349,7 +373,7 @@ export async function telegramFetchMissedMessages(opts?: { deliverToModel?: bool
     onMessageCallback?.({ bus_id: busId, user_id: userId, user_name: userName, content, timestamp, message_id: msg.id }, opts);
     if (date > maxDate) maxDate = date;
   }
-  if (maxDate > since) saveLastReceivedTimestamp(maxDate);
+  if (onMessageCallback && maxDate > since) saveLastReceivedTimestamp(maxDate);
   return delivered;
 }
 

@@ -22,7 +22,6 @@ export type AgentApiRouteCallbacks = AgentApiRouteCallbacksBase & {
 };
 
 export interface AppConfig {
-  userName?: string;
   telegramApiId?: number;
   telegramApiHash?: string;
 }
@@ -37,10 +36,10 @@ export interface AgentApiDeps {
   getInjectedMessages?: () => { formatted: string; raw: string } | null;
   /** Called when eval produces console output (stdout/stderr). Used to stream eval output to chat. */
   onOutputChunk?: (text: string) => void;
-  /** Persistent vm-bash stdout buffer. Append-only, cleared on stop-chat. Use .slice(-n) for last n chars. */
-  vmEvalStdout?: string;
-  /** Persistent vm-bash stderr buffer. Append-only, cleared on stop-chat. */
-  vmEvalStderr?: string;
+  /** Persistent vm-bash stdout buffers per user. vmEvalStdout.root, vmEvalStdout[user_id]. Append-only, cleared on stop-chat. */
+  vmEvalStdout?: Record<string, string>;
+  /** Persistent vm-bash stderr buffers per user. vmEvalStderr.root, vmEvalStderr[user_id]. Append-only, cleared on stop-chat. */
+  vmEvalStderr?: Record<string, string>;
   /** Setup mode: expose vm_serial. When false, vm_serial is not available. */
   setupMode?: boolean;
 }
@@ -82,26 +81,34 @@ export function createAgentApi(deps: AgentApiDeps): Record<string, unknown> {
       delete: (args: { mb_id: string }) => call("bus.delete", args),
     },
 
-    // Identities (name, identifier, trust_level, bus_ids; note per identity)
-    identity: {
-      list: () => call("identity.list", {}),
-      get: (args: { id_or_identifier: string }) => call("identity.get", args),
+    // Contacts (name, identifier, trust_level, bus_ids, notes)
+    contacts: {
+      list: () => call("contacts.list", {}),
+      search: (args: { query: string }) => call("contacts.search", args),
+      get: (args: { id_or_identifier: string }) => call("contacts.get", args),
       create: (args: {
         name: string;
         identifier: string;
         trust_level?: "normal" | "root";
         bus_ids?: string[];
-      }) => call("identity.create", args),
+        notes?: string;
+      }) => call("contacts.create", args),
       update: (args: {
         id_or_identifier: string;
         name?: string;
         identifier?: string;
         trust_level?: "normal" | "root";
         bus_ids?: string[];
-      }) => call("identity.update", args),
-      delete: (args: { id_or_identifier: string }) => call("identity.delete", args),
-      set_note: (args: { identifier: string; content: string }) => call("identity.set_note", args),
-      is_trusted: (args: { bus_id: string; sender_email?: string }) => call("identity.is_trusted", args),
+        notes?: string;
+      }) => call("contacts.update", args),
+      delete: (args: { id_or_identifier: string }) => call("contacts.delete", args),
+      is_trusted: (args: { bus_id: string; sender_email?: string }) => call("contacts.is_trusted", args),
+    },
+
+    // Soul (SOUL.md in yaaia folder — agent identity, appended to system prompt)
+    soul: {
+      get: () => call("soul.get", {}),
+      set: (args: { content: string }) => call("soul.set", args),
     },
 
     // Passwords (passwords and TOTPs only; usernames, hosts, ports in KB md files)
@@ -271,9 +278,7 @@ export function createAgentApi(deps: AgentApiDeps): Record<string, unknown> {
         call("mail.append", args),
     },
 
-    // Telegram
-    /** Connect to Telegram. Params: phone (required) */
-    telegram_connect: (args: { phone: string }) => call("telegram_connect", args),
+    // Telegram (connect via sidebar; auto-connects on chat start if previously connected)
     /** Resolve username to bus_id. Params: username (required) */
     telegram_search: (args: { username: string }) => call("telegram_search", args),
 

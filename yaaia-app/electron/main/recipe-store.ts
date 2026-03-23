@@ -43,20 +43,7 @@ export interface RecipeState {
 let pendingInitialPrompt = "";
 let currentModel = "";
 let recipe: RecipeState | null = null;
-let sessionTag: string | null = null;
 let codeBoundary: string | null = null;
-
-export function setSessionTag(tag: string): void {
-  sessionTag = String(tag ?? "").trim() || null;
-}
-
-export function getSessionTag(): string | null {
-  return sessionTag;
-}
-
-export function clearSessionTag(): void {
-  sessionTag = null;
-}
 
 export function setCodeBoundary(boundary: string): void {
   codeBoundary = String(boundary ?? "").trim() || null;

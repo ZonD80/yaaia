@@ -21,19 +21,10 @@ export interface McpServerConfig {
   onSendMessageToRoot?: (content: string) => void;
   /** Called when agent sends message to a Telegram bus. Send via telegram client. */
   onSendMessageToTelegram?: (busId: string, content: string) => void | Promise<void>;
-  /** Called when agent wants to connect Telegram. phone is mandatory from the tool. Returns buses + instruction on success. */
-  onTelegramConnect?: (phone: string) => Promise<{
-    ok: boolean;
-    buses?: Array<{ bus_id: string; description: string }>;
-    instruction?: string;
-    missedMessages?: Array<{ bus_id: string; user_id: number; user_name: string; content: string }>;
-    error?: string;
-  }>;
-  /** Resolve Telegram username to bus_id. Requires Telegram to be connected. */
+  /** Resolve Telegram username to bus_id. Requires Telegram to be connected (via sidebar or auto-connect on chat start). */
   onTelegramSearch?: (username: string) => Promise<{ bus_id: string; display_name?: string }>;
-  /** App config for root bus (userName). Telegram credentials exposed to eval. */
+  /** App config. Telegram credentials exposed to eval. */
   appConfig?: {
-    userName: string;
     telegramApiId?: number;
     telegramApiHash?: string;
   };

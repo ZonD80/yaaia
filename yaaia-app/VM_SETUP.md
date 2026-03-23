@@ -16,7 +16,7 @@ Enable **Setup mode** in Configuration to:
 - Expose `vm_serial` APIs (connect, read, write, write_from_file, disconnect)
 - Get a setup checklist when `vmControl.power_on` succeeds
 
-When Setup mode is off, `vm_serial` is not available. Call `vmControl.power_on`, stop after it; you will receive a message on the bus when the VM is connected for vm-bash execution.
+When Setup mode is off, `vm_serial` is not available.
 
 ## Setup Checklist
 
@@ -65,6 +65,5 @@ Enable: `systemctl enable yaaia-vm-agent`
 
 ## Verification
 
-1. Power on the VM with `vmControl.power_on`. Stop after it.
-2. You will receive a message on the bus when the VM is connected for vm-bash execution (or use vm_serial in setup mode to verify manually).
-3. Use vm-bash blocks in the agent.
+1. Power on the VM with `vmControl.power_on` (or use vm_serial in setup mode to verify manually).
+2. Use vm-bash blocks in the agent.

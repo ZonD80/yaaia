@@ -9,8 +9,6 @@ export interface McpConfig {
   openrouterApiKey: string;
   openrouterModel: string;
   codexModel: string;
-  userName: string;
-  rootUserIdentifier?: string;
   skipInitialTask?: boolean;
   enableMdParsing?: boolean;
 }
@@ -41,21 +39,21 @@ try {
     }) => ipcRenderer.invoke("passwords-set", args),
     passwordsDelete: (id: string) => ipcRenderer.invoke("passwords-delete", id),
     wipePasswords: () => ipcRenderer.invoke("wipe-passwords"),
-    identityList: () => ipcRenderer.invoke("identity-list"),
-    identityGet: (idOrIdentifier: string) => ipcRenderer.invoke("identity-get", idOrIdentifier),
-    identityCreate: (args: {
+    contactsList: () => ipcRenderer.invoke("contacts-list"),
+    contactsSearch: (query: string) => ipcRenderer.invoke("contacts-search", query),
+    contactsGet: (idOrIdentifier: string) => ipcRenderer.invoke("contacts-get", idOrIdentifier),
+    contactsCreate: (args: {
       name: string;
       identifier: string;
       trust_level?: "root" | "normal";
       bus_ids?: string[];
-    }) => ipcRenderer.invoke("identity-create", args),
-    identityUpdate: (
+      notes?: string;
+    }) => ipcRenderer.invoke("contacts-create", args),
+    contactsUpdate: (
       idOrIdentifier: string,
-      args: { name?: string; identifier?: string; trust_level?: "root" | "normal"; bus_ids?: string[] }
-    ) => ipcRenderer.invoke("identity-update", idOrIdentifier, args),
-    identityDelete: (idOrIdentifier: string) => ipcRenderer.invoke("identity-delete", idOrIdentifier),
-    identitySetNote: (identifier: string, content: string) =>
-      ipcRenderer.invoke("identity-set-note", identifier, content),
+      args: { name?: string; identifier?: string; trust_level?: "root" | "normal"; bus_ids?: string[]; notes?: string }
+    ) => ipcRenderer.invoke("contacts-update", idOrIdentifier, args),
+    contactsDelete: (idOrIdentifier: string) => ipcRenderer.invoke("contacts-delete", idOrIdentifier),
     messageBusList: () => ipcRenderer.invoke("message-bus-list"),
     messageBusSetDescription: (busId: string, description: string) =>
       ipcRenderer.invoke("message-bus-set-description", busId, description),
@@ -64,6 +62,7 @@ try {
     messageBusGetHistorySlice: (busId: string, limit: number, offset: number) =>
       ipcRenderer.invoke("message-bus-get-history-slice", busId, limit, offset),
     messageBusWipeRoot: () => ipcRenderer.invoke("message-bus-wipe-root"),
+    messageBusWipeAll: () => ipcRenderer.invoke("message-bus-wipe-all"),
     scheduleList: () => ipcRenderer.invoke("schedule-list"),
     scheduleGetStartup: () => ipcRenderer.invoke("schedule-get-startup"),
     scheduleSetStartup: (task: { title: string; instructions: string }) =>
@@ -125,6 +124,11 @@ try {
       ipcRenderer.on("email-message", fn);
       return () => ipcRenderer.removeListener("email-message", fn);
     },
+    onCalendarEvent: (callback: (payload: { bus_id: string; content: string; instruction?: string; timestamp?: string }) => void) => {
+      const fn = (_: unknown, payload: { bus_id: string; content: string; instruction?: string; timestamp?: string }) => callback(payload);
+      ipcRenderer.on("calendar-event", fn);
+      return () => ipcRenderer.removeListener("calendar-event", fn);
+    },
     onScheduleTrigger: (callback: (message: string) => void) => {
       const fn = (_: unknown, message: string) => callback(message);
       ipcRenderer.on("schedule-trigger", fn);
@@ -146,6 +150,7 @@ try {
     codexLogout: () => ipcRenderer.invoke("codex-logout"),
     googleApiStatus: () => ipcRenderer.invoke("google-api-status"),
     googleApiAuthorize: () => ipcRenderer.invoke("google-api-authorize"),
+    telegramConnectStart: (phone: string) => ipcRenderer.invoke("telegram-connect-start", phone),
     googleApiLogout: () => ipcRenderer.invoke("google-api-logout"),
     vmList: () => ipcRenderer.invoke("vm-list"),
     vmCreate: (options?: { isoPath?: string; ramMb?: number; diskGb?: number }) =>

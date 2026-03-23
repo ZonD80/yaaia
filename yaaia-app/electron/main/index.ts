@@ -19,6 +19,8 @@ import {
   telegramResolvePeer,
   telegramFetchMissedMessages,
   isTelegramConnected,
+  saveTelegramConnectPhone,
+  loadTelegramConnectPhone,
 } from "./telegram-client.js";
 import { setOnMailMessage, mailMessageFlagsAdd } from "./mail-client.js";
 import {
@@ -68,8 +70,8 @@ import {
   getBusTrustLevel,
   deleteBus,
   wipeRootHistory,
+  wipeAllHistory,
   ROOT_BUS_ID,
-  setRootUserIdentifierDefinedCheck,
   hasEventInBusHistory,
   hasMailUidInBusHistory,
   hasMessageIdInBusHistory,
@@ -78,14 +80,14 @@ import {
 } from "./message-db.js";
 import { hasTaskForEventUid, setEventTaskMapping, removeEventTaskMapping } from "./caldav-event-tasks-store.js";
 import {
-  resolveIdentity,
-  identityList,
-  identityGet,
-  identityCreate,
-  identityUpdate,
-  identityDelete,
-  identitySetNote,
-} from "./identities-store.js";
+  resolveContact,
+  contactList,
+  contactGet,
+  contactCreate,
+  contactUpdate,
+  contactDelete,
+  contactSearch,
+} from "./contacts-store.js";
 import { shouldBanBusForNoIdentity, incrementIdentityAttempts } from "./identity-attempts-store.js";
 import { ensureHistoryCollection } from "./message-db.js";
 import {
@@ -101,6 +103,13 @@ import {
   isGoogleAuthorized,
   clearGoogleAuth,
 } from "./google-auth.js";
+import { initGoogleBuses } from "./google-buses.js";
+import {
+  startGooglePoll,
+  stopGooglePoll,
+  setOnGmailMessage,
+  setOnCalendarEvent,
+} from "./google-poll.js";
 import {
   listVms,
   createVm,
@@ -236,9 +245,6 @@ export interface McpConfig {
   openrouterApiKey: string;
   openrouterModel: string;
   codexModel: string;
-  userName: string;
-  /** Who uses root chat (from_identifier for user messages). e.g. aleksei. Empty = use root identity. */
-  rootUserIdentifier: string;
   /** Session-only: skip startup task and due schedules on start-chat */
   skipInitialTask?: boolean;
   /** Setup mode: expose vm_serial, vm.power_on returns setup checklist. When off: no vm_serial, vm.power_on returns stop-after; model gets bus message when VM connected. */
@@ -254,8 +260,6 @@ const DEFAULT_CONFIG: McpConfig = {
   openrouterApiKey: "",
   openrouterModel: "google/gemini-2.5-flash",
   codexModel: "gpt-5.4-codex",
-  userName: "",
-  rootUserIdentifier: "",
   setupMode: false,
   enableMdParsing: false,
 };
@@ -272,15 +276,10 @@ function loadConfig(): McpConfig {
   return { ...DEFAULT_CONFIG };
 }
 
-/** Who uses root chat: config override or root identity identifier. Used as from_identifier for user messages. */
+/** from_identifier for root bus user messages. */
 function getRootUserIdentifier(): string {
-  const cfg = loadConfig();
-  const override = cfg.rootUserIdentifier?.trim();
-  if (override) return override;
-  return resolveIdentity(ROOT_BUS_ID)?.identifier ?? "user";
+  return resolveContact(ROOT_BUS_ID)?.identifier ?? "user";
 }
-
-setRootUserIdentifierDefinedCheck(() => getRootUserIdentifier() !== "user");
 
 function saveConfig(config: McpConfig): void {
   try {
@@ -412,8 +411,8 @@ ipcMain.handle("start-chat", async (_event, config: McpConfig) => {
           if (!isNaN(peerId)) telegramSendText(peerId, "I don't want to talk with you").catch(() => { });
           return;
         }
-        const identity = resolveIdentity(payload.bus_id);
-        if (!identity) {
+        const contact = resolveContact(payload.bus_id);
+        if (!contact) {
           if (shouldBanBusForNoIdentity(payload.bus_id)) {
             setBusProperties(payload.bus_id, { is_banned: true });
             const peerId = parseInt(payload.bus_id.replace("telegram-", ""), 10);
@@ -426,9 +425,10 @@ ipcMain.handle("start-chat", async (_event, config: McpConfig) => {
         if (payload.message_id != null && hasMessageIdInBusHistory(payload.bus_id, String(payload.message_id))) {
           return;
         }
+        const storedContent = `${payload.bus_id}:${payload.content}`;
         const busMsg = {
           role: "user" as const,
-          content: payload.content,
+          content: storedContent,
           user_id: payload.user_id,
           user_name: payload.user_name,
           bus_id: payload.bus_id,
@@ -452,11 +452,11 @@ ipcMain.handle("start-chat", async (_event, config: McpConfig) => {
               return ctx ? `${ctx}\n\n` : "";
             })()
             : "";
-        const identityAsk = !identity
-          ? `IMPORTANT: No identity exists for bus ${payload.bus_id}. Ask the user to create one via identity.create (name, identifier, bus_ids including "${payload.bus_id}"). `
+        const identityAsk = !contact
+          ? `IMPORTANT: No contact exists for bus ${payload.bus_id}. Ask the user to create one via contacts.create (name, identifier, bus_ids including "${payload.bus_id}"). `
           : "";
         const instruction = `${identityAsk}${busContext}If you need more context for this bus, call bus.get_history(bus_id="${payload.bus_id}", assessment="...", clarification="...", limit=50, offset=0) for last 50, or use negative offset for earlier messages.`;
-        queueAndTriggerAgent(`${payload.bus_id}:${payload.content}`);
+        queueAndTriggerAgent(storedContent);
         if (opts?.deliverToModel !== false && mainWindow && !mainWindow.isDestroyed()) {
           mainWindow.webContents.send("telegram-message", { ...payload, instruction });
         }
@@ -464,11 +464,75 @@ ipcMain.handle("start-chat", async (_event, config: McpConfig) => {
         console.error("[YAAIA] Telegram callback error:", err);
       }
     });
+    setOnGmailMessage((payload) => {
+      try {
+        if (isBusBanned(payload.bus_id)) return;
+        ensureBus(payload.bus_id, `Gmail: ${payload.user_name}`);
+        if (hasMessageIdInBusHistory(payload.bus_id, payload.message_id)) return;
+        const storedContent = `${payload.bus_id}:${payload.content}`;
+        const busMsg = {
+          role: "user" as const,
+          content: storedContent,
+          user_name: payload.user_name,
+          bus_id: payload.bus_id,
+          timestamp: payload.timestamp,
+          message_id: payload.message_id,
+        };
+        appendToBusHistory(payload.bus_id, busMsg);
+        queueAndTriggerAgent(storedContent);
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          const isFirstFromBus = !busesDeliveredSinceRootWipe.has(payload.bus_id);
+          if (isFirstFromBus) busesDeliveredSinceRootWipe.add(payload.bus_id);
+          const busContext = isFirstFromBus
+            ? (() => {
+                const last10 = getBusHistorySlice(payload.bus_id, 10, 0);
+                return last10.length ? `Recent history for ${payload.bus_id}:\n${last10.map((m) => `${m.role}: ${m.content}`).join("\n")}\n\n` : "";
+              })()
+            : "";
+          const instruction = `${busContext}Use gmail.users.messages.get({ userId: 'me', id: '${payload.message_id}' }) to fetch full content.`;
+          mainWindow.webContents.send("email-message", { ...payload, instruction });
+        }
+      } catch (err) {
+        console.error("[YAAIA] Gmail callback error:", err);
+      }
+    });
+    setOnCalendarEvent((payload) => {
+      try {
+        if (isBusBanned(payload.bus_id)) return;
+        ensureBus(payload.bus_id, "Calendar");
+        if (hasEventInBusHistory(payload.bus_id, payload.event_id)) return;
+        const storedContent = `${payload.bus_id}:${payload.content}`;
+        const busMsg = {
+          role: "user" as const,
+          content: storedContent,
+          user_name: "Calendar",
+          bus_id: payload.bus_id,
+          timestamp: payload.timestamp,
+          event_uid: payload.event_id,
+        };
+        appendToBusHistory(payload.bus_id, busMsg);
+        queueAndTriggerAgent(storedContent);
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          const isFirstFromBus = !busesDeliveredSinceRootWipe.has(payload.bus_id);
+          if (isFirstFromBus) busesDeliveredSinceRootWipe.add(payload.bus_id);
+          const busContext = isFirstFromBus
+            ? (() => {
+                const last10 = getBusHistorySlice(payload.bus_id, 10, 0);
+                return last10.length ? `Recent history for ${payload.bus_id}:\n${last10.map((m) => `${m.role}: ${m.content}`).join("\n")}\n\n` : "";
+              })()
+            : "";
+          const instruction = `${busContext}Use calendar.events.get({ calendarId: '${payload.calendar_id}', eventId: '${payload.event_id}' }) to fetch full event.`;
+          mainWindow.webContents.send("calendar-event", { ...payload, instruction });
+        }
+      } catch (err) {
+        console.error("[YAAIA] Calendar callback error:", err);
+      }
+    });
     setOnMailMessage((payload, opts) => {
       try {
         if (isBusBanned(payload.bus_id)) return;
-        const identity = resolveIdentity(payload.bus_id, payload.sender_email);
-        if (!identity) {
+        const contact = resolveContact(payload.bus_id, payload.sender_email);
+        if (!contact) {
           if (shouldBanBusForNoIdentity(payload.bus_id)) {
             setBusProperties(payload.bus_id, { is_banned: true });
             return;
@@ -484,9 +548,10 @@ ipcMain.handle("start-chat", async (_event, config: McpConfig) => {
           });
           return;
         }
+        const storedContent = `${payload.bus_id}:${payload.content}`;
         const busMsg = {
           role: "user" as const,
-          content: payload.content,
+          content: storedContent,
           user_id: payload.user_id,
           user_name: payload.user_name,
           bus_id: payload.bus_id,
@@ -494,17 +559,7 @@ ipcMain.handle("start-chat", async (_event, config: McpConfig) => {
           mail_uid: payload.mail_uid,
         };
         appendToBusHistory(payload.bus_id, busMsg);
-        const queued =
-          payload.mail_uid != null
-            ? JSON.stringify({
-                bus_id: payload.bus_id,
-                content: payload.content,
-                mail_uid: payload.mail_uid,
-                user_name: payload.user_name,
-                timestamp: payload.timestamp,
-              })
-              : `${payload.bus_id}:${payload.content}`;
-        queueAndTriggerAgent(queued);
+        queueAndTriggerAgent(storedContent);
         if (payload.mail_uid != null) {
           const uid = payload.mail_uid;
           setImmediate(() => {
@@ -525,8 +580,8 @@ ipcMain.handle("start-chat", async (_event, config: McpConfig) => {
                   : "";
               })()
               : "";
-          const identityAsk = !identity
-            ? `IMPORTANT: No identity exists for bus ${payload.bus_id} (sender: ${payload.sender_email ?? "unknown"}). Ask the user to create one via identity.create (name, identifier="${payload.sender_email ?? "email@example.com"}", bus_ids including "${payload.bus_id}"). `
+          const identityAsk = !contact
+            ? `IMPORTANT: No contact exists for bus ${payload.bus_id} (sender: ${payload.sender_email ?? "unknown"}). Ask the user to create one via contacts.create (name, identifier="${payload.sender_email ?? "email@example.com"}", bus_ids including "${payload.bus_id}"). `
             : "";
           const instruction = `${identityAsk}${busContext}If you need more context for this bus, call bus.get_history(bus_id="${payload.bus_id}", assessment="...", clarification="...", limit=50, offset=0).`;
           mainWindow.webContents.send("email-message", { ...payload, instruction });
@@ -555,49 +610,11 @@ ipcMain.handle("start-chat", async (_event, config: McpConfig) => {
       },
       onTelegramSearch: async (username) => {
         if (!isTelegramConnected()) {
-          throw new Error("Telegram not connected. Call telegram_connect first.");
+          throw new Error("Telegram not connected. Connect Telegram via the sidebar button.");
         }
         return telegramResolvePeer(username);
       },
-      onTelegramConnect: async (phone) => {
-        if (isTelegramConnected()) {
-          const buses = listBuses().filter((b) => b.bus_id.startsWith("telegram-"));
-          const instruction =
-            "If you need more context for a bus, call bus.get_history(bus_id, assessment, clarification, limit, offset). offset=0 = last N; offset<0 = from end.";
-          const missed = await telegramFetchMissedMessages({ deliverToModel: false });
-          return { ok: true, buses, instruction, missedMessages: missed };
-        }
-        try {
-          await telegramConnect({
-            apiId: TELEGRAM_APP_ID,
-            apiHash: TELEGRAM_APP_HASH,
-            phone: phone.trim(),
-            getLoginInput: async (step) => {
-              return new Promise<string>((resolve) => {
-                pendingTelegramLoginResolve = resolve;
-                mainWindow?.webContents?.send("telegram-login-request", { step });
-              });
-            },
-          });
-          const buses = listBuses().filter((b) => b.bus_id.startsWith("telegram-"));
-          const instruction =
-            "If you need more context for a bus, call bus.get_history(bus_id, assessment, clarification, limit, offset). offset=0 = last N; offset<0 = from end.";
-          const missed = await telegramFetchMissedMessages({ deliverToModel: false });
-          return {
-            ok: true,
-            buses,
-            instruction,
-            missedMessages: missed,
-          };
-        } catch (err) {
-          return {
-            ok: false,
-            error: err instanceof Error ? err.message : String(err),
-          };
-        }
-      },
       appConfig: {
-        userName: config.userName ?? "",
         telegramApiId: TELEGRAM_APP_ID,
         telegramApiHash: TELEGRAM_APP_HASH,
       },
@@ -607,6 +624,24 @@ ipcMain.handle("start-chat", async (_event, config: McpConfig) => {
     ensureStorageDirs();
     ensureVmAgentInShared();
     kbEnsureCollection("history");
+    mainWindow?.webContents?.send("startup-progress", "Checking Google API...");
+    initGoogleBuses().catch((err) => console.warn("[YAAIA] Google buses init:", err));
+    startGooglePoll();
+    const storedPhone = loadTelegramConnectPhone();
+    if (storedPhone && !isTelegramConnected()) {
+      mainWindow?.webContents?.send("startup-progress", "Connecting Telegram...");
+      telegramConnect({
+        apiId: TELEGRAM_APP_ID,
+        apiHash: TELEGRAM_APP_HASH,
+        phone: storedPhone,
+        getLoginInput: async (step) => {
+          return new Promise<string>((resolve) => {
+            pendingTelegramLoginResolve = resolve;
+            mainWindow?.webContents?.send("telegram-login-request", { step });
+          });
+        },
+      }).catch((err) => console.warn("[YAAIA] Telegram auto-connect:", err));
+    }
     startVmEvalServer();
     setOnVmConnected(() => {
       const content = `${ROOT_BUS_ID}:VM connected for vm-bash execution`;
@@ -648,7 +683,6 @@ ipcMain.handle("start-chat", async (_event, config: McpConfig) => {
     });
     mainWindow?.webContents?.send("startup-progress", "Agent ready");
 
-    recipeStore.setSessionTag(randomBytes(16).toString("hex"));
     recipeStore.setCodeBoundary(randomBytes(8).toString("base64url"));
 
     if (!config.skipInitialTask) {
@@ -658,6 +692,9 @@ ipcMain.handle("start-chat", async (_event, config: McpConfig) => {
     if (scheduleIntervalHandle) clearInterval(scheduleIntervalHandle);
     scheduleIntervalHandle = setInterval(runDueSchedules, 60_000);
 
+    if (isTelegramConnected()) {
+      await telegramFetchMissedMessages();
+    }
     if (hasAgentInjectedMessages() && mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send("agent-drain");
     }
@@ -688,8 +725,10 @@ ipcMain.handle("stop-chat", async () => {
   await telegramDisconnect();
   setOnTelegramMessage(null);
   setOnMailMessage(null);
+  setOnGmailMessage(null);
+  setOnCalendarEvent(null);
+  stopGooglePoll();
   setRouteCallbacksForEval(null);
-  recipeStore.clearSessionTag();
   recipeStore.clearCodeBoundary();
   clearEvalContext();
   clearAgentInjectedQueue();
@@ -726,10 +765,12 @@ async function handleAgentSendMessage(
   let targetBusId = busId ?? ROOT_BUS_ID;
   let userMsg: string;
 
+  let messageFromQueue = false;
   if (typeof message === "string" && message.trim() === "") {
     const queued = getAndClearAgentInjectedQueue();
     if (queued.length > 0) {
       message = queued.join("\n");
+      messageFromQueue = true;
     } else {
       return "";
     }
@@ -768,13 +809,22 @@ async function handleAgentSendMessage(
         ...(mail_uid !== undefined && { mail_uid }),
         ...(event_uid && { event_uid }),
       };
-      if (busIdForAppend === ROOT_BUS_ID) {
-        const rootId = getRootUserIdentifier();
+      const storedContent = busIdForAppend === ROOT_BUS_ID ? `${ROOT_BUS_ID}:${content}` : `${busIdForAppend}:${content}`;
+      const rootId = getRootUserIdentifier();
+      if (messageFromQueue) {
+        /* Queued messages were already appended to their buses by callbacks. Append to root only so model sees them; avoid duplicates. */
         appendToBusHistory(ROOT_BUS_ID, {
           ...busMsg,
           bus_id: ROOT_BUS_ID,
           from_identifier: rootId,
-          content: `${ROOT_BUS_ID}:${content}`,
+          content: storedContent,
+        });
+      } else if (busIdForAppend === ROOT_BUS_ID) {
+        appendToBusHistory(ROOT_BUS_ID, {
+          ...busMsg,
+          bus_id: ROOT_BUS_ID,
+          from_identifier: rootId,
+          content: storedContent,
         });
       } else {
         ensureBus(
@@ -785,10 +835,7 @@ async function handleAgentSendMessage(
               ? `Email: ${user_name}`
               : busIdForAppend
         );
-        const last = getBusHistorySlice(busIdForAppend, 1, 0)[0];
-        const storedContent = `${busIdForAppend}:${content}`;
-        const alreadyAppended = last?.role === "user" && last?.content === storedContent;
-        if (!alreadyAppended) appendToBusHistory(busIdForAppend, { ...busMsg, content: storedContent });
+        appendToBusHistory(busIdForAppend, { ...busMsg, content: storedContent });
       }
       parts.push(`${busIdForAppend}:${content}`);
       const label =
@@ -823,7 +870,7 @@ async function handleAgentSendMessage(
             busId: busIdForAppend,
             content: [content],
             user_id: parsed.user_id ?? 0,
-            user_name: parsed.user_name ?? cfg.userName ?? "",
+            user_name: parsed.user_name ?? "",
             timestamp: parsed.timestamp ?? new Date().toISOString(),
             mail_uid: parsed.mail_uid,
             event_uid: parsed.event_uid,
@@ -840,7 +887,7 @@ async function handleAgentSendMessage(
               busId: maybeBusId,
               content: [line.slice(colonIdx + 1).trimStart()],
               user_id: 0,
-              user_name: cfg.userName ?? "",
+              user_name: "",
               timestamp: new Date().toISOString(),
             };
           } else if (currentEntry) {
@@ -850,7 +897,7 @@ async function handleAgentSendMessage(
               busId: ROOT_BUS_ID,
               content: [line],
               user_id: 0,
-              user_name: cfg.userName ?? "",
+              user_name: "",
               timestamp: new Date().toISOString(),
             };
             flushEntry();
@@ -862,7 +909,7 @@ async function handleAgentSendMessage(
             busId: ROOT_BUS_ID,
             content: [line],
             user_id: 0,
-            user_name: cfg.userName ?? "",
+            user_name: "",
             timestamp: new Date().toISOString(),
           };
           flushEntry();
@@ -890,7 +937,7 @@ async function handleAgentSendMessage(
       }
       if (parsed) {
         content = parsed.content ?? message;
-        const user_name = parsed.user_name ?? cfg.userName ?? "";
+        const user_name = parsed.user_name ?? "";
         const user_id = parsed.user_id ?? 0;
         const parsedBusId = parsed.bus_id && parsed.bus_id !== ROOT_BUS_ID ? parsed.bus_id : undefined;
         const bus_id = parsedBusId && isValidBusIdFormat(parsedBusId) ? parsedBusId : undefined;
@@ -920,7 +967,7 @@ async function handleAgentSendMessage(
           role: "user",
           content: storedContent,
           user_id: 0,
-          user_name: cfg.userName ?? "",
+          user_name: "",
           from_identifier: rootId,
         });
       }
@@ -929,13 +976,11 @@ async function handleAgentSendMessage(
     }
     userMsg = storedContent;
   }
-  const tag = recipeStore.getSessionTag();
   const { messages: busHistory, trimmedCount } = getRootLogForModelWithMessageLimit(30);
-  const history: { role: "user" | "assistant"; content: string; wrap?: boolean }[] = busHistory.map((m) => {
+  const history: { role: "user" | "assistant"; content: string }[] = busHistory.map((m) => {
     const busId = m.bus_id ?? ROOT_BUS_ID;
-    const wrap = getBusTrustLevel(busId) === "root" && !!tag;
     const prefixContent = m.content.startsWith(`${busId}:`) ? m.content : `${busId}:${m.content}`;
-    return { role: m.role as "user" | "assistant", content: prefixContent, wrap };
+    return { role: m.role as "user" | "assistant", content: prefixContent };
   });
   recipeStore.setInitialPrompt(message);
   if (targetBusId !== ROOT_BUS_ID) {
@@ -987,9 +1032,7 @@ ipcMain.handle("finalize-task-reply", (_, isSuccess: boolean) => {
   return undefined;
 });
 
-ipcMain.handle("get-config", () =>
-  safeForIPC({ ...loadConfig(), rootUserIdentifierDefined: getRootUserIdentifier() !== "user" })
-);
+ipcMain.handle("get-config", () => safeForIPC(loadConfig()));
 
 ipcMain.handle("codex-auth-status", () =>
   safeForIPC({ authenticated: !!loadCodexAuth()?.access })
@@ -1057,6 +1100,37 @@ ipcMain.handle("google-api-logout", () => {
   return undefined;
 });
 
+ipcMain.handle("telegram-connect-start", async (_event, phone: string) => {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    return { ok: false, error: "Window not available." };
+  }
+  const ph = String(phone ?? "").trim();
+  if (!ph) return { ok: false, error: "Phone number is required." };
+  try {
+    if (isTelegramConnected()) {
+      return { ok: true };
+    }
+    await telegramConnect({
+      apiId: TELEGRAM_APP_ID,
+      apiHash: TELEGRAM_APP_HASH,
+      phone: ph,
+      getLoginInput: async (step) => {
+        return new Promise<string>((resolve) => {
+          pendingTelegramLoginResolve = resolve;
+          mainWindow?.webContents?.send("telegram-login-request", { step });
+        });
+      },
+    });
+    saveTelegramConnectPhone(ph);
+    return { ok: true };
+  } catch (err) {
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+});
+
 let pendingTelegramLoginResolve: ((value: string) => void) | null = null;
 ipcMain.handle("telegram-login-reply", (_event, value: string) => {
   if (pendingTelegramLoginResolve) {
@@ -1113,47 +1187,44 @@ ipcMain.handle("wipe-passwords", () => {
   return undefined;
 });
 
-ipcMain.handle("identity-list", () => safeForIPC(identityList()));
-ipcMain.handle("identity-get", (_, idOrIdentifier: string) => safeForIPC(identityGet(idOrIdentifier)));
+ipcMain.handle("contacts-list", () => safeForIPC(contactList()));
+ipcMain.handle("contacts-search", (_, query: string) => safeForIPC(contactSearch(query)));
+ipcMain.handle("contacts-get", (_, idOrIdentifier: string) => safeForIPC(contactGet(idOrIdentifier)));
 ipcMain.handle(
-  "identity-create",
+  "contacts-create",
   (
     _,
-    args: { name: string; identifier: string; trust_level?: "root" | "normal"; bus_ids?: string[] }
+    args: { name: string; identifier: string; trust_level?: "root" | "normal"; bus_ids?: string[]; notes?: string }
   ) => {
     try {
-      return identityCreate(args);
+      return contactCreate(args);
     } catch (err) {
       throw err instanceof Error ? err : new Error(String(err));
     }
   }
 );
 ipcMain.handle(
-  "identity-update",
+  "contacts-update",
   (
     _,
     idOrIdentifier: string,
-    args: { name?: string; identifier?: string; trust_level?: "root" | "normal"; bus_ids?: string[] }
+    args: { name?: string; identifier?: string; trust_level?: "root" | "normal"; bus_ids?: string[]; notes?: string }
   ) => {
     try {
-      identityUpdate(idOrIdentifier, args);
+      contactUpdate(idOrIdentifier, args);
       return undefined;
     } catch (err) {
       throw err instanceof Error ? err : new Error(String(err));
     }
   }
 );
-ipcMain.handle("identity-delete", (_, idOrIdentifier: string) => {
+ipcMain.handle("contacts-delete", (_, idOrIdentifier: string) => {
   try {
-    identityDelete(idOrIdentifier);
+    contactDelete(idOrIdentifier);
     return undefined;
   } catch (err) {
     throw err instanceof Error ? err : new Error(String(err));
   }
-});
-ipcMain.handle("identity-set-note", (_, identifier: string, content: string) => {
-  identitySetNote(identifier, content);
-  return undefined;
 });
 
 ipcMain.handle("message-bus-list", () => safeForIPC(listBuses()));
@@ -1178,6 +1249,12 @@ ipcMain.handle(
 );
 ipcMain.handle("message-bus-wipe-root", () => {
   wipeRootHistory();
+  busesDeliveredSinceRootWipe.clear();
+  return undefined;
+});
+
+ipcMain.handle("message-bus-wipe-all", () => {
+  wipeAllHistory();
   busesDeliveredSinceRootWipe.clear();
   return undefined;
 });
@@ -1322,7 +1399,7 @@ ipcMain.handle("agent-queue-message", (_, msg: string) => {
     role: "user",
     content: stored,
     user_id: 0,
-    user_name: loadConfig().userName ?? "",
+    user_name: "",
     from_identifier: rootId,
   });
   addToAgentInjectedQueue(stored);
@@ -1334,7 +1411,7 @@ ipcMain.handle("agent-inject-message", (_, msg: string, placeAfterAskUser?: bool
   setPendingInjectMessage(msg);
   let content = msg;
   let busId = ROOT_BUS_ID;
-  let user_name = loadConfig().userName ?? "";
+  let user_name = "";
   let user_id = 0;
   if (msg.startsWith("{")) {
     try {

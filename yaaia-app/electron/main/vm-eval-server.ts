@@ -26,26 +26,31 @@ let wsClient: { send: (data: string | Buffer) => void; readyState: number } | nu
 
 let onVmConnected: (() => void) | null = null;
 
-/** Persistent vm-bash output buffers. Cleared only on stop-chat. */
-let vmEvalStdout = "";
-let vmEvalStderr = "";
+/** Persistent vm-bash output buffers per user. Key: "root" or user_id. Cleared only on stop-chat. */
+const vmEvalStdoutByUser: Record<string, string> = {};
+const vmEvalStderrByUser: Record<string, string> = {};
 
-export function appendVmEval(stdout: string, stderr: string): void {
-  vmEvalStdout += stdout;
-  vmEvalStderr += stderr;
+export function appendVmEval(stdout: string, stderr: string, user: string): void {
+  const key = user || "root";
+  if (!vmEvalStdoutByUser[key]) vmEvalStdoutByUser[key] = "";
+  if (!vmEvalStderrByUser[key]) vmEvalStderrByUser[key] = "";
+  vmEvalStdoutByUser[key] += stdout;
+  vmEvalStderrByUser[key] += stderr;
 }
 
-export function getVmEvalStdout(): string {
-  return vmEvalStdout;
+/** Returns Record<user, stdout> e.g. { root: string, "1000": string }. */
+export function getVmEvalStdout(): Record<string, string> {
+  return { ...vmEvalStdoutByUser };
 }
 
-export function getVmEvalStderr(): string {
-  return vmEvalStderr;
+/** Returns Record<user, stderr> e.g. { root: string, "1000": string }. */
+export function getVmEvalStderr(): Record<string, string> {
+  return { ...vmEvalStderrByUser };
 }
 
 export function clearVmEvalBuffer(): void {
-  vmEvalStdout = "";
-  vmEvalStderr = "";
+  for (const k of Object.keys(vmEvalStdoutByUser)) delete vmEvalStdoutByUser[k];
+  for (const k of Object.keys(vmEvalStderrByUser)) delete vmEvalStderrByUser[k];
 }
 
 /** Called when VM agent connects. Main process wires this to queue/send "root:VM connected for vm-bash execution". */

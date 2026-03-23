@@ -59,15 +59,17 @@ import {
   removeMessagesFromBusHistoryByEventUids,
 } from "./message-db.js";
 import { startVm, stopVm } from "./vm-manager.js";
+import { isVmEvalConnected } from "./vm-eval-server.js";
 import {
-  identityList,
-  identityGet,
-  identityCreate,
-  identityUpdate,
-  identityDelete,
-  identitySetNote,
+  contactList,
+  contactGet,
+  contactCreate,
+  contactUpdate,
+  contactDelete,
+  contactSearch,
   isBusTrusted,
-} from "./identities-store.js";
+} from "./contacts-store.js";
+import { soulGet, soulSet } from "./soul-store.js";
 
 let directToolsConfig: McpServerConfig | null = null;
 
@@ -202,40 +204,6 @@ export function createDirectCallTool(): AgentApiCallTool {
           return resultText;
         }
 
-        case "telegram_connect": {
-          const msg = validateUnknownParams(args, new Set(["phone"]));
-          if (msg) {
-            recipeStore.appendToolCall(name, args, msg);
-            return finish(msg);
-          }
-          const phone = String(a.phone ?? "").trim();
-          if (!phone) {
-            recipeStore.appendToolCall(name, args, "phone is required");
-            return finish("Error: phone is required.");
-          }
-          const result = await config?.onTelegramConnect?.(phone);
-          if (!result) {
-            recipeStore.appendToolCall(name, args, "Telegram connect not available");
-            return finish("Error: Telegram connect not available.");
-          }
-          if (!result.ok) {
-            recipeStore.appendToolCall(name, args, result.error ?? "Unknown error");
-            return finish(`Error: ${result.error ?? "Unknown error"}`);
-          }
-          const buses = result.buses ?? [];
-          const instruction = result.instruction ?? "If you need conversation history for a bus, call bus.get_history with bus_id in assessment prefix.";
-          const missed = result.missedMessages ?? [];
-          let out: string;
-          if (missed.length === 0) {
-            out = `Connected. Buses: ${JSON.stringify(buses)}. ${instruction}`;
-          } else {
-            const missedStr = missed.map((m) => `[${m.bus_id}] ${m.user_name}: ${m.content}`).join("\n");
-            out = `Connected. Buses: ${JSON.stringify(buses)}. Missed messages (appended to buses):\n${missedStr}\n\n${instruction}`;
-          }
-          recipeStore.appendToolCall(name, args, "Connected");
-          return out;
-        }
-
         case "telegram_search": {
           const msg = validateUnknownParams(args, new Set(["username"]));
           if (msg) {
@@ -245,7 +213,7 @@ export function createDirectCallTool(): AgentApiCallTool {
           const searchResult = await config?.onTelegramSearch?.(String(a.username ?? ""));
           if (!searchResult) {
             recipeStore.appendToolCall(name, args, "Telegram search not available");
-            return finish("Error: Telegram search not available. Connect Telegram first.");
+            return finish("Error: Telegram not connected. Connect Telegram via the sidebar button.");
           }
           const out = JSON.stringify(searchResult);
           recipeStore.appendToolCall(name, args, out);
@@ -438,96 +406,99 @@ export function createDirectCallTool(): AgentApiCallTool {
           return `Password "${delId}" deleted.`;
         }
 
-        case "identity.list":
-        case "identity_list": {
+        case "contacts.list":
+        case "contacts_list": {
           const msg = validateUnknownParams(args, new Set());
           if (msg) {
             recipeStore.appendToolCall(name, args, msg);
             return finish(msg);
           }
-          const list = identityList();
+          const list = contactList();
           recipeStore.appendToolCall(name, args, JSON.stringify(list));
           return JSON.stringify(list);
         }
 
-        case "identity.get":
-        case "identity_get": {
+        case "contacts.search":
+        case "contacts_search": {
+          const msg = validateUnknownParams(args, new Set(["query"]));
+          if (msg) {
+            recipeStore.appendToolCall(name, args, msg);
+            return finish(msg);
+          }
+          const query = String(a.query ?? "").trim();
+          const searchList = contactSearch(query);
+          recipeStore.appendToolCall(name, args, JSON.stringify(searchList));
+          return JSON.stringify(searchList);
+        }
+
+        case "contacts.get":
+        case "contacts_get": {
           const msg = validateUnknownParams(args, new Set(["id_or_identifier"]));
           if (msg) {
             recipeStore.appendToolCall(name, args, msg);
             return finish(msg);
           }
           const idOrIdentifier = String(a.id_or_identifier ?? "").trim();
-          const ident = identityGet(idOrIdentifier);
-          recipeStore.appendToolCall(name, args, ident ? JSON.stringify(ident) : "null");
-          return ident ? JSON.stringify(ident) : "null";
+          const c = contactGet(idOrIdentifier);
+          recipeStore.appendToolCall(name, args, c ? JSON.stringify(c) : "null");
+          return c ? JSON.stringify(c) : "null";
         }
 
-        case "identity.create":
-        case "identity_create": {
-          const allowed = new Set(["name", "identifier", "trust_level", "bus_ids"]);
+        case "contacts.create":
+        case "contacts_create": {
+          const allowed = new Set(["name", "identifier", "trust_level", "bus_ids", "notes"]);
           const msg = validateUnknownParams(args, allowed);
           if (msg) {
             recipeStore.appendToolCall(name, args, msg);
             return finish(msg);
           }
-          const { name: n, identifier: id, trust_level: tl, bus_ids: bids } = a as Record<string, unknown>;
-          const createdId = identityCreate({
+          const { name: n, identifier: id, trust_level: tl, bus_ids: bids, notes: notesVal } = a as Record<string, unknown>;
+          const createdId = contactCreate({
             name: String(n ?? ""),
             identifier: String(id ?? ""),
             trust_level: tl as "root" | "normal" | undefined,
             bus_ids: Array.isArray(bids) ? bids.map(String) : undefined,
+            notes: notesVal != null ? String(notesVal) : undefined,
           });
-          recipeStore.appendToolCall(name, args, `Identity created: ${createdId}`);
-          return `Identity created. id="${createdId}"`;
+          recipeStore.appendToolCall(name, args, `Contact created: ${createdId}`);
+          return `Contact created. id="${createdId}"`;
         }
 
-        case "identity.update":
-        case "identity_update": {
-          const allowed = new Set(["id_or_identifier", "name", "identifier", "trust_level", "bus_ids"]);
+        case "contacts.update":
+        case "contacts_update": {
+          const allowed = new Set(["id_or_identifier", "name", "identifier", "trust_level", "bus_ids", "notes"]);
           const msg = validateUnknownParams(args, allowed);
           if (msg) {
             recipeStore.appendToolCall(name, args, msg);
             return finish(msg);
           }
-          const { id_or_identifier: idOrId, name: n, identifier: id, trust_level: tl, bus_ids: bids } = a as Record<string, unknown>;
-          identityUpdate(String(idOrId ?? ""), {
+          const { id_or_identifier: idOrId, name: n, identifier: id, trust_level: tl, bus_ids: bids, notes: notesVal } = a as Record<string, unknown>;
+          contactUpdate(String(idOrId ?? ""), {
             name: n != null ? String(n) : undefined,
             identifier: id != null ? String(id) : undefined,
             trust_level: tl as "root" | "normal" | undefined,
             bus_ids: Array.isArray(bids) ? bids.map(String) : undefined,
+            notes: notesVal != null ? String(notesVal) : undefined,
           });
-          recipeStore.appendToolCall(name, args, "Identity updated");
-          return "Identity updated.";
+          recipeStore.appendToolCall(name, args, "Contact updated");
+          return "Contact updated.";
         }
 
-        case "identity.delete":
-        case "identity_delete": {
+        case "contacts.delete":
+        case "contacts_delete": {
           const msg = validateUnknownParams(args, new Set(["id_or_identifier"]));
           if (msg) {
             recipeStore.appendToolCall(name, args, msg);
             return finish(msg);
           }
           const idOrIdentifier = String(a.id_or_identifier ?? "").trim();
-          identityDelete(idOrIdentifier);
-          recipeStore.appendToolCall(name, args, "Identity deleted");
-          return "Identity deleted.";
+          contactDelete(idOrIdentifier);
+          recipeStore.appendToolCall(name, args, "Contact deleted");
+          return "Contact deleted.";
         }
 
-        case "identity.set_note":
-        case "identity_set_note": {
-          const msg = validateUnknownParams(args, new Set(["identifier", "content"]));
-          if (msg) {
-            recipeStore.appendToolCall(name, args, msg);
-            return finish(msg);
-          }
-          identitySetNote(String(a.identifier ?? ""), String(a.content ?? ""));
-          recipeStore.appendToolCall(name, args, "Note saved");
-          return "Note saved.";
-        }
-
-        case "identity.is_trusted":
-        case "is_trusted": {
+        case "contacts.is_trusted":
+        case "contacts_is_trusted": {
           const msg = validateUnknownParams(args, new Set(["bus_id", "sender_email"]));
           if (msg) {
             recipeStore.appendToolCall(name, args, msg);
@@ -538,6 +509,30 @@ export function createDirectCallTool(): AgentApiCallTool {
           const trusted = isBusTrusted(busId, senderEmail);
           recipeStore.appendToolCall(name, args, String(trusted));
           return JSON.stringify(trusted);
+        }
+
+        case "soul.get":
+        case "soul_get": {
+          const msg = validateUnknownParams(args, new Set());
+          if (msg) {
+            recipeStore.appendToolCall(name, args, msg);
+            return finish(msg);
+          }
+          const content = soulGet();
+          recipeStore.appendToolCall(name, args, content);
+          return JSON.stringify(content);
+        }
+
+        case "soul.set":
+        case "soul_set": {
+          const msg = validateUnknownParams(args, new Set(["content"]));
+          if (msg) {
+            recipeStore.appendToolCall(name, args, msg);
+            return finish(msg);
+          }
+          soulSet(String(a.content ?? ""));
+          recipeStore.appendToolCall(name, args, "Soul updated");
+          return "Soul updated.";
         }
 
         case "vm.power_on": {
@@ -563,6 +558,9 @@ export function createDirectCallTool(): AgentApiCallTool {
               "3. If mounted on boot, ensure /mnt/shared/yaaia-vm-agent is configured to launch at system boot after mounts (e.g. systemd service).",
               "See VM_SETUP.md for details.",
             ].join("\n");
+          }
+          if (isVmEvalConnected()) {
+            return "VM already powered on and agent connected. Continuing.";
           }
           throw new VmPowerOnAbortError();
         }

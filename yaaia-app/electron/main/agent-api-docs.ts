@@ -70,7 +70,7 @@ export function generateApiDocs(options?: { setupMode?: boolean; codeBoundary?: 
         );
       } else {
         sectionLines.push(
-          "Power on or force-kill VMs. Use vmList for VM ids. vmControl.power_on (non-setup): powers VM on, aborts eval, shows notice to user. When VM connects, root:VM connected for vm-bash execution is sent. vm_serial not available (use setup mode for VM setup).",
+          "Power on or force-kill VMs. Use vmList for VM ids. vmControl.power_on powers VM on. vm_serial not available (use setup mode for VM setup).",
           "",
         );
       }
@@ -100,7 +100,7 @@ export function generateApiDocs(options?: { setupMode?: boolean; codeBoundary?: 
   const lines: string[] = [
     "## Agent TypeScript API",
     "",
-    `You write TypeScript code in code blocks per turn. You may add vm-bash blocks; they run sequentially with ts blocks in document order (bash1 → ts1 → bash2 → ts2). ${blockFormat} Each ts block receives vmEvalStdout and vmEvalStderr: persistent strings (append-only, cleared on stop-chat). Use vmEvalStdout.slice(-n) for last n chars. For vm-bash, the VM must be connected: call vmControl.power_on, stop after it; you will receive a message on the bus when the VM is connected for vm-bash execution. Always include a plan of execution above the code block (what you will do). Inside the code block, use console.log('bus_id:content') to send messages — parsed and routed to buses, streams during execution. Every message must use prefix format: bus_id:content or bus_id:wait:content. bus_id prefix is mandatory. The code runs in an isolated runtime with access to the following API. All functions are async; use await.`,
+    `You write TypeScript code in code blocks per turn. You may add vm-bash blocks; they run sequentially with ts blocks in document order (bash1 → ts1 → bash2 → ts2). ${blockFormat} Each ts block receives vmEvalStdout and vmEvalStderr: per-user buffers (append-only, cleared on stop-chat). Use vmEvalStdout.root, vmEvalStdout[user_id] for stdout; vmEvalStderr.root, vmEvalStderr[user_id] for stderr. Use .slice(-n) for last n chars. Always include a plan of execution above the code block (what you will do). Inside the code block, use console.log('bus_id:content') to send messages — parsed and routed to buses, streams during execution. Every message must use prefix format: bus_id:content or bus_id:wait:content. bus_id prefix is mandatory. The code runs in an isolated runtime with access to the following API. All functions are async; use await.`,
     "",
     "**Eval output:** Use **console.log**, **console.info**, **console.warn**, **console.error** for output.",
     "",
@@ -112,10 +112,10 @@ export function generateApiDocs(options?: { setupMode?: boolean; codeBoundary?: 
     "",
     "### vmEvalStdout / vmEvalStderr (from vm-bash)",
     "",
-    "VM must be connected: call vmControl.power_on, stop after it; you will receive a message on the bus when the VM is connected for vm-bash execution. Blocks run sequentially (bash1 → ts1 → bash2 → ts2); output appends to persistent buffers. Cleared on stop-chat.",
+    "Blocks run sequentially (bash1 → ts1 → bash2 → ts2); output appends to per-user buffers. Cleared on stop-chat.",
     "```ts",
-    "vmEvalStdout: string;  // e.g. vmEvalStdout.slice(-3000) for last 3k chars",
-    "vmEvalStderr: string;",
+    "vmEvalStdout: Record<string, string>;  // vmEvalStdout.root, vmEvalStdout[user_id]; use .slice(-n) for last n chars",
+    "vmEvalStderr: Record<string, string>;  // vmEvalStderr.root, vmEvalStderr[user_id]",
     "```",
     "",
     "### Shared types (for JSON returns)",
@@ -123,6 +123,9 @@ export function generateApiDocs(options?: { setupMode?: boolean; codeBoundary?: 
     "```ts",
     "// bus.list",
     "type BusEntry = { bus_id: string; description: string; trust_level?: 'normal'|'root'; is_banned?: boolean; is_connected: boolean };",
+    "",
+    "// contacts.list / contacts.search / contacts.get",
+    "type Contact = { id: string; name: string; identifier: string; trust_level: 'normal'|'root'; bus_ids: string[]; notes: string };",
     "",
     "// bus.get_history",
     "type HistoryMessage = { role: 'user'|'assistant'; content: string; user_id?: number; user_name?: string; bus_id?: string; timestamp: string; mail_uid?: number; event_uid?: string };",
@@ -163,7 +166,6 @@ export function generateApiDocs(options?: { setupMode?: boolean; codeBoundary?: 
     "",
     "// app_config (read-only, set at startup)",
     "type AppConfig = {",
-    "  userName?: string;",
     "  telegramApiId?: number;",
     "  telegramApiHash?: string;",
     "};",
@@ -171,8 +173,8 @@ export function generateApiDocs(options?: { setupMode?: boolean; codeBoundary?: 
     "",
     "### Read-only globals",
     "",
-    "- **vmList**: VmInfo[] — VMs known to YaaiaVM. Use v.id for vmControl.power_on, vmControl.kill, vm_serial.connect. vmControl.power_on: stop after it; you will receive a bus message when VM is connected for vm-bash.",
-    "- **app_config**: AppConfig | null — Telegram apiId/apiHash. Use for telegram_connect (credentials come from app).",
+    "- **vmList**: VmInfo[] — VMs known to YaaiaVM. Use v.id for vmControl.power_on, vmControl.kill, vm_serial.connect.",
+    "- **app_config**: AppConfig | null — Telegram apiId/apiHash. Telegram connects via sidebar or auto-connects on chat start.",
     "",
     "### Google API (Gmail, Calendar)",
     "",

@@ -77,8 +77,7 @@ function createCapturingConsole(deps: AgentApiDeps): {
     const withNewline = text + "\n";
     chunks.push({ stream, text: withNewline });
 
-    const toParse = stream === "stderr" ? `root:${text}` : text;
-    const parsed = parsePrefixedMessages(toParse);
+    const parsed = parsePrefixedMessages(text);
     if (parsed.length > 0) {
       for (const msg of parsed) {
         if (!isValidBusId(msg.busId)) continue;
@@ -256,8 +255,8 @@ export async function runAgentCode(
   }
 
   persistentSandbox.console = capturingConsole;
-  persistentSandbox.vmEvalStdout = deps.vmEvalStdout ?? "";
-  persistentSandbox.vmEvalStderr = deps.vmEvalStderr ?? "";
+  persistentSandbox.vmEvalStdout = deps.vmEvalStdout ?? {};
+  persistentSandbox.vmEvalStderr = deps.vmEvalStderr ?? {};
   persistentSandbox.vmList = vmList;
   const [gmailClient, calendarClient] = await Promise.all([getGmailClient(), getCalendarClient()]);
   persistentSandbox.gmail = gmailClient;

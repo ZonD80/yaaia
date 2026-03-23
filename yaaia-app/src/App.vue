@@ -50,15 +50,6 @@
           <label>Codex Model</label>
           <input v-model="config.codexModel" placeholder="gpt-5.4-codex" />
         </div>
-        <div class="field">
-          <label>Your name (root bus)</label>
-          <input v-model="config.userName" placeholder="e.g. Alice" />
-        </div>
-        <div class="field">
-          <label>Who uses root chat (identifier)</label>
-          <input v-model="config.rootUserIdentifier" placeholder="e.g. aleksei (empty = use identity)" />
-          <p class="editor-hint">from_identifier for your messages. Assistant replies use "assistant".</p>
-        </div>
         <div class="field vm-section">
           <label>Linux VM</label>
           <p v-if="vmMessage" class="vm-message" :class="{ error: vmMessageError }">{{ vmMessage }}</p>
@@ -132,12 +123,6 @@
         </button>
       </section>
       <section class="chat" v-else>
-        <div v-if="agentReady && !config.rootUserIdentifierDefined && !rootIdentifierWarningDismissed"
-          class="root-identifier-warning">
-          <span>Root chat history is not saved. Set "Who uses root chat (identifier)" in config.</span>
-          <button type="button" class="root-identifier-warning-close" @click="rootIdentifierWarningDismissed = true"
-            title="Dismiss">×</button>
-        </div>
         <div class="chat-messages" ref="messagesRef">
           <div v-if="rootHistoryLoadedCount < rootHistoryTotal" class="chat-load-older">
             <button type="button" class="btn secondary small" @click="loadOlderMessages">
@@ -217,8 +202,9 @@
       </section>
       <aside class="sidebar">
         <button class="btn secondary" @click="authorizeGoogleApi">Authorize Google API for agent</button>
+        <button class="btn secondary" @click="openConnectTelegram">Connect Telegram for agent</button>
         <button class="btn secondary" @click="openPasswordsEditor">Passwords Editor</button>
-        <button class="btn secondary" @click="openIdentitiesEditor">Identities Editor</button>
+        <button class="btn secondary" @click="openContactsEditor">Contacts Editor</button>
         <button class="btn secondary" @click="openScheduleEditor">Schedules</button>
         <button class="btn secondary" @click="viewRecipe">View recipe</button>
         <button class="btn secondary" @click="saveRecipe">Save recipe</button>
@@ -227,6 +213,7 @@
         <button class="btn secondary" @click="openVmSerialConsole">VM Serial Console</button>
         <button class="btn secondary" @click="openStorageFolder">Open storage folder</button>
         <button class="btn secondary" @click="exitChat">Exit chat</button>
+        <button class="btn secondary" @click="wipeAllHistory">Wipe ALL history</button>
       </aside>
     </main>
     <div v-if="telegramLoginStep" class="ask-user-overlay">
@@ -237,6 +224,21 @@
           :placeholder="telegramLoginPlaceholder" class="editor-input" @keydown.enter="submitTelegramLogin" />
         <div class="ask-user-actions">
           <button class="btn primary" @click="submitTelegramLogin">Submit</button>
+        </div>
+      </div>
+    </div>
+    <div v-if="showConnectTelegramModal" class="ask-user-overlay editor-overlay" @click.self="showConnectTelegramModal = false">
+      <div class="ask-user-modal">
+        <h3>Connect Telegram for agent</h3>
+        <p class="ask-user-clarification">Enter your phone number (e.g. +1234567890):</p>
+        <input v-model="connectTelegramPhone" type="tel" placeholder="+1234567890" class="editor-input"
+          @keydown.enter="submitConnectTelegram" />
+        <p v-if="connectTelegramError" class="editor-error">{{ connectTelegramError }}</p>
+        <div class="ask-user-actions">
+          <button class="btn primary" @click="submitConnectTelegram" :disabled="connectTelegramConnecting">
+            {{ connectTelegramConnecting ? "Connecting…" : "Connect" }}
+          </button>
+          <button class="btn secondary" @click="showConnectTelegramModal = false">Cancel</button>
         </div>
       </div>
     </div>
@@ -305,30 +307,33 @@
         </div>
       </div>
     </div>
-    <div v-if="showIdentitiesEditor" class="ask-user-overlay editor-overlay" @click.self="showIdentitiesEditor = false">
+    <div v-if="showContactsEditor" class="ask-user-overlay editor-overlay" @click.self="showContactsEditor = false">
       <div class="ask-user-modal editor-modal">
-        <h3>Identities Editor</h3>
-        <p class="editor-hint">Identities map buses to memory partitions. identifier = memory key. bus_ids =
+        <h3>Contacts Editor</h3>
+        <p class="editor-hint">Contacts map buses to memory partitions. identifier = memory key. bus_ids =
           comma-separated
           (e.g. telegram-123, email-account).</p>
-        <p v-if="identitiesError" class="editor-error">{{ identitiesError }}</p>
+        <p v-if="contactsError" class="editor-error">{{ contactsError }}</p>
+        <input v-model="contactsSearchQuery" type="text" placeholder="Search by name or notes..."
+          class="editor-input" style="margin-bottom: 0.5rem" />
         <div class="editor-form">
-          <input v-model="identitiesForm.name" type="text" placeholder="Name" class="editor-input" />
-          <input v-model="identitiesForm.identifier" type="text"
+          <input v-model="contactsForm.name" type="text" placeholder="Name" class="editor-input" />
+          <input v-model="contactsForm.identifier" type="text"
             placeholder="Identifier (e.g. self, email@example.com, google-account-calendar_id)" class="editor-input" />
-          <select v-model="identitiesForm.trust_level" class="editor-input">
+          <select v-model="contactsForm.trust_level" class="editor-input">
             <option value="normal">normal</option>
             <option value="root">root</option>
           </select>
-          <input v-model="identitiesForm.bus_ids_str" type="text" placeholder="bus_ids (comma-separated)"
+          <input v-model="contactsForm.bus_ids_str" type="text" placeholder="bus_ids (comma-separated)"
             class="editor-input" />
+          <textarea v-model="contactsForm.notes" placeholder="Notes..." rows="3" class="editor-textarea"></textarea>
           <div class="editor-form-actions">
-            <button class="btn primary" @click="saveIdentity">{{ identitiesEditingId ? "Update" : "Add" }}</button>
-            <button v-if="identitiesEditingId" class="btn secondary" @click="startAddIdentity">Cancel edit</button>
+            <button class="btn primary" @click="saveContact">{{ contactsEditingId ? "Update" : "Add" }}</button>
+            <button v-if="contactsEditingId" class="btn secondary" @click="startAddContact">Cancel edit</button>
           </div>
         </div>
         <div class="editor-list">
-          <div v-for="item in identitiesItems" :key="item.id" class="editor-row">
+          <div v-for="item in contactsDisplayItems" :key="item.id" class="editor-row">
             <div class="editor-row-fields">
               <span class="editor-row-desc">{{ item.name }}</span>
               <span class="editor-row-type">{{ item.identifier }}</span>
@@ -336,28 +341,14 @@
               <span class="editor-row-value">{{ item.bus_ids.join(", ") || "—" }}</span>
             </div>
             <div class="editor-row-actions">
-              <button class="btn secondary small" @click="startEditIdentity(item)">Edit</button>
-              <button class="btn secondary small" @click="openIdentityNote(item)">Note</button>
-              <button class="btn secondary small" @click="deleteIdentity(item)">Delete</button>
+              <button class="btn secondary small" @click="startEditContact(item)">Edit</button>
+              <button class="btn secondary small" @click="deleteContact(item)">Delete</button>
             </div>
           </div>
         </div>
         <div class="editor-modal-actions">
-          <button class="btn secondary" @click="startAddIdentity">Add new</button>
-          <button class="btn secondary" @click="showIdentitiesEditor = false">Close</button>
-        </div>
-      </div>
-    </div>
-    <div v-if="showIdentityNoteEditor" class="ask-user-overlay editor-overlay"
-      @click.self="showIdentityNoteEditor = false">
-      <div class="ask-user-modal editor-modal">
-        <h3>Note: {{ identityNoteTarget?.name ?? identityNoteTarget?.identifier }}</h3>
-        <p v-if="identityNoteError" class="editor-error">{{ identityNoteError }}</p>
-        <textarea v-model="identityNoteContent" placeholder="Markdown note..." rows="12"
-          class="editor-textarea"></textarea>
-        <div class="editor-form-actions">
-          <button class="btn primary" @click="saveIdentityNote">Save</button>
-          <button class="btn secondary" @click="showIdentityNoteEditor = false">Close</button>
+          <button class="btn secondary" @click="startAddContact">Add new</button>
+          <button class="btn secondary" @click="showContactsEditor = false">Close</button>
         </div>
       </div>
     </div>
@@ -679,6 +670,35 @@ async function authorizeGoogleApi() {
   }
 }
 
+function openConnectTelegram() {
+  showConnectTelegramModal.value = true;
+  connectTelegramPhone.value = "";
+  connectTelegramError.value = "";
+}
+
+async function submitConnectTelegram() {
+  const phone = connectTelegramPhone.value.trim();
+  if (!phone) {
+    connectTelegramError.value = "Phone number is required.";
+    return;
+  }
+  connectTelegramError.value = "";
+  connectTelegramConnecting.value = true;
+  try {
+    const r = await window.electronAPI?.telegramConnectStart?.(phone);
+    if (r?.ok) {
+      showConnectTelegramModal.value = false;
+      connectTelegramPhone.value = "";
+    } else {
+      connectTelegramError.value = r?.error ?? "Connection failed.";
+    }
+  } catch (err) {
+    connectTelegramError.value = err instanceof Error ? err.message : "Connection failed.";
+  } finally {
+    connectTelegramConnecting.value = false;
+  }
+}
+
 async function openPasswordsEditor() {
   showPasswordsEditor.value = true;
   passwordsError.value = "";
@@ -742,104 +762,82 @@ async function deletePassword(uuid: string) {
   }
 }
 
-async function openIdentitiesEditor() {
-  showIdentitiesEditor.value = true;
-  identitiesError.value = "";
-  await refreshIdentitiesList();
+async function openContactsEditor() {
+  showContactsEditor.value = true;
+  contactsError.value = "";
+  await refreshContactsList();
 }
 
-async function refreshIdentitiesList() {
+async function refreshContactsList() {
   try {
-    const list = (await window.electronAPI?.identityList?.()) ?? [];
-    identitiesItems.value = list as typeof identitiesItems.value;
+    const list = (await window.electronAPI?.contactsList?.()) ?? [];
+    contactsItems.value = list as typeof contactsItems.value;
   } catch (err) {
-    identitiesItems.value = [];
-    identitiesError.value = err instanceof Error ? err.message : "Failed to load";
+    contactsItems.value = [];
+    contactsError.value = err instanceof Error ? err.message : "Failed to load";
   }
 }
 
-function startAddIdentity() {
-  identitiesEditingId.value = null;
-  identitiesForm.value = { name: "", identifier: "", trust_level: "normal", bus_ids_str: "" };
+function startAddContact() {
+  contactsEditingId.value = null;
+  contactsForm.value = { name: "", identifier: "", trust_level: "normal", bus_ids_str: "", notes: "" };
 }
 
-function startEditIdentity(entry: (typeof identitiesItems.value)[0]) {
-  identitiesEditingId.value = entry.id;
-  identitiesForm.value = {
+function startEditContact(entry: (typeof contactsItems.value)[0]) {
+  contactsEditingId.value = entry.id;
+  contactsForm.value = {
     name: entry.name,
     identifier: entry.identifier,
     trust_level: entry.trust_level,
     bus_ids_str: entry.bus_ids.join(", "),
+    notes: entry.notes ?? "",
   };
 }
 
-async function saveIdentity() {
-  identitiesError.value = "";
-  const busIds = identitiesForm.value.bus_ids_str
+async function saveContact() {
+  contactsError.value = "";
+  const busIds = contactsForm.value.bus_ids_str
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean);
   try {
-    if (identitiesEditingId.value) {
-      await window.electronAPI?.identityUpdate?.(identitiesEditingId.value, {
-        name: identitiesForm.value.name,
-        identifier: identitiesForm.value.identifier,
-        trust_level: identitiesForm.value.trust_level,
+    if (contactsEditingId.value) {
+      await window.electronAPI?.contactsUpdate?.(contactsEditingId.value, {
+        name: contactsForm.value.name,
+        identifier: contactsForm.value.identifier,
+        trust_level: contactsForm.value.trust_level,
         bus_ids: busIds,
+        notes: contactsForm.value.notes,
       });
     } else {
-      await window.electronAPI?.identityCreate?.({
-        name: identitiesForm.value.name,
-        identifier: identitiesForm.value.identifier,
-        trust_level: identitiesForm.value.trust_level,
+      await window.electronAPI?.contactsCreate?.({
+        name: contactsForm.value.name,
+        identifier: contactsForm.value.identifier,
+        trust_level: contactsForm.value.trust_level,
         bus_ids: busIds,
+        notes: contactsForm.value.notes,
       });
     }
-    await refreshIdentitiesList();
-    identitiesEditingId.value = null;
-    identitiesForm.value = { name: "", identifier: "", trust_level: "normal", bus_ids_str: "" };
+    await refreshContactsList();
+    contactsEditingId.value = null;
+    contactsForm.value = { name: "", identifier: "", trust_level: "normal", bus_ids_str: "", notes: "" };
   } catch (err) {
-    identitiesError.value = err instanceof Error ? err.message : "Failed to save";
+    contactsError.value = err instanceof Error ? err.message : "Failed to save";
   }
 }
 
-async function deleteIdentity(entry: (typeof identitiesItems.value)[0]) {
-  if (!confirm(`Delete identity "${entry.name}"?`)) return;
-  identitiesError.value = "";
+async function deleteContact(entry: (typeof contactsItems.value)[0]) {
+  if (!confirm(`Delete contact "${entry.name}"?`)) return;
+  contactsError.value = "";
   try {
-    await window.electronAPI?.identityDelete?.(entry.id);
-    await refreshIdentitiesList();
-    if (identitiesEditingId.value === entry.id) {
-      identitiesEditingId.value = null;
-      identitiesForm.value = { name: "", identifier: "", trust_level: "normal", bus_ids_str: "" };
+    await window.electronAPI?.contactsDelete?.(entry.id);
+    await refreshContactsList();
+    if (contactsEditingId.value === entry.id) {
+      contactsEditingId.value = null;
+      contactsForm.value = { name: "", identifier: "", trust_level: "normal", bus_ids_str: "", notes: "" };
     }
   } catch (err) {
-    identitiesError.value = err instanceof Error ? err.message : "Failed to delete";
-  }
-}
-
-async function openIdentityNote(entry: (typeof identitiesItems.value)[0]) {
-  identityNoteTarget.value = entry;
-  identityNoteError.value = "";
-  try {
-    const ident = await window.electronAPI?.identityGet?.(entry.identifier);
-    identityNoteContent.value = (ident && "note" in ident ? ident.note : "") ?? "";
-  } catch (err) {
-    identityNoteContent.value = "";
-    identityNoteError.value = err instanceof Error ? err.message : "Failed to load";
-  }
-  showIdentityNoteEditor.value = true;
-}
-
-async function saveIdentityNote() {
-  if (!identityNoteTarget.value) return;
-  identityNoteError.value = "";
-  try {
-    await window.electronAPI?.identitySetNote?.(identityNoteTarget.value.identifier, identityNoteContent.value);
-    showIdentityNoteEditor.value = false;
-    identityNoteTarget.value = null;
-  } catch (err) {
-    identityNoteError.value = err instanceof Error ? err.message : "Failed to save";
+    contactsError.value = err instanceof Error ? err.message : "Failed to delete";
   }
 }
 
@@ -998,13 +996,9 @@ const config = ref({
   openrouterApiKey: "",
   openrouterModel: "google/gemini-2.5-flash",
   codexModel: "gpt-5.4-codex",
-  userName: "",
-  rootUserIdentifier: "",
-  rootUserIdentifierDefined: true,
   enableMdParsing: false,
   setupMode: false,
 });
-const rootIdentifierWarningDismissed = ref(false);
 const skipInitialTask = ref(false);
 
 type VmInfo = { id: string; name: string; path: string; status: string; ramMb: number; diskGb: number };
@@ -1208,6 +1202,10 @@ const askUserCountdown = ref(60);
 
 // Passwords Editor
 const showPasswordsEditor = ref(false);
+const showConnectTelegramModal = ref(false);
+const connectTelegramPhone = ref("");
+const connectTelegramError = ref("");
+const connectTelegramConnecting = ref(false);
 const passwordsItems = ref<
   Array<{ uuid: string; description: string; type: "string" | "totp"; value: string }>
 >([]);
@@ -1219,23 +1217,30 @@ const passwordsForm = ref({
   value: "",
 });
 
-// Identities Editor
-const showIdentitiesEditor = ref(false);
-const showIdentityNoteEditor = ref(false);
-const identitiesItems = ref<
-  Array<{ id: string; name: string; identifier: string; trust_level: "root" | "normal"; bus_ids: string[] }>
+// Contacts Editor
+const showContactsEditor = ref(false);
+const contactsItems = ref<
+  Array<{ id: string; name: string; identifier: string; trust_level: "root" | "normal"; bus_ids: string[]; notes: string }>
 >([]);
-const identitiesError = ref("");
-const identitiesEditingId = ref<string | null>(null);
-const identitiesForm = ref({
+const contactsSearchQuery = ref("");
+const contactsDisplayItems = computed(() => {
+  const q = contactsSearchQuery.value.trim();
+  if (!q) return contactsItems.value;
+  return contactsItems.value.filter(
+    (c) =>
+      c.name.toLowerCase().includes(q.toLowerCase()) ||
+      (c.notes && c.notes.toLowerCase().includes(q.toLowerCase()))
+  );
+});
+const contactsError = ref("");
+const contactsEditingId = ref<string | null>(null);
+const contactsForm = ref({
   name: "",
   identifier: "",
   trust_level: "normal" as "root" | "normal",
   bus_ids_str: "",
+  notes: "",
 });
-const identityNoteTarget = ref<{ id: string; name: string; identifier: string } | null>(null);
-const identityNoteContent = ref("");
-const identityNoteError = ref("");
 
 // Schedule Editor
 const ZERO_TASK_ID = "zero";
@@ -1271,6 +1276,7 @@ let scheduleTriggerUnsub: (() => void) | undefined;
 let agentDrainUnsub: (() => void) | undefined;
 let telegramMessageUnsub: (() => void) | undefined;
 let emailMessageUnsub: (() => void) | undefined;
+let calendarEventUnsub: (() => void) | undefined;
 let telegramLoginUnsub: (() => void) | undefined;
 
 /** Queued messages when agent is busy; drained and sent together when agent finishes. */
@@ -1371,8 +1377,8 @@ function rootHistoryToMessages(hist: RootHistoryMessage[]): ChatMessage[] {
     const timestamp = m.timestamp;
     if (role === "user" && busId && busId !== "root") {
       let emoji = "📱";
-      if (busId.startsWith("email-")) emoji = "📧";
-      else if (busId.startsWith("google-")) emoji = "📅";
+      if (busId.startsWith("email-") || busId.startsWith("gmail-")) emoji = "📧";
+      else if (busId.startsWith("google-calendar-")) emoji = "📅";
       content = `${emoji} **${busId}** (${userName}): ${content}`;
       return { role, content, timestamp, type: undefined, isTelegram: true };
     }
@@ -1473,6 +1479,13 @@ async function exitChat() {
   messageQueue.value = [];
   await window.electronAPI?.stopChat?.();
   agentReady.value = false;
+}
+
+async function wipeAllHistory() {
+  if (!confirm("Wipe ALL message history from every bus? This cannot be undone.")) return;
+  await window.electronAPI?.messageBusWipeAll?.();
+  messages.value = [];
+  await refreshMessagesFromRoot();
 }
 
 function stopAgent() {
@@ -1698,6 +1711,13 @@ onMounted(async () => {
     messages.value.push({ role: "user", content: incomingLabel, timestamp: ts, isTelegram: true });
     scrollToBottomAlways();
   });
+  calendarEventUnsub = window.electronAPI?.onCalendarEvent?.((payload) => {
+    const preview = payload.content.length > 300 ? payload.content.slice(0, 300) + "…" : payload.content;
+    const incomingLabel = `📅 **Calendar**: ${preview}`;
+    const ts = payload.timestamp ?? new Date().toISOString();
+    messages.value.push({ role: "user", content: incomingLabel, timestamp: ts, isTelegram: true });
+    scrollToBottomAlways();
+  });
 
   askUserUnsub = window.electronAPI?.onAskUserPopup?.((info) => {
     playNotificationSound();
@@ -1769,6 +1789,7 @@ onUnmounted(() => {
   agentDrainUnsub?.();
   telegramMessageUnsub?.();
   emailMessageUnsub?.();
+  calendarEventUnsub?.();
   telegramLoginUnsub?.();
   stopAskUserCountdown();
   stopTaskTimer();
@@ -1947,39 +1968,6 @@ onUnmounted(() => {
   flex-direction: column;
   min-width: 0;
   min-height: 0;
-}
-
-.root-identifier-warning {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 0.75rem;
-  padding: 0.5rem 1rem;
-  margin-bottom: 0.5rem;
-  background: #2a2518;
-  border: 1px solid #3d3520;
-  border-radius: 6px;
-  font-size: 0.9rem;
-  color: #e6edf3;
-}
-
-.root-identifier-warning-close {
-  flex-shrink: 0;
-  width: 1.5rem;
-  height: 1.5rem;
-  padding: 0;
-  border: none;
-  background: transparent;
-  color: #8b949e;
-  font-size: 1.25rem;
-  line-height: 1;
-  cursor: pointer;
-  border-radius: 4px;
-}
-
-.root-identifier-warning-close:hover {
-  background: #3d3520;
-  color: #e6edf3;
 }
 
 .chat-messages {
