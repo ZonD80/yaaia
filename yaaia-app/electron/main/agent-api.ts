@@ -66,11 +66,29 @@ export function createAgentApi(deps: AgentApiDeps): Record<string, unknown> {
     /** List all message buses. */
     bus: {
       list: () => call("bus.list", {}),
-      get_history: (args: { bus_id: string; limit?: number; offset?: number }) =>
+      /**
+       * Fetch message history. bus_id `root` merges all buses by time.
+       * Params: limit (default 50, max 200), offset. Optional from_timestamp, to_timestamp (ISO-8601 received_at bounds), from_id (SQLite messages.id, inclusive lower bound).
+       */
+      get_history: (args: {
+        bus_id: string;
+        limit?: number;
+        offset?: number;
+        from_timestamp?: string;
+        to_timestamp?: string;
+        from_id?: number;
+      }) =>
         call("bus.get_history", {
           bus_id: args.bus_id,
           limit: args.limit ?? 50,
           offset: args.offset ?? 0,
+          ...(args.from_timestamp != null && String(args.from_timestamp).trim() !== ""
+            ? { from_timestamp: String(args.from_timestamp).trim() }
+            : {}),
+          ...(args.to_timestamp != null && String(args.to_timestamp).trim() !== ""
+            ? { to_timestamp: String(args.to_timestamp).trim() }
+            : {}),
+          ...(args.from_id != null && Number.isFinite(Number(args.from_id)) ? { from_id: Number(args.from_id) } : {}),
         }),
       set_properties: (args: {
         mb_id: string;

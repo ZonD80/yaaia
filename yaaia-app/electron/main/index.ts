@@ -27,6 +27,7 @@ import {
   startAgent,
   stopAgent,
   sendMessage,
+  clearAgentSessionApiMessages,
   requestAgentAbort,
   setPendingInjectMessage,
   setRouteCallbacksForEval,
@@ -63,7 +64,7 @@ import {
   getBusHistory,
   getBusHistorySlice,
   getRootHistorySliceWithTotal,
-  getRootLogForModelWithMessageLimit,
+  getRootLogForModel,
   isBusBanned,
   listBuses,
   setBusProperties,
@@ -390,6 +391,7 @@ ipcMain.handle("start-chat", async (_event, config: McpConfig) => {
       });
     }
 
+    clearAgentSessionApiMessages();
     recipeStore.clearPendingFinalize();
     mainWindow?.webContents?.send("startup-progress-reset");
     mainWindow?.webContents?.send("startup-progress", "Starting YaaiaVM...");
@@ -732,6 +734,7 @@ ipcMain.handle("stop-chat", async () => {
   recipeStore.clearCodeBoundary();
   clearEvalContext();
   clearAgentInjectedQueue();
+  clearAgentSessionApiMessages();
   busesDeliveredSinceRootWipe.clear();
   return safeForIPC({ ok: true });
 });
@@ -775,6 +778,9 @@ async function handleAgentSendMessage(
       return "";
     }
   }
+
+  /** Prior DB state only — excludes the message(s) about to be appended; synthetic HISTORY block is not persisted. */
+  const { messages: priorRootForModel, trimmedCount } = getRootLogForModel(50_000);
 
   if (typeof message === "string" && message.includes("\n")) {
     targetBusId = ROOT_BUS_ID;
@@ -976,11 +982,16 @@ async function handleAgentSendMessage(
     }
     userMsg = storedContent;
   }
-  const { messages: busHistory, trimmedCount } = getRootLogForModelWithMessageLimit(30);
-  const history: { role: "user" | "assistant"; content: string }[] = busHistory.map((m) => {
+  const history = priorRootForModel.map((m) => {
     const busId = m.bus_id ?? ROOT_BUS_ID;
     const prefixContent = m.content.startsWith(`${busId}:`) ? m.content : `${busId}:${m.content}`;
-    return { role: m.role as "user" | "assistant", content: prefixContent };
+    return {
+      role: m.role as "user" | "assistant",
+      content: prefixContent,
+      db_id: m.db_id,
+      timestamp: m.timestamp,
+      bus_id: busId,
+    };
   });
   recipeStore.setInitialPrompt(message);
   if (targetBusId !== ROOT_BUS_ID) {

@@ -191,14 +191,33 @@ export function createDirectCallTool(): AgentApiCallTool {
         case "bus.get_history":
         case "get_bus_history": {
           const busId = String(a.bus_id ?? "root").trim() || ROOT_BUS_ID;
-          const msg = validateUnknownParams(args, new Set(["bus_id", "limit", "offset"]));
+          const msg = validateUnknownParams(args, new Set(["bus_id", "limit", "offset", "from_timestamp", "to_timestamp", "from_id"]));
           if (msg) {
             recipeStore.appendToolCall(name, args, msg);
             return finish(msg);
           }
           const limit = Math.min(Math.max(0, Number(a.limit) || 50), 200);
           const offset = Number(a.offset) || 0;
-          const sliced = getBusHistorySlice(busId, limit, offset);
+          const fromTs =
+            a.from_timestamp != null && String(a.from_timestamp).trim() !== ""
+              ? String(a.from_timestamp).trim()
+              : undefined;
+          const toTs =
+            a.to_timestamp != null && String(a.to_timestamp).trim() !== "" ? String(a.to_timestamp).trim() : undefined;
+          let fromId: number | undefined;
+          if (a.from_id != null && String(a.from_id).trim() !== "") {
+            const n = Number(a.from_id);
+            if (!Number.isFinite(n) || !Number.isInteger(n) || n < 1) {
+              recipeStore.appendToolCall(name, args, "Invalid from_id");
+              return finish("Error: from_id must be a positive integer (messages.id).");
+            }
+            fromId = n;
+          }
+          const filter =
+            fromTs !== undefined || toTs !== undefined || fromId !== undefined
+              ? { from_timestamp: fromTs, to_timestamp: toTs, from_id: fromId }
+              : undefined;
+          const sliced = getBusHistorySlice(busId, limit, offset, filter);
           const resultText = JSON.stringify(sliced);
           recipeStore.appendToolCall(name, args, `Returned ${sliced.length} messages`);
           return resultText;

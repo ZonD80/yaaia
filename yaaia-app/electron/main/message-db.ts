@@ -78,6 +78,8 @@ function migrateSchema(): void {
 export type HistoryMessage = {
   role: "user" | "assistant";
   content: string;
+  /** SQLite messages.id — for model-facing history formatting only */
+  db_id?: number;
   user_id?: number;
   user_name?: string;
   bus_id?: string;
@@ -92,6 +94,7 @@ export type HistoryMessage = {
 export type BusMessage = {
   role: "user" | "assistant";
   content: string;
+  db_id?: number;
   user_id?: number;
   user_name?: string;
   bus_id?: string;
@@ -404,12 +407,13 @@ export function getMessagesInWindow(
 ): HistoryMessage[] {
   const roleClause = roleFilter === "user" ? " AND role = 'user'" : roleFilter === "assistant" ? " AND role = 'assistant'" : "";
   const stmt = getDb().prepare(`
-    SELECT from_identifier, bus_id, text, received_at, role, mail_uid, event_uid, during_eval, streaming_start, streaming_end
+    SELECT id, from_identifier, bus_id, text, received_at, role, mail_uid, event_uid, during_eval, streaming_start, streaming_end
     FROM messages
     WHERE received_at >= ? AND received_at <= ? AND during_eval = ?${roleClause}
     ORDER BY received_at ASC
   `);
   const rows = stmt.all(fromTime, toTime, duringEval ? 1 : 0) as Array<{
+    id: number;
     from_identifier: string;
     bus_id: string;
     text: string;
@@ -425,6 +429,7 @@ export function getMessagesInWindow(
 }
 
 function rowToHistoryMessage(row: {
+  id?: number;
   from_identifier: string;
   bus_id: string;
   text: string;
@@ -442,6 +447,7 @@ function rowToHistoryMessage(row: {
   return {
     role,
     content: row.text,
+    ...(row.id != null ? { db_id: row.id } : {}),
     user_id,
     user_name,
     bus_id: row.bus_id,
@@ -455,6 +461,7 @@ function rowToHistoryMessage(row: {
 }
 
 function rowToBusMessage(row: {
+  id?: number;
   from_identifier: string;
   bus_id: string;
   text: string;
@@ -469,6 +476,7 @@ function rowToBusMessage(row: {
   return {
     role,
     content: row.text,
+    ...(row.id != null ? { db_id: row.id } : {}),
     user_id,
     user_name,
     bus_id: row.bus_id,
@@ -482,6 +490,7 @@ export function toBusMessage(m: HistoryMessage): BusMessage {
   return {
     role: m.role,
     content: m.content,
+    db_id: m.db_id,
     user_id: m.user_id,
     user_name: m.user_name,
     bus_id: m.bus_id,
@@ -493,18 +502,43 @@ export function toBusMessage(m: HistoryMessage): BusMessage {
 
 export function getBusHistory(busId: string): HistoryMessage[] {
   const stmt = getDb().prepare(
-    "SELECT from_identifier, bus_id, text, received_at, role, mail_uid, event_uid FROM messages WHERE bus_id = ? ORDER BY received_at ASC"
+    "SELECT id, from_identifier, bus_id, text, received_at, role, mail_uid, event_uid FROM messages WHERE bus_id = ? ORDER BY received_at ASC"
   );
   const rows = stmt.all(busId) as Parameters<typeof rowToHistoryMessage>[0][];
   return rows.map(rowToHistoryMessage);
 }
 
+/** Optional filters applied before offset/limit window (same semantics as unfiltered slice). */
+export type BusHistorySliceFilter = {
+  /** ISO-8601 — include messages with received_at >= this */
+  from_timestamp?: string;
+  /** ISO-8601 — include messages with received_at <= this */
+  to_timestamp?: string;
+  /** SQLite messages.id — include messages with id >= this (inclusive) */
+  from_id?: number;
+};
+
+function applyBusHistorySliceFilter(full: HistoryMessage[], filter?: BusHistorySliceFilter): HistoryMessage[] {
+  if (!filter) return full;
+  const fromTs = filter.from_timestamp?.trim();
+  const toTs = filter.to_timestamp?.trim();
+  const fromId = filter.from_id;
+  return full.filter((m) => {
+    if (fromTs && m.timestamp < fromTs) return false;
+    if (toTs && m.timestamp > toTs) return false;
+    if (fromId != null && (m.db_id == null || m.db_id < fromId)) return false;
+    return true;
+  });
+}
+
 export function getBusHistorySlice(
   busId: string,
   limit: number = 50,
-  offset: number = 0
+  offset: number = 0,
+  filter?: BusHistorySliceFilter
 ): HistoryMessage[] {
-  const full = busId === ROOT_BUS_ID ? getRootLogFull() : getBusHistory(busId);
+  const raw = busId === ROOT_BUS_ID ? getRootLogFull() : getBusHistory(busId);
+  const full = applyBusHistorySliceFilter(raw, filter);
   if (offset === 0) return full.slice(-limit);
   if (offset > 0) return full.slice(offset, offset + limit);
   const from = Math.max(0, full.length + offset);
@@ -521,8 +555,9 @@ export function getActiveBuses(): string[] {
 
 export type RootLogResult = { messages: HistoryMessage[]; trimmedCount: number };
 
-function estimateMessageSize(m: HistoryMessage): number {
-  return (m.content?.length ?? 0) + 200;
+/** Character count for root-log cap (synthetic HISTORY / prior DB window). */
+function historyContentChars(m: HistoryMessage): number {
+  return m.content?.length ?? 0;
 }
 
 export function getRootLogFull(): HistoryMessage[] {
@@ -540,30 +575,23 @@ export function getRootLog(maxChars: number = 50_000): RootLogResult {
   let total = 0;
   const result: HistoryMessage[] = [];
   for (const m of all) {
-    total += estimateMessageSize(m);
+    total += historyContentChars(m);
     result.push(m);
   }
   // Cap by trimming from oldest (front), keep newest
   while (total > maxChars && result.length > 1) {
     const removed = result.shift()!;
-    total -= estimateMessageSize(removed);
+    total -= historyContentChars(removed);
   }
   const trimmedCount = all.length - result.length;
   return { messages: result, trimmedCount };
 }
 
 const DEFAULT_ROOT_LOG_CHARS = 50_000;
-const LLM_HISTORY_MESSAGE_LIMIT = 30;
 
 export function getRootLogForModel(maxChars: number = DEFAULT_ROOT_LOG_CHARS): RootLogForModel {
   const { messages, trimmedCount } = getRootLog(maxChars);
   return { messages: messages.map(toBusMessage), trimmedCount };
-}
-
-export function getRootLogForModelWithMessageLimit(limit: number = LLM_HISTORY_MESSAGE_LIMIT): RootLogForModel {
-  const full = getRootLogFull().map(toBusMessage);
-  const messages = full.slice(-limit);
-  return { messages, trimmedCount: Math.max(0, full.length - limit) };
 }
 
 export function getBusHistorySliceAsBusMessages(

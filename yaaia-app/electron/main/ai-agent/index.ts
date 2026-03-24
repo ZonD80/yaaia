@@ -461,7 +461,23 @@ export function stopAgent(): void {
 }
 
 export type StreamChunkCallback = (chunk: string) => void;
-export type HistoryMessage = { role: "user" | "assistant"; content: string };
+export type HistoryMessage = {
+  role: "user" | "assistant";
+  content: string;
+  /** messages.id — model history block only, not a separate stored turn */
+  db_id?: number;
+  timestamp?: string;
+  bus_id?: string;
+};
+
+/** In-memory API transcript for the current chat session (cleared on start/stop chat). First request uses synthetic HISTORY; later requests reuse this as normal user/assistant turns. */
+export type SessionApiMessage = { role: "user" | "assistant"; content: string };
+
+let agentSessionApiMessages: SessionApiMessage[] = [];
+
+export function clearAgentSessionApiMessages(): void {
+  agentSessionApiMessages = [];
+}
 
 const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
 
@@ -470,6 +486,70 @@ type OpenAIMessage =
   | { role: "assistant"; content: null; tool_calls: { id: string; type: "function"; function: { name: string; arguments: string } }[] }
   | { role: "tool"; content: string; tool_call_id: string };
 
+/** Prior DB snapshot for first-turn synthetic HISTORY only (must match getRootLog default). */
+const MODEL_HISTORY_MAX_CHARS = 50_000;
+/** Rolling cap on in-memory session transcript (user/assistant turns after first request). */
+const SESSION_ROLLING_MAX_CHARS = 200_000;
+
+/** Keep newest messages; drop/truncate oldest so total content length ≤ maxChars. First remaining turn must be user when possible. */
+function trimSessionToRollingCharLimit(messages: SessionApiMessage[], maxChars: number): SessionApiMessage[] {
+  if (messages.length === 0 || maxChars <= 0) return [];
+  const out: SessionApiMessage[] = [];
+  let total = 0;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    const len = m.content.length;
+    if (len === 0) {
+      out.unshift({ role: m.role, content: m.content });
+      continue;
+    }
+    if (total + len <= maxChars) {
+      out.unshift({ role: m.role, content: m.content });
+      total += len;
+    } else {
+      const remaining = maxChars - total;
+      if (remaining > 0) {
+        out.unshift({ role: m.role, content: m.content.slice(-remaining) });
+      }
+      break;
+    }
+  }
+  while (out.length > 0 && out[0].role === "assistant") {
+    out.shift();
+  }
+  return out;
+}
+
+function formatHistoryLineForModel(h: HistoryMessage): string {
+  const idPart = h.db_id != null ? String(h.db_id) : "?";
+  const datePart = h.timestamp ?? "";
+  const text = h.content.replace(/\r\n/g, "\n").replace(/\n+/g, " ").trim();
+  return `${idPart} - ${datePart} - ${text}`;
+}
+
+function buildSyntheticHistoryUserContent(
+  userMessage: string,
+  history: HistoryMessage[],
+  trimmedCount?: number
+): string {
+  const trimmedNote =
+    trimmedCount !== undefined && trimmedCount > 0
+      ? `Note: ${trimmedCount} earlier message(s) were omitted from this window (about ${MODEL_HISTORY_MAX_CHARS} characters). Use bus.get_history(bus_id="root", limit=50, offset=…) or optional from_timestamp, to_timestamp, from_id (SQLite messages.id) to fetch older messages if needed.\n\n`
+      : "";
+  if (history.length === 0) {
+    return trimmedNote ? `${trimmedNote}${userMessage}` : userMessage;
+  }
+  const lines = history.map(formatHistoryLineForModel);
+  const block = [
+    "=== HISTORY (db_id - date - message) ===",
+    ...lines,
+    "=== HISTORY END ===",
+    "",
+    userMessage,
+  ].join("\n");
+  return trimmedNote ? `${trimmedNote}${block}` : block;
+}
+
 function buildUserMessagesWithTag(
   userMessage: string,
   history: HistoryMessage[],
@@ -477,20 +557,8 @@ function buildUserMessagesWithTag(
   trimmedCount?: number
 ): OpenAIMessage[] {
   const messages: OpenAIMessage[] = [];
-  if (history.length > 0 || (trimmedCount !== undefined && trimmedCount > 0)) {
-    const trimmedNote =
-      trimmedCount !== undefined && trimmedCount > 0
-        ? `Note: ${trimmedCount} earlier message(s) trimmed. Use bus.get_history(bus_id="root", offset=1, limit=50) to fetch older messages if needed.\n\n`
-        : "";
-    const historyBlock =
-      history.length > 0
-        ? history
-          .map((h) => `${h.role === "user" ? "User" : "Assistant"}: ${h.content}`)
-          .join("\n")
-        : "";
-    messages.push({ role: "user" as const, content: `${trimmedNote}Conversation history:\n${historyBlock}` });
-  }
-  messages.push({ role: "user" as const, content: userMessage });
+  const combined = buildSyntheticHistoryUserContent(userMessage, history, trimmedCount);
+  messages.push({ role: "user" as const, content: combined });
   return messages;
 }
 
@@ -516,7 +584,8 @@ async function runCodeBasedSendMessage(
   targetBusId?: string,
   trimmedCount?: number,
   useOpenRouter = false,
-  useCodex = false
+  useCodex = false,
+  sessionPrefix?: SessionApiMessage[]
 ): Promise<{ text: string }> {
   const provider = useCodex ? "Codex" : useOpenRouter ? "OpenRouter" : "Claude";
   logVerbose("runCodeBasedSendMessage starting, provider:", provider, "user message length:", userMessage.length);
@@ -530,12 +599,10 @@ async function runCodeBasedSendMessage(
   const emitChunk = rawEmitChunk;
 
   type Message = { role: "user" | "assistant"; content: string };
-  const messages: Message[] = buildUserMessagesWithTag(
-    userMessage,
-    history,
-    targetBusId,
-    trimmedCount
-  ) as Message[];
+  const messages: Message[] =
+    sessionPrefix && sessionPrefix.length > 0
+      ? [...sessionPrefix.map((m) => ({ ...m })), { role: "user", content: userMessage }]
+      : (buildUserMessagesWithTag(userMessage, history, targetBusId, trimmedCount) as Message[]);
 
   if (!routeCallbacksForEval) {
     throw new Error("Route callbacks for eval not set. Ensure start-chat has run.");
@@ -546,6 +613,7 @@ async function runCodeBasedSendMessage(
     emitChunk,
   };
 
+  try {
   let loopIter = 0;
   while (true) {
     loopIter++;
@@ -676,6 +744,7 @@ async function runCodeBasedSendMessage(
       const toTime = streamedMsgs[streamedMsgs.length - 1]?.streamingEnd ?? new Date().toISOString();
       const external = getMessagesInWindow(fromTime, toTime, false, "user");
       if (external.length === 0) {
+        messages.push({ role: "assistant", content: fullText });
         return { text: fullText || "" };
       }
       messages.push({ role: "assistant", content: fullText });
@@ -775,6 +844,10 @@ async function runCodeBasedSendMessage(
 
     if (!fullText.trim()) return { text: fullText };
   }
+  } finally {
+    const snapshot = messages.map((m) => ({ role: m.role, content: m.content }));
+    agentSessionApiMessages = trimSessionToRollingCharLimit(snapshot, SESSION_ROLLING_MAX_CHARS);
+  }
 }
 
 export async function sendMessage(
@@ -791,13 +864,15 @@ export async function sendMessage(
 
   agentAbortRequested = false;
 
+  const useSessionContinuation = agentSessionApiMessages.length > 0;
   return runCodeBasedSendMessage(
     userMessage,
     onChunk,
-    history,
+    useSessionContinuation ? [] : history,
     targetBusId,
-    trimmedCount,
+    useSessionContinuation ? 0 : trimmedCount,
     agentConfig.aiProvider === "openrouter",
-    agentConfig.aiProvider === "codex"
+    agentConfig.aiProvider === "codex",
+    useSessionContinuation ? agentSessionApiMessages : undefined
   );
 }

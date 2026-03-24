@@ -128,7 +128,7 @@ export function generateApiDocs(options?: { setupMode?: boolean; codeBoundary?: 
     "type Contact = { id: string; name: string; identifier: string; trust_level: 'normal'|'root'; bus_ids: string[]; notes: string };",
     "",
     "// bus.get_history",
-    "type HistoryMessage = { role: 'user'|'assistant'; content: string; user_id?: number; user_name?: string; bus_id?: string; timestamp: string; mail_uid?: number; event_uid?: string };",
+    "type HistoryMessage = { role: 'user'|'assistant'; content: string; db_id?: number; user_id?: number; user_name?: string; bus_id?: string; timestamp: string; mail_uid?: number; event_uid?: string };",
     "",
     "// passwords.list — only for passwords and TOTPs; usernames, hosts, ports go in KB md files",
     "type PasswordListEntry = { uuid: string; description: string; type: 'string' | 'totp' };",
