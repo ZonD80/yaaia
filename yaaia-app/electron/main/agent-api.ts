@@ -14,8 +14,41 @@ import {
   disconnectVmSerial,
   sendFileToVmSerial,
 } from "./vm-serial.js";
+import { generateModuleHelp, type AgentHelpModule } from "./agent-api-docs.js";
+import type { MemoryEvalContext } from "./memory-store.js";
+
+/** JSDoc param shapes for memory.* tools (agent-api.ts source of truth for spec generator). */
+type MemoryProvenanceArg = {
+  source_bus_id?: string;
+  source_db_id?: number;
+  source_external_message_id?: string;
+  source_contact_id?: string;
+  provenance_note?: string;
+  references_memory_ids?: number[];
+};
+
+type MemoryListArg = {
+  kind?: string;
+  tags?: string[];
+  body_substring?: string;
+  source_bus_id?: string;
+  source_contact_id?: string;
+  source_db_id?: number;
+  from_timestamp?: string;
+  to_timestamp?: string;
+  limit?: number;
+  offset?: number;
+};
 
 export type AgentApiCallTool = (name: string, args: Record<string, unknown>) => Promise<string>;
+
+function defineModuleHelp(obj: object, module: AgentHelpModule, opts: { setupMode: boolean; codeBoundary: string | null }): void {
+  Object.defineProperty(obj, "help", {
+    value: () => generateModuleHelp(module, opts),
+    enumerable: false,
+    configurable: true,
+  });
+}
 
 export type AgentApiRouteCallbacks = AgentApiRouteCallbacksBase & {
   emitChunk?: (chunk: string) => void;
@@ -42,6 +75,10 @@ export interface AgentApiDeps {
   vmEvalStderr?: Record<string, string>;
   /** Setup mode: expose vm_serial. When false, vm_serial is not available. */
   setupMode?: boolean;
+  /** Bbtag boundary for `.help()` text; defaults from recipe in eval. */
+  codeBoundary?: string | null;
+  /** Per-eval memory buffers + ids for memory.* provenance (source_db_id 0 resolution). */
+  memoryEval?: MemoryEvalContext;
 }
 
 /**
@@ -59,7 +96,12 @@ export function createAgentApi(deps: AgentApiDeps): Record<string, unknown> {
 
   const appConfig = deps.appConfig ?? null;
 
-  return {
+  const helpOpts = {
+    setupMode: deps.setupMode ?? false,
+    codeBoundary: deps.codeBoundary ?? null,
+  };
+
+  const api: Record<string, unknown> = {
     // App config (Telegram apiId/apiHash, CalDAV Google client id/secret)
     app_config: appConfig,
 
@@ -97,13 +139,28 @@ export function createAgentApi(deps: AgentApiDeps): Record<string, unknown> {
         is_banned?: boolean;
       }) => call("bus.set_properties", args),
       delete: (args: { mb_id: string }) => call("bus.delete", args),
+      /** Outgoing Telegram voice call to the user for this `telegram-<id>` bus. */
+      call: (args: { bus_id: string; timeout_ms?: number }) =>
+        call("bus.call", {
+          bus_id: args.bus_id,
+          ...(args.timeout_ms != null && Number.isFinite(Number(args.timeout_ms)) ? { timeout_ms: Number(args.timeout_ms) } : {}),
+        }),
+      /** Accept incoming ring for this caller bus (matches incoming-call notification). */
+      pickup: (args: { bus_id: string }) => call("bus.pickup", { bus_id: args.bus_id }),
+      /** End the active VoIP call. Optional bus_id must match the active call if provided. */
+      hangup: (args: { bus_id?: string }) =>
+        call("bus.hangup", {
+          ...(args.bus_id != null && String(args.bus_id).trim() !== "" ? { bus_id: String(args.bus_id).trim() } : {}),
+        }),
+      /** Decline a ringing call, or end active call if it matches this bus. */
+      reject: (args: { bus_id: string }) => call("bus.reject", { bus_id: args.bus_id }),
     },
 
     // Contacts (name, identifier, trust_level, bus_ids, notes)
     contacts: {
       list: () => call("contacts.list", {}),
       search: (args: { query: string }) => call("contacts.search", args),
-      get: (args: { id_or_identifier: string }) => call("contacts.get", args),
+      get: (args: { id_or_identifier?: string; identifier?: string }) => call("contacts.get", args),
       create: (args: {
         name: string;
         identifier: string;
@@ -112,14 +169,14 @@ export function createAgentApi(deps: AgentApiDeps): Record<string, unknown> {
         notes?: string;
       }) => call("contacts.create", args),
       update: (args: {
-        id_or_identifier: string;
+        id_or_identifier?: string;
         name?: string;
         identifier?: string;
         trust_level?: "normal" | "root";
         bus_ids?: string[];
         notes?: string;
       }) => call("contacts.update", args),
-      delete: (args: { id_or_identifier: string }) => call("contacts.delete", args),
+      delete: (args: { id_or_identifier?: string; identifier?: string }) => call("contacts.delete", args),
       is_trusted: (args: { bus_id: string; sender_email?: string }) => call("contacts.is_trusted", args),
     },
 
@@ -127,6 +184,43 @@ export function createAgentApi(deps: AgentApiDeps): Record<string, unknown> {
     soul: {
       get: () => call("soul.get", {}),
       set: (args: { content: string }) => call("soul.set", args),
+    },
+
+    memory: {
+      /**
+       * Insert or upsert (by key) a global memory row. Provenance is set on create; key upserts update body/kind/tags only.
+       * Params: provenance.source_db_id — SQLite messages.id; use 0 for this assistant message once id is known.
+       */
+      put: (args: {
+        kind?: string;
+        body: string;
+        tags?: string[];
+        key?: string;
+        provenance?: MemoryProvenanceArg;
+      }) =>
+        call("memory.put", {
+          kind: args.kind,
+          body: args.body,
+          tags: args.tags,
+          key: args.key,
+          provenance: args.provenance ?? {},
+        }),
+      /** Get one memory by id (negative ids are eval-pending rows). */
+      get: (args: { id: number }) => call("memory.get", args),
+      /**
+       * List with optional filters.
+       * Params: kind?, tags?, body_substring?, source_bus_id?, source_contact_id?, source_db_id? (0 = pending assistant rows in eval), from_timestamp?, to_timestamp?, limit?, offset?
+       */
+      list: (args?: MemoryListArg) => call("memory.list", args ?? {}),
+      /** Delete by id. */
+      delete: (args: { id: number }) => call("memory.delete", args),
+      /**
+       * Search body by FTS5 (default) or LIKE. v1 only — phase 2 may add vectors.
+       * Params: query (required), mode?: fts|like, limit?
+       */
+      find: (args: { query: string; mode?: "fts" | "like"; limit?: number }) => call("memory.find", args),
+      /** Persist markdown shown at top of memory.help(). */
+      set_help: (args: { text: string }) => call("memory.set_help", args),
     },
 
     // Passwords (passwords and TOTPs only; usernames, hosts, ports in KB md files)
@@ -342,4 +436,18 @@ export function createAgentApi(deps: AgentApiDeps): Record<string, unknown> {
         }
       : {}),
   };
+
+  defineModuleHelp(api.bus as object, "bus", helpOpts);
+  defineModuleHelp(api.contacts as object, "contacts", helpOpts);
+  defineModuleHelp(api.soul as object, "soul", helpOpts);
+  defineModuleHelp(api.passwords as object, "passwords", helpOpts);
+  defineModuleHelp(api.schedule as object, "schedule", helpOpts);
+  defineModuleHelp(api.task as object, "task", helpOpts);
+  defineModuleHelp(api.mail as object, "mail", helpOpts);
+  defineModuleHelp(api.vmControl as object, "vmControl", helpOpts);
+  if (api.vm_serial) defineModuleHelp(api.vm_serial as object, "vm_serial", helpOpts);
+  defineModuleHelp(api.telegram_search as object, "telegram_search", helpOpts);
+  defineModuleHelp(api.memory as object, "memory", helpOpts);
+
+  return api;
 }

@@ -9,12 +9,14 @@ import {
   appendMessage,
   ROOT_BUS_ID,
   getMessagesInWindow,
+  getHistoryDb,
 } from "../message-db.js";
 import { createStreamHandler, parsePrefixedMessages } from "../stream-handler.js";
 import type { AgentApiRouteCallbacks } from "../agent-api.js";
 import { callCodexApi } from "../codex-client.js";
 import { runAgentCode } from "../agent-eval.js";
-import { generateApiDocs } from "../agent-api-docs.js";
+import { createMemoryEvalBuffers, flushPendingMemoryRows } from "../memory-store.js";
+import { generateApiHelpIndex } from "../agent-api-docs.js";
 import { getDirectToolsSetupMode } from "../direct-tools.js";
 import {
   sendVmScript,
@@ -38,7 +40,7 @@ function persistToolOutputToRoot(toolName: string, resultText: string): void {
 }
 const SYSTEM_PROMPT_PATH = join(__dirname, "../../SYSTEM_PROMPT.md");
 
-function loadSystemPrompt(apiDocs?: string): string {
+function loadSystemPrompt(): string {
   try {
     const base = readFileSync(SYSTEM_PROMPT_PATH, "utf-8").trim();
     const boundary = getCodeBoundary();
@@ -50,11 +52,10 @@ function loadSystemPrompt(apiDocs?: string): string {
 
 **TypeScript:** \`[${boundary}=ts]\` ... \`[/${boundary}]\`
 **vm-bash:** \`[${boundary}=vm-bash:N:user]\` ... \`[/${boundary}]\` (N = timeout seconds, user = run as, e.g. root)
-- Blocks run sequentially in document order: bash1 → ts1 → bash2 → ts2. Content can include any characters (backticks, quotes, etc.).`;
+- Blocks run sequentially in document order: bash1 → ts1 → bash2 → ts2. Between the opening and closing tags, write **only** the script source. **Do not** wrap that source in Markdown code fences (\`\`\`, \`\`\`typescript, etc.); the tags delimit the code. Triple backticks inside bbtags break extraction and are wrong.
+- Content between tags may use backticks, quotes, newlines, etc. as needed for valid code — just never add an extra \`\`\` layer around the whole block.`;
     }
-    if (apiDocs) {
-      out += "\n\n" + apiDocs;
-    }
+    out += "\n\n" + generateApiHelpIndex({ setupMode: getDirectToolsSetupMode(), codeBoundary: boundary });
     const soul = soulGet();
     if (soul) {
       out += "\n\n## Soul (agent identity)\n\n" + soul;
@@ -585,13 +586,13 @@ async function runCodeBasedSendMessage(
   trimmedCount?: number,
   useOpenRouter = false,
   useCodex = false,
-  sessionPrefix?: SessionApiMessage[]
+  sessionPrefix?: SessionApiMessage[],
+  sendOptions?: { triggeringUserDbId?: number }
 ): Promise<{ text: string }> {
   const provider = useCodex ? "Codex" : useOpenRouter ? "OpenRouter" : "Claude";
   logVerbose("runCodeBasedSendMessage starting, provider:", provider, "user message length:", userMessage.length);
 
-  const apiDocs = generateApiDocs({ setupMode: getDirectToolsSetupMode(), codeBoundary: getCodeBoundary() });
-  const systemPrompt = loadSystemPrompt(apiDocs);
+  const systemPrompt = loadSystemPrompt();
   const rawEmitChunk = (chunk: string) => {
     if (chunk && onChunk) onChunk(chunk);
   };
@@ -614,236 +615,262 @@ async function runCodeBasedSendMessage(
   };
 
   try {
-  let loopIter = 0;
-  while (true) {
-    loopIter++;
-    if (process.env.DEBUG?.includes("yaaia") && loopIter > 1) logVerbose("Agent loop iteration", loopIter);
-    if (agentAbortRequested) return { text: "Stopped by user." };
+    let loopIter = 0;
+    while (true) {
+      loopIter++;
+      if (process.env.DEBUG?.includes("yaaia") && loopIter > 1) logVerbose("Agent loop iteration", loopIter);
+      if (agentAbortRequested) return { text: "Stopped by user." };
 
-    const injected = getAndClearPendingInjectMessage();
-    if (injected) {
-      const last = messages[messages.length - 1];
-      const wrapUser = "[User message during reply]: " + injected;
-      if (last?.role === "assistant") {
-        messages.push({ role: "user", content: wrapUser });
-      } else {
-        messages.push({ role: "assistant", content: "" });
-        messages.push({ role: "user", content: wrapUser });
+      const injected = getAndClearPendingInjectMessage();
+      if (injected) {
+        const last = messages[messages.length - 1];
+        const wrapUser = "[User message during reply]: " + injected;
+        if (last?.role === "assistant") {
+          messages.push({ role: "user", content: wrapUser });
+        } else {
+          messages.push({ role: "assistant", content: "" });
+          messages.push({ role: "user", content: wrapUser });
+        }
+        emitStructured(emitChunk, { type: "user_injected", content: injected });
+        continue;
       }
-      emitStructured(emitChunk, { type: "user_injected", content: injected });
-      continue;
-    }
 
-    const streamHandler = createStreamHandler({ emitChunk: rawEmitChunk });
-    const processChunk = (chunk: string) => {
-      try {
-        streamHandler.processChunk(chunk);
-      } catch (e) {
-        console.error("[YAAIA] Stream chunk error:", e);
-      }
-    };
-    emitStructured(emitChunk, { type: "thinking" });
-    let responseText: string;
-    if (useCodex) {
-      logVerbose("Calling Codex API, model:", agentConfig!.codexModel || "gpt-5.4-codex");
-      const codexMessages = prepareMessagesForApi(messages);
-      const result = await callCodexApi(
-        systemPrompt,
-        codexMessages,
-        agentConfig!.codexModel || "gpt-5.4-codex",
-        lastCodexReasoningEncrypted,
-        (chunk) => processChunk(chunk)
-      );
-      streamHandler.flush();
-      responseText = result.text;
-      lastCodexReasoningEncrypted = result.reasoningEncrypted;
-      logVerbose("Codex response received, length:", responseText.length);
-    } else if (useOpenRouter) {
-      const model = agentConfig!.openrouterModel || "google/gemini-2.5-flash";
-      logVerbose("Calling OpenRouter API, model:", model);
-      const apiKey = agentConfig!.openrouterApiKey.trim();
-      const res = await fetch(OPENROUTER_URL, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          model,
-          messages: [{ role: "system", content: systemPrompt }, ...prepareMessagesForApi(messages)],
-          max_tokens: 8192,
-          stream: true,
-          reasoning: { enabled: true },
-        }),
-      });
-      logVerbose("OpenRouter response status:", res.status, res.statusText);
-      if (!res.ok) throw new Error((await res.text()) || `OpenRouter API error ${res.status}`);
-      const reader = res.body?.getReader();
-      if (!reader) throw new Error("OpenRouter response has no body");
-      const decoder = new TextDecoder();
-      let buffer = "";
-      responseText = "";
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split("\n");
-        buffer = lines.pop() ?? "";
-        for (const line of lines) {
-          if (!line.startsWith("data: ")) continue;
-          const data = line.slice(6).trim();
-          if (!data || data === "[DONE]") continue;
-          try {
-            const parsed = JSON.parse(data) as { choices?: Array<{ delta?: { content?: string }; message?: { content?: string } }> };
-            const choice = parsed.choices?.[0];
-            if (!choice) continue;
-            const delta = choice.delta ?? choice.message;
-            const content = delta?.content;
-            if (typeof content === "string") {
-              responseText += content;
-              processChunk(content);
+      const streamHandler = createStreamHandler({ emitChunk: rawEmitChunk });
+      const processChunk = (chunk: string) => {
+        try {
+          streamHandler.processChunk(chunk);
+        } catch (e) {
+          console.error("[YAAIA] Stream chunk error:", e);
+        }
+      };
+      emitStructured(emitChunk, { type: "thinking" });
+      let responseText: string;
+      if (useCodex) {
+        logVerbose("Calling Codex API, model:", agentConfig!.codexModel || "gpt-5.4-codex");
+        const codexMessages = prepareMessagesForApi(messages);
+        const result = await callCodexApi(
+          systemPrompt,
+          codexMessages,
+          agentConfig!.codexModel || "gpt-5.4-codex",
+          lastCodexReasoningEncrypted,
+          (chunk) => processChunk(chunk)
+        );
+        streamHandler.flush();
+        responseText = result.text;
+        lastCodexReasoningEncrypted = result.reasoningEncrypted;
+        logVerbose("Codex response received, length:", responseText.length);
+      } else if (useOpenRouter) {
+        const model = agentConfig!.openrouterModel || "google/gemini-2.5-flash";
+        logVerbose("Calling OpenRouter API, model:", model);
+        const apiKey = agentConfig!.openrouterApiKey.trim();
+        const res = await fetch(OPENROUTER_URL, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${apiKey}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            model,
+            messages: [{ role: "system", content: systemPrompt }, ...prepareMessagesForApi(messages)],
+            max_tokens: 8192,
+            stream: true,
+            reasoning: { enabled: true },
+          }),
+        });
+        logVerbose("OpenRouter response status:", res.status, res.statusText);
+        if (!res.ok) throw new Error((await res.text()) || `OpenRouter API error ${res.status}`);
+        const reader = res.body?.getReader();
+        if (!reader) throw new Error("OpenRouter response has no body");
+        const decoder = new TextDecoder();
+        let buffer = "";
+        responseText = "";
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split("\n");
+          buffer = lines.pop() ?? "";
+          for (const line of lines) {
+            if (!line.startsWith("data: ")) continue;
+            const data = line.slice(6).trim();
+            if (!data || data === "[DONE]") continue;
+            try {
+              const parsed = JSON.parse(data) as { choices?: Array<{ delta?: { content?: string }; message?: { content?: string } }> };
+              const choice = parsed.choices?.[0];
+              if (!choice) continue;
+              const delta = choice.delta ?? choice.message;
+              const content = delta?.content;
+              if (typeof content === "string") {
+                responseText += content;
+                processChunk(content);
+              }
+            } catch {
+              /* skip malformed */
             }
-          } catch {
-            /* skip malformed */
           }
         }
+        streamHandler.flush();
+        logVerbose("OpenRouter response received, content length:", responseText.length);
+      } else {
+        logVerbose("Calling Claude API, model:", agentConfig!.claudeModel || "claude-sonnet-4-6");
+        const apiKey = (globalThis as { __yaaiaClaudeApiKey?: string }).__yaaiaClaudeApiKey;
+        if (!apiKey) throw new Error("Claude API key not set.");
+        const client = new Anthropic({ apiKey });
+        const stream = client.messages.stream(
+          {
+            model: agentConfig!.claudeModel || "claude-sonnet-4-6",
+            max_tokens: 16384,
+            system: systemPrompt,
+            messages: prepareMessagesForApi(messages) as Anthropic.MessageParam[],
+            cache_control: { type: "ephemeral" },
+            thinking: { type: "adaptive" },
+          },
+          { headers: { "anthropic-beta": "context-1m-2025-08-07" } }
+        );
+        stream.on("text", (delta) => processChunk(delta));
+        const message = await stream.finalMessage();
+        streamHandler.flush();
+        const textBlock = message.content.find((b) => (b as { type?: string }).type === "text") as { text?: string } | undefined;
+        responseText = textBlock?.text ?? "";
+        logVerbose("Claude response received, length:", responseText.length);
       }
-      streamHandler.flush();
-      logVerbose("OpenRouter response received, content length:", responseText.length);
-    } else {
-      logVerbose("Calling Claude API, model:", agentConfig!.claudeModel || "claude-sonnet-4-6");
-      const apiKey = (globalThis as { __yaaiaClaudeApiKey?: string }).__yaaiaClaudeApiKey;
-      if (!apiKey) throw new Error("Claude API key not set.");
-      const client = new Anthropic({ apiKey });
-      const stream = client.messages.stream(
-        {
-          model: agentConfig!.claudeModel || "claude-sonnet-4-6",
-          max_tokens: 16384,
-          system: systemPrompt,
-          messages: prepareMessagesForApi(messages) as Anthropic.MessageParam[],
-          cache_control: { type: "ephemeral" },
-          thinking: { type: "adaptive" },
-        },
-        { headers: { "anthropic-beta": "context-1m-2025-08-07" } }
-      );
-      stream.on("text", (delta) => processChunk(delta));
-      const message = await stream.finalMessage();
-      streamHandler.flush();
-      const textBlock = message.content.find((b) => (b as { type?: string }).type === "text") as { text?: string } | undefined;
-      responseText = textBlock?.text ?? "";
-      logVerbose("Claude response received, length:", responseText.length);
-    }
 
-    const fullText = responseText.trim();
-    const { blocks } = extractBlocks(fullText, getCodeBoundary());
-    const streamedMsgs = streamHandler.getStreamedMessages();
-    const hasTs = blocks.some((b) => b.type === "ts");
+      const fullText = responseText.trim();
+      const { blocks } = extractBlocks(fullText, getCodeBoundary());
+      const streamedMsgs = streamHandler.getStreamedMessages();
+      const assistantDbIdForMemory =
+        streamedMsgs.length > 0 ? streamedMsgs[streamedMsgs.length - 1]!.db_id : undefined;
+      const memoryBuffers = createMemoryEvalBuffers();
+      const hasTs = blocks.some((b) => b.type === "ts");
+      const hasVmBash = blocks.some((b) => b.type === "vm-bash");
 
-    if (!hasTs) {
-      const fromTime = streamedMsgs[0]?.streamingStart ?? new Date().toISOString();
-      const toTime = streamedMsgs[streamedMsgs.length - 1]?.streamingEnd ?? new Date().toISOString();
-      const external = getMessagesInWindow(fromTime, toTime, false, "user");
-      if (external.length === 0) {
+      if (!hasTs && hasVmBash) {
         messages.push({ role: "assistant", content: fullText });
-        return { text: fullText || "" };
+        const errMsg =
+          "Error: Your reply included vm-bash block(s) but no TypeScript block. vm-bash output is only available to the following TypeScript block via vmEvalStdout and vmEvalStderr. Include at least one `[…=ts]`…`[/…]` block in document order after each vm-bash segment (bash → ts → bash → ts). Repeat the assistant message with a TypeScript block that processes the vm shell output.";
+        messages.push({ role: "user", content: errMsg });
+        emitStructured(emitChunk, { type: "user_injected", content: errMsg });
+        continue;
+      }
+
+      if (!hasTs) {
+        const fromTime = streamedMsgs[0]?.streamingStart ?? new Date().toISOString();
+        const toTime = streamedMsgs[streamedMsgs.length - 1]?.streamingEnd ?? new Date().toISOString();
+        const external = getMessagesInWindow(fromTime, toTime, false, "user");
+        if (external.length === 0) {
+          messages.push({ role: "assistant", content: fullText });
+          return { text: fullText || "" };
+        }
+        messages.push({ role: "assistant", content: fullText });
+        const wrapUser = external.map((m) => m.content).join("\n\n");
+        messages.push({ role: "user", content: wrapUser });
+        emitStructured(emitChunk, { type: "user_injected", content: external.map((m) => m.content).join("\n\n") });
+        continue;
+      }
+
+      // Run blocks sequentially: bash1 -> ts1 -> bash2 -> ts2 as they appear
+      let evalResult: Awaited<ReturnType<typeof runAgentCode>> | null = null;
+      for (const block of blocks) {
+        if (block.type === "vm-bash") {
+          const entry = sendVmScript(block.script, block.user);
+          if (entry) {
+            await entry.waitOrTimeout(block.timeout);
+            appendVmEval(entry.stdout, entry.stderr, block.user);
+          } else {
+            const errMsg = "VM not connected, it may be powered off";
+            appendVmEval(errMsg, errMsg, block.user);
+          }
+        } else {
+          logVerbose("Running ts eval, code length:", block.code.length);
+          if (process.env.DEBUG?.includes("yaaia")) {
+            const stdoutBufs = getVmEvalStdout();
+            const rootOut = stdoutBufs.root ?? "";
+            console.log("[YAAIA vm-bash] vmEvalStdout keys=", Object.keys(stdoutBufs), "root len=", rootOut.length, "root tail=", JSON.stringify(rootOut.slice(-500)));
+          }
+          evalResult = await runAgentCode(block.code, {
+            routeCallbacks,
+            getInjectedMessages: getAndClearInjectedMessages,
+            vmEvalStdout: getVmEvalStdout(),
+            vmEvalStderr: getVmEvalStderr(),
+            memoryEval: {
+              buffers: memoryBuffers,
+              assistantDbId: assistantDbIdForMemory,
+              triggeringUserDbId: sendOptions?.triggeringUserDbId,
+            },
+          });
+        }
+      }
+      const evalEndTime = new Date().toISOString();
+      if (!evalResult) evalResult = { ok: true, output: "", injected: undefined, askUserReply: undefined };
+
+      if (
+        assistantDbIdForMemory != null &&
+        assistantDbIdForMemory >= 1 &&
+        memoryBuffers.pending.length > 0
+      ) {
+        flushPendingMemoryRows(getHistoryDb(), memoryBuffers, assistantDbIdForMemory);
+      }
+
+      const outputText = evalResult.ok
+        ? evalResult.output
+        : `Error: ${evalResult.error}`;
+
+      logVerbose("Eval finished, ok:", evalResult.ok, "output length:", outputText.length);
+
+      if (evalResult.vmPowerOnAbort) {
+        return { text: outputText.trim() };
+      }
+
+      const fromTime = streamedMsgs[0]?.streamingStart ?? new Date().toISOString();
+      const streamEndTime = streamedMsgs[streamedMsgs.length - 1]?.streamingEnd ?? fromTime;
+      const toTime = streamEndTime > evalEndTime ? streamEndTime : evalEndTime;
+      const external = getMessagesInWindow(fromTime, toTime, false, "user");
+
+      if (evalResult.injected) {
+        emitStructured(emitChunk, { type: "user_injected", content: evalResult.injected.raw });
+      }
+      if (evalResult.askUserReply != null) {
+        emitStructured(emitChunk, { type: "user_injected", content: evalResult.askUserReply });
+      }
+
+      if (!evalResult.ok && outputText.trim()) {
+        const errContent = `root:${outputText.trim()}`;
+        appendMessage(ROOT_BUS_ID, { role: "user", content: errContent, during_eval: true });
+        const { deliverMessage } = await import("../message-delivery.js");
+        deliverMessage(ROOT_BUS_ID, errContent).catch(() => { });
+        emitChunk(errContent + "\n");
+      }
+
+      const parsedOutput = parsePrefixedMessages(outputText);
+      const evalUserParts: string[] = [];
+      for (const msg of parsedOutput) {
+        evalUserParts.push(`${msg.busId}:${msg.content}`);
+      }
+      if (parsedOutput.length === 0 && outputText.trim()) {
+        evalUserParts.push(`root:${outputText.trim()}`);
+      }
+      const injectedMessages = (evalResult.injected as { messages?: { busId: string; content: string }[] } | undefined)?.messages;
+      if (injectedMessages) {
+        for (const { busId, content } of injectedMessages) {
+          evalUserParts.push(`${busId}:${content}`);
+        }
+      }
+      if (evalResult.askUserReply != null && evalResult.askUserReply.trim()) {
+        evalUserParts.push(evalResult.askUserReply.trim());
+      }
+      if (external.length > 0) {
+        const externalParts = external.map((m) => m.content);
+        evalUserParts.push(...externalParts);
+      }
+      if (evalUserParts.length === 0) {
+        return { text: outputText.trim() || fullText };
       }
       messages.push({ role: "assistant", content: fullText });
-      const wrapUser = external.map((m) => m.content).join("\n\n");
+      const wrapUser = evalUserParts.join("\n\n");
       messages.push({ role: "user", content: wrapUser });
-      emitStructured(emitChunk, { type: "user_injected", content: external.map((m) => m.content).join("\n\n") });
-      continue;
-    }
 
-    // Run blocks sequentially: bash1 -> ts1 -> bash2 -> ts2 as they appear
-    let evalResult: Awaited<ReturnType<typeof runAgentCode>> | null = null;
-    for (const block of blocks) {
-      if (block.type === "vm-bash") {
-        const entry = sendVmScript(block.script, block.user);
-        if (entry) {
-          await entry.waitOrTimeout(block.timeout);
-          appendVmEval(entry.stdout, entry.stderr, block.user);
-        } else {
-          const errMsg = "VM not connected, it may be powered off";
-          appendVmEval(errMsg, errMsg, block.user);
-        }
-      } else {
-        logVerbose("Running ts eval, code length:", block.code.length);
-        if (process.env.DEBUG?.includes("yaaia")) {
-          const stdoutBufs = getVmEvalStdout();
-          const rootOut = stdoutBufs.root ?? "";
-          console.log("[YAAIA vm-bash] vmEvalStdout keys=", Object.keys(stdoutBufs), "root len=", rootOut.length, "root tail=", JSON.stringify(rootOut.slice(-500)));
-        }
-        evalResult = await runAgentCode(block.code, {
-          routeCallbacks,
-          getInjectedMessages: getAndClearInjectedMessages,
-          vmEvalStdout: getVmEvalStdout(),
-          vmEvalStderr: getVmEvalStderr(),
-        });
-      }
+      if (!fullText.trim()) return { text: fullText };
     }
-    const evalEndTime = new Date().toISOString();
-    if (!evalResult) evalResult = { ok: true, output: "", injected: undefined, askUserReply: undefined };
-
-    const outputText = evalResult.ok
-      ? evalResult.output
-      : `Error: ${evalResult.error}`;
-
-    logVerbose("Eval finished, ok:", evalResult.ok, "output length:", outputText.length);
-
-    if (evalResult.vmPowerOnAbort) {
-      return { text: outputText.trim() };
-    }
-
-    const fromTime = streamedMsgs[0]?.streamingStart ?? new Date().toISOString();
-    const streamEndTime = streamedMsgs[streamedMsgs.length - 1]?.streamingEnd ?? fromTime;
-    const toTime = streamEndTime > evalEndTime ? streamEndTime : evalEndTime;
-    const external = getMessagesInWindow(fromTime, toTime, false, "user");
-
-    if (evalResult.injected) {
-      emitStructured(emitChunk, { type: "user_injected", content: evalResult.injected.raw });
-    }
-    if (evalResult.askUserReply != null) {
-      emitStructured(emitChunk, { type: "user_injected", content: evalResult.askUserReply });
-    }
-
-    if (!evalResult.ok && outputText.trim()) {
-      const errContent = `root:${outputText.trim()}`;
-      appendMessage(ROOT_BUS_ID, { role: "user", content: errContent, during_eval: true });
-      const { deliverMessage } = await import("../message-delivery.js");
-      deliverMessage(ROOT_BUS_ID, errContent).catch(() => { });
-      emitChunk(errContent + "\n");
-    }
-
-    const parsedOutput = parsePrefixedMessages(outputText);
-    const evalUserParts: string[] = [];
-    for (const msg of parsedOutput) {
-      evalUserParts.push(`${msg.busId}:${msg.content}`);
-    }
-    if (parsedOutput.length === 0 && outputText.trim()) {
-      evalUserParts.push(`root:${outputText.trim()}`);
-    }
-    const injectedMessages = (evalResult.injected as { messages?: { busId: string; content: string }[] } | undefined)?.messages;
-    if (injectedMessages) {
-      for (const { busId, content } of injectedMessages) {
-        evalUserParts.push(`${busId}:${content}`);
-      }
-    }
-    if (evalResult.askUserReply != null && evalResult.askUserReply.trim()) {
-      evalUserParts.push(evalResult.askUserReply.trim());
-    }
-    if (external.length > 0) {
-      const externalParts = external.map((m) => m.content);
-      evalUserParts.push(...externalParts);
-    }
-    if (evalUserParts.length === 0) {
-      return { text: outputText.trim() || fullText };
-    }
-    messages.push({ role: "assistant", content: fullText });
-    const wrapUser = evalUserParts.join("\n\n");
-    messages.push({ role: "user", content: wrapUser });
-
-    if (!fullText.trim()) return { text: fullText };
-  }
   } finally {
     const snapshot = messages.map((m) => ({ role: m.role, content: m.content }));
     agentSessionApiMessages = trimSessionToRollingCharLimit(snapshot, SESSION_ROLLING_MAX_CHARS);
@@ -855,7 +882,8 @@ export async function sendMessage(
   onChunk?: StreamChunkCallback,
   history: HistoryMessage[] = [],
   targetBusId?: string,
-  trimmedCount?: number
+  trimmedCount?: number,
+  sendOptions?: { triggeringUserDbId?: number }
 ): Promise<{ text: string }> {
   logVerbose("sendMessage called, provider:", agentConfig?.aiProvider ?? "?", "targetBusId:", targetBusId ?? "root");
   if (!agentConfig) {
@@ -873,6 +901,7 @@ export async function sendMessage(
     useSessionContinuation ? 0 : trimmedCount,
     agentConfig.aiProvider === "openrouter",
     agentConfig.aiProvider === "codex",
-    useSessionContinuation ? agentSessionApiMessages : undefined
+    useSessionContinuation ? agentSessionApiMessages : undefined,
+    sendOptions
   );
 }

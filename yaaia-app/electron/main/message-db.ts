@@ -15,6 +15,7 @@ import { isGoogleAuthorized } from "./google-auth.js";
 import { getTrustLevelForBus, contactUpdateTrustByBusId } from "./contacts-store.js";
 import { telegramDeleteChatHistory } from "./telegram-client.js";
 import { mailDeleteMessagesByUids } from "./mail-client.js";
+import { migrateMemorySchema } from "./memory-store.js";
 
 const YAAIA_DIR = join(homedir(), "yaaia");
 const HISTORY_DB_PATH = join(YAAIA_DIR, "storage", "history.db");
@@ -57,8 +58,22 @@ function getDb(): InstanceType<typeof BetterSqlite3> {
       );
     `);
     migrateSchema();
+    migrateMemorySchema(db);
   }
   return db;
+}
+
+/** Shared SQLite handle (messages + agent memory). */
+export function getHistoryDb(): InstanceType<typeof BetterSqlite3> {
+  return getDb();
+}
+
+/** Last persisted messages.id for a bus (before a new insert), for prev_msg_id headers. */
+export function getLastMessageDbIdForBus(busId: string): number | undefined {
+  const row = getDb()
+    .prepare("SELECT id FROM messages WHERE bus_id = ? ORDER BY id DESC LIMIT 1")
+    .get(busId) as { id: number } | undefined;
+  return row?.id;
 }
 
 function migrateSchema(): void {
@@ -80,6 +95,8 @@ export type HistoryMessage = {
   content: string;
   /** SQLite messages.id — for model-facing history formatting only */
   db_id?: number;
+  /** External/channel id from messages.message_id (not the SQLite row id). */
+  external_message_id?: string;
   user_id?: number;
   user_name?: string;
   bus_id?: string;
@@ -294,6 +311,12 @@ export type AppendMessageOptions = {
   streaming_end?: string;
 };
 
+/** Result of inserting a message row. db_id is SQLite messages.id; external_message_id is the optional channel id column. */
+export type AppendMessageResult = {
+  db_id: number;
+  external_message_id?: string;
+};
+
 export function appendMessage(
   busId: string,
   message: {
@@ -306,7 +329,7 @@ export function appendMessage(
     event_uid?: string;
     from_identifier?: string;
   } & AppendMessageOptions
-): string | undefined {
+): AppendMessageResult {
   const receivedAt = message.timestamp ?? new Date().toISOString();
   const fromId = toFromIdentifier(message);
   const toId = message.bus_id ?? busId;
@@ -319,7 +342,7 @@ export function appendMessage(
     INSERT INTO messages (from_identifier, to_identifier, bus_id, text, received_at, message_id, role, mail_uid, event_uid, during_eval, streaming_start, streaming_end)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
-  stmt.run(
+  const runResult = stmt.run(
     fromId,
     toId,
     message.bus_id ?? busId,
@@ -333,14 +356,18 @@ export function appendMessage(
     message.streaming_start ?? null,
     message.streaming_end ?? null
   );
-  return messageId ?? undefined;
+  const db_id = Number(runResult.lastInsertRowid);
+  return {
+    db_id,
+    ...(messageId != null ? { external_message_id: messageId } : {}),
+  };
 }
 
 /** Append message (alias for legacy). */
 export function appendToHistory(
   busId: string,
   message: Omit<HistoryMessage, "timestamp"> & { timestamp?: string; message_id?: string }
-): string | undefined {
+): AppendMessageResult {
   return appendMessage(busId, {
     role: message.role,
     content: message.content,
@@ -356,13 +383,13 @@ export function appendToHistory(
   });
 }
 
-/** Append a placeholder for streaming; returns { messageId, streamingStart }. */
-export function appendStreamingPlaceholder(busId: string): { messageId: string; streamingStart: string } {
+/** Append a placeholder for streaming; returns messageId, streamingStart, and SQLite db_id. */
+export function appendStreamingPlaceholder(busId: string): { messageId: string; streamingStart: string; db_id: number } {
   ensureRootBus();
   ensureMbDir(busId);
   const messageId = `${busId}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
   const now = new Date().toISOString();
-  appendMessage(busId, {
+  const { db_id } = appendMessage(busId, {
     role: "assistant",
     content: "",
     bus_id: busId,
@@ -371,7 +398,7 @@ export function appendStreamingPlaceholder(busId: string): { messageId: string; 
     during_eval: false,
     streaming_start: now,
   });
-  return { messageId, streamingStart: now };
+  return { messageId, streamingStart: now, db_id };
 }
 
 /** Update message content by bus_id and message_id (streaming). */
@@ -407,7 +434,7 @@ export function getMessagesInWindow(
 ): HistoryMessage[] {
   const roleClause = roleFilter === "user" ? " AND role = 'user'" : roleFilter === "assistant" ? " AND role = 'assistant'" : "";
   const stmt = getDb().prepare(`
-    SELECT id, from_identifier, bus_id, text, received_at, role, mail_uid, event_uid, during_eval, streaming_start, streaming_end
+    SELECT id, from_identifier, bus_id, text, received_at, role, mail_uid, event_uid, message_id, during_eval, streaming_start, streaming_end
     FROM messages
     WHERE received_at >= ? AND received_at <= ? AND during_eval = ?${roleClause}
     ORDER BY received_at ASC
@@ -421,6 +448,7 @@ export function getMessagesInWindow(
     role: string;
     mail_uid: number | null;
     event_uid: string | null;
+    message_id: string | null;
     during_eval: number;
     streaming_start: string | null;
     streaming_end: string | null;
@@ -437,6 +465,7 @@ function rowToHistoryMessage(row: {
   role: string;
   mail_uid: number | null;
   event_uid: string | null;
+  message_id?: string | null;
   during_eval?: number;
   streaming_start?: string | null;
   streaming_end?: string | null;
@@ -444,10 +473,12 @@ function rowToHistoryMessage(row: {
   const role = row.role === "assistant" ? "assistant" : "user";
   const user_id = role === "user" && /^\d+$/.test(row.from_identifier) ? parseInt(row.from_identifier, 10) : undefined;
   const user_name = role === "user" && row.from_identifier !== "user" && !user_id ? row.from_identifier : undefined;
+  const ext = row.message_id != null && String(row.message_id).trim() !== "" ? String(row.message_id) : undefined;
   return {
     role,
     content: row.text,
     ...(row.id != null ? { db_id: row.id } : {}),
+    ...(ext ? { external_message_id: ext } : {}),
     user_id,
     user_name,
     bus_id: row.bus_id,
@@ -469,10 +500,12 @@ function rowToBusMessage(row: {
   role: string;
   mail_uid: number | null;
   event_uid: string | null;
+  message_id?: string | null;
 }): BusMessage {
   const role = row.role === "assistant" ? "assistant" : "user";
   const user_id = role === "user" && /^\d+$/.test(row.from_identifier) ? parseInt(row.from_identifier, 10) : undefined;
   const user_name = role === "user" && row.from_identifier !== "user" && !user_id ? row.from_identifier : undefined;
+  const ext = row.message_id != null && String(row.message_id).trim() !== "" ? String(row.message_id) : undefined;
   return {
     role,
     content: row.text,
@@ -483,6 +516,7 @@ function rowToBusMessage(row: {
     timestamp: row.received_at,
     mail_uid: row.mail_uid ?? undefined,
     event_uid: row.event_uid ?? undefined,
+    ...(ext ? { message_id: ext } : {}),
   };
 }
 
@@ -497,12 +531,13 @@ export function toBusMessage(m: HistoryMessage): BusMessage {
     timestamp: m.timestamp,
     mail_uid: m.mail_uid,
     event_uid: m.event_uid,
+    ...(m.external_message_id ? { message_id: m.external_message_id } : {}),
   };
 }
 
 export function getBusHistory(busId: string): HistoryMessage[] {
   const stmt = getDb().prepare(
-    "SELECT id, from_identifier, bus_id, text, received_at, role, mail_uid, event_uid FROM messages WHERE bus_id = ? ORDER BY received_at ASC"
+    "SELECT id, from_identifier, bus_id, text, received_at, role, mail_uid, event_uid, message_id FROM messages WHERE bus_id = ? ORDER BY received_at ASC"
   );
   const rows = stmt.all(busId) as Parameters<typeof rowToHistoryMessage>[0][];
   return rows.map(rowToHistoryMessage);
@@ -632,10 +667,11 @@ export function getRootBusHistoryOnly(): BusMessage[] {
   return getBusHistory(ROOT_BUS_ID).map(toBusMessage);
 }
 
-export function appendToBusHistory(busId: string, message: BusMessage): void {
+/** Returns SQLite messages.id for the new row. */
+export function appendToBusHistory(busId: string, message: BusMessage): number {
   ensureRootBus();
   ensureMbDir(busId);
-  appendMessage(busId, {
+  const r = appendMessage(busId, {
     role: message.role,
     content: message.content,
     user_id: message.user_id,
@@ -647,6 +683,7 @@ export function appendToBusHistory(busId: string, message: BusMessage): void {
     message_id: message.message_id,
     from_identifier: message.from_identifier,
   });
+  return r.db_id;
 }
 
 /** Append placeholder with generated message_id. Returns message_id for later replace. */

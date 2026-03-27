@@ -78,6 +78,7 @@ import {
   hasMessageIdInBusHistory,
   removeMessagesFromBusHistoryByEventUids,
   isValidBusIdFormat,
+  getLastMessageDbIdForBus,
 } from "./message-db.js";
 import { hasTaskForEventUid, setEventTaskMapping, removeEventTaskMapping } from "./caldav-event-tasks-store.js";
 import {
@@ -90,6 +91,11 @@ import {
   contactSearch,
 } from "./contacts-store.js";
 import { shouldBanBusForNoIdentity, incrementIdentityAttempts } from "./identity-attempts-store.js";
+import { registerTelegramVoipIpc } from "./telegram-voip/register-ipc.js";
+import {
+  startTelegramGatewayIfNeeded,
+  stopTelegramGatewayIfSpawned,
+} from "./telegram-gateway-process.js";
 import { ensureHistoryCollection } from "./message-db.js";
 import {
   createAuthorizationFlow,
@@ -341,6 +347,7 @@ function stopAgentServer(): void {
 app.setPath("userData", APP_DATA_DIR);
 
 app.whenReady().then(async () => {
+  await startTelegramGatewayIfNeeded();
   ensureStorageDirs();
   // Start YaaiaVM early so it's ready when config screen loads
   startYaaiaVm().catch((err) => console.warn("[YAAIA] YaaiaVM background start:", err));
@@ -354,6 +361,7 @@ app.on("before-quit", async (event) => {
   isQuitting = true;
 
   stopYaaiaVm();
+  stopTelegramGatewayIfSpawned();
   stopOllama();
   stopAgentServer();
   await stopMailClient();
@@ -369,6 +377,8 @@ app.on("before-quit", async (event) => {
 app.on("window-all-closed", () => {
   if (!isQuitting) app.quit();
 });
+
+registerTelegramVoipIpc();
 
 ipcMain.handle("start-chat", async (_event, config: McpConfig) => {
   stopAgentServer();
@@ -759,6 +769,14 @@ ipcMain.handle(
   }
 );
 
+function prependMessageIdHeader(
+  text: string,
+  meta: { db_id: number; prev_db_id?: number; bus_id: string }
+): string {
+  const prev = meta.prev_db_id != null ? `prev_msg_id: ${meta.prev_db_id}\n` : "";
+  return `=== CURRENT MESSAGE (db_id: ${meta.db_id}, message_id: ${meta.db_id}, bus_id: ${meta.bus_id}) ===\n${prev}=== END HEADER ===\n\n${text}`;
+}
+
 async function handleAgentSendMessage(
   event: Electron.IpcMainInvokeEvent,
   message: string,
@@ -767,6 +785,7 @@ async function handleAgentSendMessage(
   const cfg = loadConfig();
   let targetBusId = busId ?? ROOT_BUS_ID;
   let userMsg: string;
+  let triggeringUserDbId: number | undefined;
 
   let messageFromQueue = false;
   if (typeof message === "string" && message.trim() === "") {
@@ -787,6 +806,8 @@ async function handleAgentSendMessage(
     const lines = message.split("\n");
     const parts: string[] = [];
     const readableLines: string[] = [];
+    type TurnMeta = { db_id: number; prev_db_id?: number; bus_id: string };
+    const lastTurnHeaderRef: { current: TurnMeta | null } = { current: null };
     let currentEntry: {
       busId: string;
       content: string[];
@@ -817,21 +838,26 @@ async function handleAgentSendMessage(
       };
       const storedContent = busIdForAppend === ROOT_BUS_ID ? `${ROOT_BUS_ID}:${content}` : `${busIdForAppend}:${content}`;
       const rootId = getRootUserIdentifier();
+      const prevForBus = messageFromQueue
+        ? getLastMessageDbIdForBus(ROOT_BUS_ID)
+        : getLastMessageDbIdForBus(busIdForAppend === ROOT_BUS_ID ? ROOT_BUS_ID : busIdForAppend);
       if (messageFromQueue) {
         /* Queued messages were already appended to their buses by callbacks. Append to root only so model sees them; avoid duplicates. */
-        appendToBusHistory(ROOT_BUS_ID, {
+        const dbId = appendToBusHistory(ROOT_BUS_ID, {
           ...busMsg,
           bus_id: ROOT_BUS_ID,
           from_identifier: rootId,
           content: storedContent,
         });
+        lastTurnHeaderRef.current = { db_id: dbId, prev_db_id: prevForBus, bus_id: ROOT_BUS_ID };
       } else if (busIdForAppend === ROOT_BUS_ID) {
-        appendToBusHistory(ROOT_BUS_ID, {
+        const dbId = appendToBusHistory(ROOT_BUS_ID, {
           ...busMsg,
           bus_id: ROOT_BUS_ID,
           from_identifier: rootId,
           content: storedContent,
         });
+        lastTurnHeaderRef.current = { db_id: dbId, prev_db_id: prevForBus, bus_id: ROOT_BUS_ID };
       } else {
         ensureBus(
           busIdForAppend,
@@ -841,7 +867,8 @@ async function handleAgentSendMessage(
               ? `Email: ${user_name}`
               : busIdForAppend
         );
-        appendToBusHistory(busIdForAppend, { ...busMsg, content: storedContent });
+        const dbId = appendToBusHistory(busIdForAppend, { ...busMsg, content: storedContent });
+        lastTurnHeaderRef.current = { db_id: dbId, prev_db_id: prevForBus, bus_id: busIdForAppend };
       }
       parts.push(`${busIdForAppend}:${content}`);
       const label =
@@ -929,6 +956,11 @@ async function handleAgentSendMessage(
       readableLines.length > 0
         ? `New messages received while you were busy:\n\n${readableLines.join("\n\n")}`
         : parts.join("\n");
+    const turnHdr = lastTurnHeaderRef.current;
+    if (turnHdr != null) {
+      userMsg = prependMessageIdHeader(userMsg, turnHdr);
+      triggeringUserDbId = turnHdr.db_id;
+    }
   } else {
     let content = message;
     let storedContent: string;
@@ -949,7 +981,8 @@ async function handleAgentSendMessage(
         const bus_id = parsedBusId && isValidBusIdFormat(parsedBusId) ? parsedBusId : undefined;
         const rootId = getRootUserIdentifier();
         storedContent = `${ROOT_BUS_ID}:${content}`;
-        appendToBusHistory(ROOT_BUS_ID, {
+        const prevDb = getLastMessageDbIdForBus(ROOT_BUS_ID);
+        const dbId = appendToBusHistory(ROOT_BUS_ID, {
           role: "user",
           content: storedContent,
           user_id,
@@ -957,6 +990,8 @@ async function handleAgentSendMessage(
           from_identifier: rootId,
           ...(bus_id && { bus_id }),
         });
+        triggeringUserDbId = dbId;
+        userMsg = prependMessageIdHeader(storedContent, { db_id: dbId, prev_db_id: prevDb, bus_id: ROOT_BUS_ID });
       } else {
         const msgStr = typeof message === "string" ? message : String(message);
         const colonIdx = msgStr.indexOf(":");
@@ -969,18 +1004,21 @@ async function handleAgentSendMessage(
           storedContent = `${ROOT_BUS_ID}:${content}`;
         }
         const rootId = getRootUserIdentifier();
-        appendToBusHistory(ROOT_BUS_ID, {
+        const prevDb = getLastMessageDbIdForBus(ROOT_BUS_ID);
+        const dbId = appendToBusHistory(ROOT_BUS_ID, {
           role: "user",
           content: storedContent,
           user_id: 0,
           user_name: "",
           from_identifier: rootId,
         });
+        triggeringUserDbId = dbId;
+        userMsg = prependMessageIdHeader(storedContent, { db_id: dbId, prev_db_id: prevDb, bus_id: ROOT_BUS_ID });
       }
     } else {
       storedContent = `${targetBusId}:${content}`;
+      userMsg = storedContent;
     }
-    userMsg = storedContent;
   }
   const history = priorRootForModel.map((m) => {
     const busId = m.bus_id ?? ROOT_BUS_ID;
@@ -1005,7 +1043,8 @@ async function handleAgentSendMessage(
       (chunk) => event.sender.send("agent-stream-chunk", String(chunk ?? "")),
       history,
       targetBusId,
-      trimmedCount
+      trimmedCount,
+      triggeringUserDbId != null ? { triggeringUserDbId } : undefined
     );
 
   const result = await doSend();

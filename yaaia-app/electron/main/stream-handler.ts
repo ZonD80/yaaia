@@ -23,6 +23,8 @@ export type StreamHandlerCallbacks = {
 export type StreamedMessage = {
   busId: string;
   messageId: string;
+  /** SQLite messages.id for this assistant row (streaming placeholder). */
+  db_id: number;
   content: string;
   streamingStart: string;
   streamingEnd: string;
@@ -42,6 +44,7 @@ export function createStreamHandler(callbacks: StreamHandlerCallbacks): {
   let current: {
     busId: string;
     messageId: string;
+    db_id: number;
     parts: string[];
     streamingStart: string;
   } | null = null;
@@ -50,10 +53,11 @@ export function createStreamHandler(callbacks: StreamHandlerCallbacks): {
   function startMessage(busId: string): void {
     if (!isValidBusId(busId)) return;
     ensureBus(busId);
-    const { messageId, streamingStart } = appendStreamingPlaceholder(busId);
+    const { messageId, streamingStart, db_id } = appendStreamingPlaceholder(busId);
     current = {
       busId,
       messageId,
+      db_id,
       parts: [],
       streamingStart,
     };
@@ -74,6 +78,7 @@ export function createStreamHandler(callbacks: StreamHandlerCallbacks): {
       streamedMessages.push({
         busId: current.busId,
         messageId: current.messageId,
+        db_id: current.db_id,
         content: storedContent,
         streamingStart: current.streamingStart,
         streamingEnd,
@@ -149,6 +154,7 @@ export function createStreamHandler(callbacks: StreamHandlerCallbacks): {
         streamedMessages.push({
           busId: current.busId,
           messageId: current.messageId,
+          db_id: current.db_id,
           content: storedContent,
           streamingStart: current.streamingStart,
           streamingEnd,

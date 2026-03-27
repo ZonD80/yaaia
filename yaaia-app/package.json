@@ -15,10 +15,13 @@
     "dev": "npm run generate:api-spec && electron-vite dev",
     "build": "npm run generate:api-spec && electron-vite build",
     "preview": "electron-vite preview",
-    "pack": "npm run build && npm run build:vm && npm run build:vm-agent && npm run build:ollama && mkdir -p dist-electron/resources && cp -f resources/icon.png resources/YaaiaVM resources/yaaia-vm-agent dist-electron/resources/ 2>/dev/null || true && cp -rf resources/ollama dist-electron/resources/ 2>/dev/null || true && electron-builder --mac",
+    "pack": "npm run build && npm run build:vm && npm run build:vm-agent && npm run build:ollama && npm run build:voip-helper && npm run build:telegram-gateway && mkdir -p dist-electron/resources && cp -f resources/icon.png resources/YaaiaVM resources/yaaia-vm-agent dist-electron/resources/ 2>/dev/null || true && cp -f resources/yaaia-voip-helper dist-electron/resources/ 2>/dev/null || true && cp -f resources/yaaia-tg-gateway dist-electron/resources/ 2>/dev/null || true && cp -f resources/libntgcalls.dylib dist-electron/resources/ 2>/dev/null || true && cp -rf resources/ollama dist-electron/resources/ 2>/dev/null || true && electron-builder --mac",
     "build:vm": "cd yaaia-vm && swift build -c release 2>/dev/null && cp -f .build/arm64-apple-macosx/release/YaaiaVM ../resources/ && codesign --force --sign - --entitlements YaaiaVM.entitlements ../resources/YaaiaVM || true",
     "build:vm-agent": "cd yaaia-vm-agent && GOOS=linux GOARCH=arm64 go build -o yaaia-vm-agent . && mkdir -p \"$HOME/yaaia/storage/shared\" && cp -f yaaia-vm-agent \"$HOME/yaaia/storage/shared/\" && cp -f yaaia-vm-agent ../resources/",
-    "build:ollama": "node scripts/build-ollama.js"
+    "build:ollama": "node scripts/build-ollama.js",
+    "build:voip-helper": "cd native/yaaia-voip-helper && swift build -c release && (cp -f .build/arm64-apple-macosx/release/yaaia-voip-helper ../../resources/ 2>/dev/null || cp -f .build/x86_64-apple-macosx/release/yaaia-voip-helper ../../resources/ 2>/dev/null || true)",
+    "build:telegram-gateway": "cd ../yaaia-telegram-gateway && (CGO_LDFLAGS='-Wl,-rpath,@loader_path' CGO_LDFLAGS_ALLOW='-Wl,-rpath,@loader_path' CGO_ENABLED=1 go build -tags ntgcalls -o ../yaaia-app/resources/yaaia-tg-gateway ./cmd/yaaia-tg-gateway && (test -f ../yaaia-app/native/ntgcalls/macos-arm64/lib/libntgcalls.dylib && cp -f ../yaaia-app/native/ntgcalls/macos-arm64/lib/libntgcalls.dylib ../yaaia-app/resources/ || true) || go build -o ../yaaia-app/resources/yaaia-tg-gateway ./cmd/yaaia-tg-gateway)",
+    "build:telegram-gateway-voip": "cd ../yaaia-telegram-gateway && CGO_LDFLAGS='-Wl,-rpath,@loader_path' CGO_LDFLAGS_ALLOW='-Wl,-rpath,@loader_path' CGO_ENABLED=1 go build -tags ntgcalls -o ../yaaia-app/resources/yaaia-tg-gateway ./cmd/yaaia-tg-gateway && (test -f ../yaaia-app/native/ntgcalls/macos-arm64/lib/libntgcalls.dylib && cp -f ../yaaia-app/native/ntgcalls/macos-arm64/lib/libntgcalls.dylib ../yaaia-app/resources/ || true)"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.78.0",
@@ -27,7 +30,6 @@
     "@langchain/core": "^0.3.44",
     "@mistralai/mistralai": "^1.5.2",
     "@modelcontextprotocol/sdk": "^1.27.0",
-    "@mtcute/node": "^0.28.2",
     "@qdrant/js-client-rest": "1.13.0",
     "@supabase/supabase-js": "^2.49.1",
     "adm-zip": "^0.5.16",
@@ -45,6 +47,7 @@
     "otplib": "^13.3.0",
     "redis": "^4.6.13",
     "strip-ansi": "^7.1.0",
+    "undici": "^5.29.0",
     "vue": "^3.4.0",
     "ws": "^8.19.0",
     "zod": "^3.23.0"

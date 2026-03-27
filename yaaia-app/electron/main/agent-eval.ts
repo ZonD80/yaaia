@@ -21,6 +21,8 @@ import { parsePrefixedMessages } from "./stream-handler.js";
 import { waitForUserReply } from "./ask-user-bridge.js";
 import { listVms } from "./vm-manager.js";
 import { getGmailClient, getCalendarClient } from "./google-api-agent.js";
+import { getCodeBoundary } from "./recipe-store.js";
+import { generateModuleHelp } from "./agent-api-docs.js";
 
 const EVAL_TIMEOUT_MS = 120_000;
 
@@ -190,13 +192,15 @@ export async function runAgentCode(
     }
   };
   const fullDeps: AgentApiDeps = {
-    callTool: deps.callTool ?? createDirectCallTool(),
+    callTool: deps.callTool ?? createDirectCallTool(deps.memoryEval),
     routeCallbacks: deps.routeCallbacks,
     appConfig: deps.appConfig ?? getDirectToolsAppConfig(),
     getInjectedMessages: deps.getInjectedMessages,
     vmEvalStdout: deps.vmEvalStdout,
     vmEvalStderr: deps.vmEvalStderr,
     setupMode: deps.setupMode ?? getDirectToolsSetupMode(),
+    codeBoundary: deps.codeBoundary ?? getCodeBoundary(),
+    memoryEval: deps.memoryEval,
   };
   const api = createAgentApi(fullDeps);
   const vmList = await listVms();
@@ -262,6 +266,19 @@ export async function runAgentCode(
   persistentSandbox.gmail = gmailClient;
   persistentSandbox.calendar = calendarClient;
   Object.assign(persistentSandbox, api);
+
+  const helpOpts = {
+    setupMode: fullDeps.setupMode ?? false,
+    codeBoundary: fullDeps.codeBoundary ?? null,
+  };
+  Object.defineProperty(persistentSandbox.store as object, "help", {
+    value: () => generateModuleHelp("store", helpOpts),
+    enumerable: false,
+    configurable: true,
+  });
+  persistentSandbox.runtime = {
+    help: () => generateModuleHelp("runtime", helpOpts),
+  };
 
   const wrapped = `
     (async () => {

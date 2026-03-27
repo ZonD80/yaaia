@@ -1,0 +1,9 @@
+Release/obj.target/yaaia_ntgcalls/src/binding.o: ../src/binding.cc \
+  /Users/zond80/Documents/WORK_SITES/yaaia/yaaia-app/node_modules/node-addon-api/napi.h \
+  /var/folders/4w/py7yfvl165vb_mcqbfc0ps200000gn/T/cursor-sandbox-cache/698848e4da18c270e453152d76122379/node-gyp/25.2.1/include/node/node_api.h \
+  /var/folders/4w/py7yfvl165vb_mcqbfc0ps200000gn/T/cursor-sandbox-cache/698848e4da18c270e453152d76122379/node-gyp/25.2.1/include/node/js_native_api.h \
+  /var/folders/4w/py7yfvl165vb_mcqbfc0ps200000gn/T/cursor-sandbox-cache/698848e4da18c270e453152d76122379/node-gyp/25.2.1/include/node/js_native_api_types.h \
+  /var/folders/4w/py7yfvl165vb_mcqbfc0ps200000gn/T/cursor-sandbox-cache/698848e4da18c270e453152d76122379/node-gyp/25.2.1/include/node/node_api_types.h \
+  /Users/zond80/Documents/WORK_SITES/yaaia/yaaia-app/node_modules/node-addon-api/napi-inl.h \
+  /Users/zond80/Documents/WORK_SITES/yaaia/yaaia-app/node_modules/node-addon-api/napi-inl.deprecated.h \
+  /Users/zond80/Documents/WORK_SITES/yaaia/yaaia-app/native/ntgcalls/macos-arm64/ntgcalls.h

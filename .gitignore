@@ -9,3 +9,5 @@ secrets.txt
 yaaia-app/yaaia-vm/.build
 yaaia-app/yaaia-vm-agent/yaaia-vm-agent
 yaaia-app/resources/yaaia-vm-agent
+yaaia-app/*.db
+yaaia-app/native/yaaia-voip-helper/.build

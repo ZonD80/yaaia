@@ -1,11 +1,32 @@
 /**
- * Generate API documentation for the agent.
- * Used in the system prompt so the model knows the TS API surface.
- * Spec is generated from agent-api.ts (code as source of truth).
- * Run: npx tsx scripts/generate-agent-api-spec.ts
+ * Per-module API documentation for the agent eval runtime.
+ * Call `{module}.help()` in ts blocks to load docs on demand (not in system prompt).
+ * Spec source: agent-api.ts → TOOL_SPECS. Run: npx tsx scripts/generate-agent-api-spec.ts
  */
 
 import { TOOL_SPECS } from "./agent-api-spec.generated.js";
+import { getMemoryHelpText } from "./memory-store.js";
+import { getHistoryDb } from "./message-db.js";
+
+export type AgentHelpModule =
+  | "runtime"
+  | "store"
+  | "bus"
+  | "contacts"
+  | "mail"
+  | "passwords"
+  | "schedule"
+  | "soul"
+  | "task"
+  | "telegram_search"
+  | "vmControl"
+  | "vm_serial"
+  | "memory";
+
+export interface AgentHelpOptions {
+  setupMode?: boolean;
+  codeBoundary?: string | null;
+}
 
 function formatReturnBlock(schema: string): string {
   if (schema.includes("\n")) {
@@ -25,180 +46,242 @@ function docFromSpec(spec: { name: string; description: string; params?: string;
   return out;
 }
 
-const SECTION_ORDER = ["top", "mail", "vm", "vm_serial"] as const;
-
-function getSection(name: string): (typeof SECTION_ORDER)[number] {
-  if (name.startsWith("mail.")) return "mail";
-  if (name.startsWith("vm.")) return "vm";
-  if (name.startsWith("vm_serial.")) return "vm_serial";
-  return "top";
+function blockFormatLine(boundary: string | null | undefined): string {
+  return boundary
+    ? `Use [${boundary}=ts]...[/${boundary}] for TypeScript and [${boundary}=vm-bash:N:user]...[/${boundary}] for vm-bash (N=timeout sec, user=run as). Between tags write raw code only — do not wrap with markdown code fences (\`\`\` / \`\`\`typescript).`
+    : "Use [{key}=ts]...[/{key}] and [{key}=vm-bash:N:user]...[/{key}] (key from system prompt). Raw code between tags; no markdown fences inside bbtags.";
 }
 
-/** Generate static API docs for the eval runtime. Spec from agent-api.ts. setupMode: include vm_serial section. codeBoundary: runtime boundary for bbtag. */
-export function generateApiDocs(options?: { setupMode?: boolean; codeBoundary?: string | null }): string {
+function filterSpecsByPrefix(prefix: string): typeof TOOL_SPECS {
+  return TOOL_SPECS.filter((s) => s.name === prefix || s.name.startsWith(prefix + "."));
+}
+
+function vmDisplaySpec(spec: (typeof TOOL_SPECS)[number]): (typeof TOOL_SPECS)[number] {
+  if (spec.name.startsWith("vm.")) {
+    return { ...spec, name: spec.name.replace("vm.", "vmControl.") };
+  }
+  return spec;
+}
+
+/** Short pointer for system prompt — full docs via `runtime.help()` and per-module `.help()` in eval. */
+export function generateApiHelpIndex(options?: AgentHelpOptions): string {
   const setupMode = options?.setupMode ?? false;
   const boundary = options?.codeBoundary ?? null;
-  const bySection = new Map<(typeof SECTION_ORDER)[number], typeof TOOL_SPECS>();
-  for (const s of SECTION_ORDER) bySection.set(s, []);
-  for (const spec of TOOL_SPECS) {
-    const section = getSection(spec.name);
-    if (section === "vm_serial" && !setupMode) continue;
-    bySection.get(section)!.push(spec);
-  }
-
-  const sectionLines: string[] = [];
-  for (const section of SECTION_ORDER) {
-    if (section === "vm_serial" && !setupMode) continue;
-    const specs = bySection.get(section)!;
-    if (specs.length === 0) continue;
-    const title = section === "top" ? "Top-level" : section;
-    sectionLines.push("### " + title, "");
-    if (section === "top") {
-      sectionLines.push(
-        "- **store** — Persistent object across ts runs. Use `store.x = 1` to persist. Cleared on stop-chat.",
-        "- **console.log('bus_id:content')** — Send to bus. Content must use prefix format bus_id:content (bus_id mandatory). Parsed and routed during execution. Streams to chat. Example: `console.log('root:Connecting...');`",
-        "- **console.log('bus_id:wait:content')** — Ask user; blocks up to 60s. Root or telegram only.",
-        "- **wait**(seconds: number): Promise<void> — Pause for n seconds. Use instead of setTimeout (not available in sandbox).",
-        "",
-      );
-    }
-    if (section === "vm") {
-      if (setupMode) {
-        sectionLines.push(
-          "Power on or force-kill VMs. Use vmList for VM ids. vmControl.power_on returns setup checklist (see VM_SETUP.md). vm_serial available for setup.",
-          "",
-        );
-      } else {
-        sectionLines.push(
-          "Power on or force-kill VMs. Use vmList for VM ids. vmControl.power_on powers VM on. vm_serial not available (use setup mode for VM setup).",
-          "",
-        );
-      }
-    }
-    if (section === "vm_serial") {
-      sectionLines.push(
-        "Connect to a running Linux VM's serial console. VM must be started first. Use for shell commands. Output is ANSI-stripped.",
-        "",
-        "**Large bash scripts:** Use vm-bash blocks with heredoc: `cat > /mnt/shared/script.sh << 'EOF'` ... `EOF`. write_from_file reads from shared (path relative to shared root).",
-        "",
-        "**Escaping:** Use `chars: string[]` for unambiguous control — each element is one character sent raw. Or use `data` with `raw: true` to skip escaping.",
-        "",
-      );
-    }
-    for (const spec of specs) {
-      const displaySpec =
-        section === "vm" && spec.name.startsWith("vm.")
-          ? { ...spec, name: spec.name.replace("vm.", "vmControl.") }
-          : spec;
-      sectionLines.push(docFromSpec(displaySpec), "");
-    }
-  }
-
-  const blockFormat = boundary
-    ? `Use [${boundary}=ts]...[/${boundary}] for TypeScript and [${boundary}=vm-bash:N:user]...[/${boundary}] for vm-bash (N=timeout sec, user=run as). Content can include any characters.`
-    : "Use [{key}=ts]...[/{key}] and [{key}=vm-bash:N:user]...[/{key}] (key from system prompt).";
-  const lines: string[] = [
-    "## Agent TypeScript API",
+  const vmSerialLine = setupMode
+    ? "- **vm_serial.help()** — Linux VM serial console (setup mode only)."
+    : "- **vm_serial** — not available; use setup mode for `vm_serial.help()`.";
+  const lines = [
+    "## TypeScript API reference (on demand)",
     "",
-    `You write TypeScript code in code blocks per turn. You may add vm-bash blocks; they run sequentially with ts blocks in document order (bash1 → ts1 → bash2 → ts2). ${blockFormat} Each ts block receives vmEvalStdout and vmEvalStderr: per-user buffers (append-only, cleared on stop-chat). Use vmEvalStdout.root, vmEvalStdout[user_id] for stdout; vmEvalStderr.root, vmEvalStderr[user_id] for stderr. Use .slice(-n) for last n chars. Always include a plan of execution above the code block (what you will do). Inside the code block, use console.log('bus_id:content') to send messages — parsed and routed to buses, streams during execution. Every message must use prefix format: bus_id:content or bus_id:wait:content. bus_id prefix is mandatory. The code runs in an isolated runtime with access to the following API. All functions are async; use await.`,
+    "Full API documentation is **not** inlined here. Inside a ts bbtag, call:",
     "",
-    "**Eval output:** Use **console.log**, **console.info**, **console.warn**, **console.error** for output.",
+    "- **runtime.help()** — Eval overview: code blocks, `vmEvalStdout` / `vmEvalStderr`, shared JSON types, read-only globals (`vmList`, `app_config`), Google clients, file ops, workflow.",
+    "- **store.help()** — Persistent `store`, `console.log` routing, `wait`, `get_datetime`.",
+    "- **bus.help()**, **contacts.help()**, **mail.help()**, **passwords.help()**, **schedule.help()**, **soul.help()**, **task.help()**, **memory.help()**, **vmControl.help()** — per-namespace tools.",
+    "- **telegram_search.help()** — resolve Telegram username to bus_id (function has a `.help` property).",
+    vmSerialLine,
     "",
-    "### Return types and errors",
-    "",
-    "Every API returns **Promise<string>**. Parse with `JSON.parse(result)` when the tool returns JSON. Types below describe the parsed structure.",
-    "",
-    "**On failure:** All tools throw `Error` with message starting `Error:`. No try/catch = execution stops.",
-    "",
-    "### vmEvalStdout / vmEvalStderr (from vm-bash)",
-    "",
-    "Blocks run sequentially (bash1 → ts1 → bash2 → ts2); output appends to per-user buffers. Cleared on stop-chat.",
-    "```ts",
-    "vmEvalStdout: Record<string, string>;  // vmEvalStdout.root, vmEvalStdout[user_id]; use .slice(-n) for last n chars",
-    "vmEvalStderr: Record<string, string>;  // vmEvalStderr.root, vmEvalStderr[user_id]",
-    "```",
-    "",
-    "### Shared types (for JSON returns)",
-    "",
-    "```ts",
-    "// bus.list",
-    "type BusEntry = { bus_id: string; description: string; trust_level?: 'normal'|'root'; is_banned?: boolean; is_connected: boolean };",
-    "",
-    "// contacts.list / contacts.search / contacts.get",
-    "type Contact = { id: string; name: string; identifier: string; trust_level: 'normal'|'root'; bus_ids: string[]; notes: string };",
-    "",
-    "// bus.get_history",
-    "type HistoryMessage = { role: 'user'|'assistant'; content: string; db_id?: number; user_id?: number; user_name?: string; bus_id?: string; timestamp: string; mail_uid?: number; event_uid?: string };",
-    "",
-    "// passwords.list — only for passwords and TOTPs; usernames, hosts, ports go in KB md files",
-    "type PasswordListEntry = { uuid: string; description: string; type: 'string' | 'totp' };",
-    "",
-    "// passwords.get — returns string. For type=totp: OTP code by default; raw=true returns the seed. When not found: 'Password \"{id}\" not found.'",
-    "",
-    "// schedule.list",
-    "type ScheduleEntry = { id: string; at: string; title: string; instructions: string; created_at: string };",
-    "type ListTasksResult = { startup_task?: { title: string; instructions: string }; scheduled: ScheduleEntry[] };",
-    "",
-    "// mail.fetch_all / mail.fetch_one",
-    "type MailEnvelope = {",
-    "  date?: Date; subject?: string;",
-    "  from?: { address?: string; name?: string }[];",
-    "  to?: { address?: string; name?: string }[];",
-    "  cc?: { address?: string; name?: string }[];",
-    "  bcc?: { address?: string; name?: string }[];",
-    "  messageId?: string; inReplyTo?: string;",
-    "  replyTo?: { address?: string; name?: string }[];",
-    "};",
-    "type MailFetchMessage = {",
-    "  uid: number; seq: number;",
-    "  envelope: MailEnvelope;",
-    "  flags: Set<string>|string[];",
-    "  internalDate?: Date; size?: number;",
-    "  source?: string;  // when query.source=true",
-    "  labels?: string[]; threadId?: string;  // Gmail",
-    "};",
-    "",
-    "// telegram_search",
-    "type TelegramSearchResult = { bus_id: string; display_name?: string };",
-    "",
-    "// vmList (read-only, available in eval)",
-    "type VmInfo = { id: string; name: string; path: string; status: 'running'|'stopped'; ramMb: number; diskGb: number };",
-    "",
-    "// app_config (read-only, set at startup)",
-    "type AppConfig = {",
-    "  telegramApiId?: number;",
-    "  telegramApiHash?: string;",
-    "};",
-    "```",
-    "",
-    "### Read-only globals",
-    "",
-    "- **vmList**: VmInfo[] — VMs known to YaaiaVM. Use v.id for vmControl.power_on, vmControl.kill, vm_serial.connect.",
-    "- **app_config**: AppConfig | null — Telegram apiId/apiHash. Telegram connects via sidebar or auto-connects on chat start.",
-    "",
-    "### Google API (Gmail, Calendar)",
-    "",
-    "When authorized via \"Authorize Google API for agent\":",
-    "",
-    "- **gmail**: Gmail API v1 client | null — Use `gmail.users.messages.list({ userId: 'me' })`, `gmail.users.messages.get()`, `gmail.users.messages.send()`, etc. See googleapis.dev/nodejs/googleapis/latest/gmail.",
-    "- **calendar**: Google Calendar API v3 client | null — Use `calendar.events.list({ calendarId: 'primary' })`, `calendar.events.insert()`, etc. See googleapis.dev/nodejs/googleapis/latest/calendar.",
-    "",
-    "Check `if (gmail)` / `if (calendar)` before use. When not authorized, they are null.",
-    "",
-    "### File operations",
-    "",
-    "No host fs API. Shared folder at **/mnt/shared** in VM — empty by default. Build your hierarchy with vm-bash: `cat`, `echo`, `mkdir`, `cp`, `mv`, `rm`, heredocs.",
-    "",
-    ...sectionLines,
-    "### Workflow",
-    "",
-    "1. Write plan of execution above the code block",
-    "2. task.start({ summary }) at beginning of multi-step task",
-    "3. Use console.log('bus_id:content') inside code to report progress (e.g. before/after key steps)",
-    "4. task.finalize({ is_successful }) before ending",
-    "",
-    "Multi-step tools (e.g. mail.connect) return status; use next code block to continue.",
+    `Code block tags: ${blockFormatLine(boundary)}`,
   ];
-
   return lines.join("\n");
+}
+
+/** Markdown documentation for one eval module (return as string; use `console.log` to surface). */
+export function generateModuleHelp(module: AgentHelpModule, options?: AgentHelpOptions): string {
+  const setupMode = options?.setupMode ?? false;
+  const boundary = options?.codeBoundary ?? null;
+  const bf = blockFormatLine(boundary);
+
+  switch (module) {
+    case "runtime": {
+      const lines: string[] = [
+        "# runtime — eval environment",
+        "",
+        `You write TypeScript in bbtags (not markdown fenced code). vm-bash bbtags run sequentially with ts bbtags (bash1 → ts1 → bash2 → ts2). ${bf} Each ts segment receives **vmEvalStdout** and **vmEvalStderr**: per-user buffers (append-only, cleared on stop-chat). Use vmEvalStdout.root, vmEvalStdout[user_id]; same for stderr. Use .slice(-n) for last n chars. Include a plan of execution above the ts bbtag. Inside the tag pair, use **console.log('bus_id:content')** to send messages — parsed and routed to buses. Every message: **bus_id:content** or **bus_id:wait:content**. bus_id prefix is mandatory. All API methods are async; use await.`,
+        "",
+        "**Eval output:** **console.log**, **console.info**, **console.warn**, **console.error**.",
+        "",
+        "## Return types and errors",
+        "",
+        "Every tool returns **Promise<string>**. Parse with `JSON.parse(result)` when the tool returns JSON.",
+        "",
+        "**On failure:** tools throw `Error` with message starting `Error:`. No try/catch = execution stops.",
+        "",
+        "## vmEvalStdout / vmEvalStderr (from vm-bash)",
+        "",
+        "Blocks run sequentially; output appends to per-user buffers. Cleared on stop-chat.",
+        "```ts",
+        "vmEvalStdout: Record<string, string>;",
+        "vmEvalStderr: Record<string, string>;",
+        "```",
+        "",
+        "## Shared types (JSON returns)",
+        "",
+        "```ts",
+        "// bus.list",
+        "type BusEntry = { bus_id: string; description: string; trust_level?: 'normal'|'root'; is_banned?: boolean; is_connected: boolean };",
+        "",
+        "// contacts.list / contacts.search / contacts.get",
+        "type Contact = { id: string; name: string; identifier: string; trust_level: 'normal'|'root'; bus_ids: string[]; notes: string };",
+        "",
+        "// bus.get_history",
+        "type HistoryMessage = { role: 'user'|'assistant'; content: string; db_id?: number; external_message_id?: string; user_id?: number; user_name?: string; bus_id?: string; timestamp: string; mail_uid?: number; event_uid?: string };",
+        "",
+        "// passwords.list",
+        "type PasswordListEntry = { uuid: string; description: string; type: 'string' | 'totp' };",
+        "",
+        "// passwords.get — string; totp: OTP by default; raw=true returns seed",
+        "",
+        "// schedule.list",
+        "type ScheduleEntry = { id: string; at: string; title: string; instructions: string; created_at: string };",
+        "type ListTasksResult = { startup_task?: { title: string; instructions: string }; scheduled: ScheduleEntry[] };",
+        "",
+        "// mail.fetch_all / mail.fetch_one",
+        "type MailEnvelope = {",
+        "  date?: Date; subject?: string;",
+        "  from?: { address?: string; name?: string }[];",
+        "  to?: { address?: string; name?: string }[];",
+        "  cc?: { address?: string; name?: string }[];",
+        "  bcc?: { address?: string; name?: string }[];",
+        "  messageId?: string; inReplyTo?: string;",
+        "  replyTo?: { address?: string; name?: string }[];",
+        "};",
+        "type MailFetchMessage = { uid: number; seq: number; envelope: MailEnvelope; flags: Set<string>|string[]; internalDate?: Date; size?: number; source?: string; labels?: string[]; threadId?: string };",
+        "",
+        "// telegram_search",
+        "type TelegramSearchResult = { bus_id: string; display_name?: string };",
+        "",
+        "// vmList",
+        "type VmInfo = { id: string; name: string; path: string; status: 'running'|'stopped'; ramMb: number; diskGb: number };",
+        "",
+        "// app_config",
+        "type AppConfig = { telegramApiId?: number; telegramApiHash?: string };",
+        "```",
+        "",
+        "## Read-only globals",
+        "",
+        "- **vmList**: VmInfo[] — use v.id for vmControl.power_on, vmControl.kill, vm_serial.connect.",
+        "- **app_config**: AppConfig | null — Telegram apiId/apiHash.",
+        "",
+        "## Google API (Gmail, Calendar)",
+        "",
+        "When authorized: **gmail** and **calendar** are googleapis clients or null. Check `if (gmail)` / `if (calendar)`. See googleapis.dev for Gmail/Calendar.",
+        "",
+        "## File operations",
+        "",
+        "No host fs API. Shared folder at **/mnt/shared** in VM — use vm-bash to create files.",
+        "",
+        "## Workflow",
+        "",
+        "1. Plan above the code block",
+        "2. task.start({ summary }) at start of multi-step work",
+        "3. console.log('bus_id:content') for progress",
+        "4. task.finalize({ is_successful }) before ending",
+      ];
+      return lines.join("\n");
+    }
+
+    case "store": {
+      const specs = filterSpecsByPrefix("get_datetime");
+      const toolLines = specs.map((s) => docFromSpec(s));
+      const lines: string[] = [
+        "# store — persistence and I/O helpers",
+        "",
+        "- **store** — Persistent object across ts runs (`store.x = 1`). Cleared on stop-chat. Use **memory** (see `memory.help()`) for durable cross-conversation knowledge with provenance.",
+        "- **console.log('bus_id:content')** — Send to bus; prefix mandatory. **console.log('bus_id:wait:content')** — ask user (blocks up to 60s; root or telegram).",
+        "- **wait**(seconds): Promise<void> — pause; setTimeout is not available.",
+        "",
+        "## Tool",
+        "",
+        ...toolLines,
+        "",
+      ];
+      return lines.join("\n");
+    }
+
+    case "bus": {
+      const specs = filterSpecsByPrefix("bus").map((s) => docFromSpec(s));
+      return ["# bus", "", ...specs, ""].join("\n");
+    }
+
+    case "contacts": {
+      const specs = filterSpecsByPrefix("contacts").map((s) => docFromSpec(s));
+      return ["# contacts", "", ...specs, ""].join("\n");
+    }
+
+    case "mail": {
+      const specs = filterSpecsByPrefix("mail").map((s) => docFromSpec(s));
+      return ["# mail", "", ...specs, ""].join("\n");
+    }
+
+    case "passwords": {
+      const specs = filterSpecsByPrefix("passwords").map((s) => docFromSpec(s));
+      return ["# passwords", "", ...specs, ""].join("\n");
+    }
+
+    case "schedule": {
+      const specs = filterSpecsByPrefix("schedule").map((s) => docFromSpec(s));
+      return ["# schedule", "", ...specs, ""].join("\n");
+    }
+
+    case "soul": {
+      const specs = filterSpecsByPrefix("soul").map((s) => docFromSpec(s));
+      return ["# soul", "", ...specs, ""].join("\n");
+    }
+
+    case "task": {
+      const specs = filterSpecsByPrefix("task").map((s) => docFromSpec(s));
+      return ["# task", "", ...specs, ""].join("\n");
+    }
+
+    case "telegram_search": {
+      const spec = TOOL_SPECS.find((s) => s.name === "telegram_search");
+      const lines = spec ? [docFromSpec(spec)] : [];
+      return ["# telegram_search", "", ...lines, ""].join("\n");
+    }
+
+    case "vmControl": {
+      const intro = setupMode
+        ? "Power on or force-kill VMs. Use vmList for ids. vmControl.power_on returns setup checklist in setup mode."
+        : "Power on or force-kill VMs. vm_serial is not available outside setup mode.";
+      const specs = filterSpecsByPrefix("vm").map((s) => docFromSpec(vmDisplaySpec(s)));
+      return ["# vmControl", "", intro, "", ...specs, ""].join("\n");
+    }
+
+    case "memory": {
+      const persisted = getMemoryHelpText(getHistoryDb()).trim();
+      const specs = filterSpecsByPrefix("memory").map((s) => docFromSpec(s));
+      const lines: string[] = ["# memory — global durable knowledge", ""];
+      if (persisted) {
+        lines.push("## Agent-authored notes", "", persisted, "", "---", "");
+      }
+      lines.push(
+        "Cross-conversation recall with provenance. v1 search uses FTS5/LIKE only (semantic search is phase 2).",
+        "",
+        ...specs,
+        ""
+      );
+      return lines.join("\n");
+    }
+
+    case "vm_serial": {
+      if (!setupMode) {
+        return "# vm_serial\n\nNot available — enable setup mode for vm_serial tools.\n";
+      }
+      const lines: string[] = [
+        "# vm_serial — Linux VM serial console",
+        "",
+        "Connect to a running VM. Output is ANSI-stripped.",
+        "",
+        "**Large bash scripts:** vm-bash blocks with heredoc to /mnt/shared; **write_from_file** reads from shared.",
+        "",
+        "**Escaping:** use `chars: string[]` for raw characters, or `data` with `raw: true`.",
+        "",
+        "Methods map to vm_serial.* (connect, read, write, write_from_file, disconnect).",
+        "",
+      ];
+      return lines.join("\n");
+    }
+
+  }
 }

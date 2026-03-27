@@ -10,6 +10,10 @@ export const RETURN_SCHEMAS: Record<string, string> = {
   "bus.get_history": `HistoryMessage[] — see Shared types`,
   "bus.set_properties": `"Properties set for {mb_id}."`,
   "bus.delete": `"Bus {mb_id} deleted."`,
+  "bus.call": `{ ok: true; bus_id: string; call_id: string; key_fingerprint: string; encryption_key_b64: string }`,
+  "bus.pickup": `{ ok: true; bus_id: string; call_id: string; key_fingerprint: string; encryption_key_b64: string }`,
+  "bus.hangup": `{ ok: true; hung_up: true; bus_id: string }`,
+  "bus.reject": `{ ok: true; rejected?: true; ended?: string }`,
 
   "contacts.list": `Contact[] — see Shared types`,
   "contacts.search": `Contact[] — filtered by name/notes`,
@@ -100,6 +104,13 @@ export const RETURN_SCHEMAS: Record<string, string> = {
   "vm_serial.read": `string — buffered output (ANSI stripped) or "(no output yet)"`,
   "vm_serial.write": `"Sent." | "Error: ..."`,
   "vm_serial.disconnect": `"Disconnected."`,
+
+  "memory.put": `{ id: number }`,
+  "memory.get": `MemoryEntry | null — see memory.help()`,
+  "memory.list": `MemoryEntry[]`,
+  "memory.delete": `string — confirmation`,
+  "memory.find": `MemoryEntry[] — v1 FTS5/LIKE only; phase 2 may add vectors`,
+  "memory.set_help": `"Memory help text updated."`,
 
   // Special
   "mail.mailbox_create": `object — imapflow result`,

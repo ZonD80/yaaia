@@ -17,7 +17,11 @@
     "!**/*.tsbuildinfo",
     "SYSTEM_PROMPT.md",
   ],
-  extraResources: [],
+  extraResources: [
+    { from: "resources/yaaia-tg-gateway", to: "yaaia-tg-gateway" },
+    // VoIP: run npm run build:telegram-gateway-voip first so resources/libntgcalls.dylib exists
+    { from: "resources/libntgcalls.dylib", to: "libntgcalls.dylib" },
+  ],
   asar: true,
   asarUnpack: [
     "**/node_modules/archiver/**",

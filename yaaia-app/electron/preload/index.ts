@@ -151,6 +151,9 @@ try {
     googleApiStatus: () => ipcRenderer.invoke("google-api-status"),
     googleApiAuthorize: () => ipcRenderer.invoke("google-api-authorize"),
     telegramConnectStart: (phone: string) => ipcRenderer.invoke("telegram-connect-start", phone),
+    voipAppleSttFile: (audioPath: string, busId?: string) =>
+      ipcRenderer.invoke("voip-apple-stt-file", audioPath, busId),
+    voipAppleTtsFile: (text: string, outPath: string) => ipcRenderer.invoke("voip-apple-tts-file", text, outPath),
     googleApiLogout: () => ipcRenderer.invoke("google-api-logout"),
     vmList: () => ipcRenderer.invoke("vm-list"),
     vmCreate: (options?: { isoPath?: string; ramMb?: number; diskGb?: number }) =>

@@ -72,6 +72,12 @@ interface ElectronAPI {
   googleApiAuthorize: () => Promise<{ ok: boolean; error?: string }>;
   googleApiLogout: () => Promise<void>;
   telegramConnectStart: (phone: string) => Promise<{ ok: boolean; error?: string }>;
+  /** Pass `busId` (e.g. `telegram-123`) so returned `text` is `busId:transcript` for routing. */
+  voipAppleSttFile: (
+    audioPath: string,
+    busId?: string,
+  ) => Promise<{ ok: boolean; text?: string; outPath?: string; error?: string }>;
+  voipAppleTtsFile: (text: string, outPath: string) => Promise<{ ok: boolean; text?: string; outPath?: string; error?: string }>;
   vmList: () => Promise<Array<{ id: string; name: string; path: string; status: string; ramMb: number; diskGb: number }>>;
   vmCreate: (options?: { isoPath?: string; ramMb?: number; diskGb?: number }) => Promise<{ ok: boolean; vmId?: string; error?: string }>;
   vmStart: (vmId: string) => Promise<void>;

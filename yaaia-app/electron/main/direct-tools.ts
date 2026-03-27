@@ -12,7 +12,20 @@ import {
   ensureBus,
   getBusHistorySlice,
   ROOT_BUS_ID,
+  getHistoryDb,
 } from "./message-db.js";
+import {
+  memoryPut,
+  memoryGet,
+  memoryList,
+  memoryDelete,
+  memoryFind,
+  getMemoryHelpText,
+  setMemoryHelpText,
+  type MemoryEvalContext,
+  type MemoryProvenance,
+  type MemoryListFilter,
+} from "./memory-store.js";
 import {
   passwordsList,
   passwordsGet,
@@ -70,8 +83,23 @@ import {
   isBusTrusted,
 } from "./contacts-store.js";
 import { soulGet, soulSet } from "./soul-store.js";
+import { isTelegramConnected, parseTelegramBusPeerId } from "./telegram-client.js";
+
+async function gatewayTelegramVoip(path: string, body: Record<string, unknown>): Promise<Response> {
+  const base = (process.env.YAAIA_TG_GATEWAY_URL ?? "http://127.0.0.1:37567").replace(/\/$/, "");
+  const h: Record<string, string> = { "Content-Type": "application/json" };
+  const t = process.env.YAAIA_TG_GATEWAY_TOKEN?.trim();
+  if (t) h.Authorization = `Bearer ${t}`;
+  return fetch(`${base}${path}`, { method: "POST", body: JSON.stringify(body), headers: h });
+}
 
 let directToolsConfig: McpServerConfig | null = null;
+
+function telegramBusIdFromArgs(raw: unknown): string | null {
+  const s = String(raw ?? "").trim();
+  if (!s.startsWith("telegram-")) return null;
+  return parseTelegramBusPeerId(s) != null ? s : null;
+}
 
 /** Thrown by vm.power_on in non-setup mode to abort eval. Caught in agent-eval. */
 export class VmPowerOnAbortError extends Error {
@@ -105,6 +133,13 @@ function validateUnknownParams(args: unknown, allowedKeys: Set<string>): string 
   const unknown = Object.keys(a).filter((k) => !allowedKeys.has(k));
   if (unknown.length === 0) return null;
   return `Unknown params: ${unknown.join(", ")}`;
+}
+
+/** Which contact to load: `id_or_identifier` wins; if omitted, `identifier` is used (same shape as contacts.create). */
+function contactLookupKey(a: Record<string, unknown>): string {
+  const primary = String(a.id_or_identifier ?? "").trim();
+  if (primary) return primary;
+  return String(a.identifier ?? "").trim();
 }
 
 function stripBusIdAssessmentClarification(args: Record<string, unknown>): Record<string, unknown> {
@@ -150,7 +185,25 @@ function contentToText(content: { type: string; text?: string; resource?: { text
 
 export type AgentApiCallTool = (name: string, args: Record<string, unknown>) => Promise<string>;
 
-export function createDirectCallTool(): AgentApiCallTool {
+function parseMemoryProvenance(raw: unknown): MemoryProvenance {
+  if (!raw || typeof raw !== "object") return {};
+  const p = raw as Record<string, unknown>;
+  const refs = p.references_memory_ids;
+  return {
+    ...(p.source_bus_id != null && String(p.source_bus_id).trim() !== ""
+      ? { source_bus_id: String(p.source_bus_id) }
+      : {}),
+    ...(p.source_db_id != null && Number.isFinite(Number(p.source_db_id))
+      ? { source_db_id: Number(p.source_db_id) }
+      : {}),
+    ...(p.source_external_message_id != null ? { source_external_message_id: String(p.source_external_message_id) } : {}),
+    ...(p.source_contact_id != null ? { source_contact_id: String(p.source_contact_id) } : {}),
+    ...(p.provenance_note != null ? { provenance_note: String(p.provenance_note) } : {}),
+    ...(Array.isArray(refs) ? { references_memory_ids: refs.map((x) => Number(x)).filter((n) => Number.isInteger(n)) } : {}),
+  };
+}
+
+export function createDirectCallTool(memoryEval?: MemoryEvalContext | null): AgentApiCallTool {
   const config = directToolsConfig;
 
   return async (name: string, args: Record<string, unknown>): Promise<string> => {
@@ -221,6 +274,123 @@ export function createDirectCallTool(): AgentApiCallTool {
           const resultText = JSON.stringify(sliced);
           recipeStore.appendToolCall(name, args, `Returned ${sliced.length} messages`);
           return resultText;
+        }
+
+        case "bus.call": {
+          const msg = validateUnknownParams(args, new Set(["bus_id", "timeout_ms"]));
+          if (msg) {
+            recipeStore.appendToolCall(name, args, msg);
+            return finish(msg);
+          }
+          const busId = telegramBusIdFromArgs(a.bus_id);
+          if (!busId) {
+            recipeStore.appendToolCall(name, args, "invalid bus_id");
+            return finish("Error: bus_id must be a Telegram bus (telegram-<userId>).");
+          }
+          if (!isTelegramConnected()) {
+            recipeStore.appendToolCall(name, args, "Telegram not connected");
+            return finish("Error: Telegram not connected.");
+          }
+          const timeoutMs =
+            a.timeout_ms != null && Number.isFinite(Number(a.timeout_ms)) ? Math.max(5_000, Number(a.timeout_ms)) : 120_000;
+          try {
+            const r = await gatewayTelegramVoip("/v1/voip/call", { bus_id: busId, timeout_ms: timeoutMs });
+            const resultText = await r.text();
+            recipeStore.appendToolCall(name, args, `status ${r.status}`);
+            if (!r.ok && !resultText.startsWith("{")) {
+              return finish(`Error: ${resultText || r.statusText}`);
+            }
+            return resultText;
+          } catch (e) {
+            const err = e instanceof Error ? e.message : String(e);
+            recipeStore.appendToolCall(name, args, err);
+            return finish(`Error: ${err}`);
+          }
+        }
+
+        case "bus.pickup": {
+          const msg = validateUnknownParams(args, new Set(["bus_id"]));
+          if (msg) {
+            recipeStore.appendToolCall(name, args, msg);
+            return finish(msg);
+          }
+          const busId = telegramBusIdFromArgs(a.bus_id);
+          if (!busId) {
+            recipeStore.appendToolCall(name, args, "invalid bus_id");
+            return finish("Error: bus_id must be a Telegram bus (telegram-<userId>).");
+          }
+          if (!isTelegramConnected()) {
+            recipeStore.appendToolCall(name, args, "Telegram not connected");
+            return finish("Error: Telegram not connected.");
+          }
+          try {
+            const r = await gatewayTelegramVoip("/v1/voip/pickup", { bus_id: busId });
+            const resultText = await r.text();
+            recipeStore.appendToolCall(name, args, `status ${r.status}`);
+            if (!r.ok && !resultText.startsWith("{")) {
+              return finish(`Error: ${resultText || r.statusText}`);
+            }
+            return resultText;
+          } catch (e) {
+            const err = e instanceof Error ? e.message : String(e);
+            recipeStore.appendToolCall(name, args, err);
+            return finish(`Error: ${err}`);
+          }
+        }
+
+        case "bus.hangup": {
+          const msg = validateUnknownParams(args, new Set(["bus_id"]));
+          if (msg) {
+            recipeStore.appendToolCall(name, args, msg);
+            return finish(msg);
+          }
+          try {
+            const body: Record<string, unknown> = {};
+            if (a.bus_id != null && String(a.bus_id).trim() !== "") {
+              body.bus_id = String(a.bus_id).trim();
+            }
+            const r = await gatewayTelegramVoip("/v1/voip/hangup", body);
+            const resultText = await r.text();
+            recipeStore.appendToolCall(name, args, `status ${r.status}`);
+            if (!r.ok && !resultText.startsWith("{")) {
+              return finish(`Error: ${resultText || r.statusText}`);
+            }
+            return resultText;
+          } catch (e) {
+            const err = e instanceof Error ? e.message : String(e);
+            recipeStore.appendToolCall(name, args, err);
+            return finish(`Error: ${err}`);
+          }
+        }
+
+        case "bus.reject": {
+          const msg = validateUnknownParams(args, new Set(["bus_id"]));
+          if (msg) {
+            recipeStore.appendToolCall(name, args, msg);
+            return finish(msg);
+          }
+          const busId = telegramBusIdFromArgs(a.bus_id);
+          if (!busId) {
+            recipeStore.appendToolCall(name, args, "invalid bus_id");
+            return finish("Error: bus_id must be a Telegram bus (telegram-<userId>).");
+          }
+          if (!isTelegramConnected()) {
+            recipeStore.appendToolCall(name, args, "Telegram not connected");
+            return finish("Error: Telegram not connected.");
+          }
+          try {
+            const r = await gatewayTelegramVoip("/v1/voip/reject", { bus_id: busId });
+            const resultText = await r.text();
+            recipeStore.appendToolCall(name, args, `status ${r.status}`);
+            if (!r.ok && !resultText.startsWith("{")) {
+              return finish(`Error: ${resultText || r.statusText}`);
+            }
+            return resultText;
+          } catch (e) {
+            const err = e instanceof Error ? e.message : String(e);
+            recipeStore.appendToolCall(name, args, err);
+            return finish(`Error: ${err}`);
+          }
         }
 
         case "telegram_search": {
@@ -452,12 +622,12 @@ export function createDirectCallTool(): AgentApiCallTool {
 
         case "contacts.get":
         case "contacts_get": {
-          const msg = validateUnknownParams(args, new Set(["id_or_identifier"]));
+          const msg = validateUnknownParams(args, new Set(["id_or_identifier", "identifier"]));
           if (msg) {
             recipeStore.appendToolCall(name, args, msg);
             return finish(msg);
           }
-          const idOrIdentifier = String(a.id_or_identifier ?? "").trim();
+          const idOrIdentifier = contactLookupKey(a as Record<string, unknown>);
           const c = contactGet(idOrIdentifier);
           recipeStore.appendToolCall(name, args, c ? JSON.stringify(c) : "null");
           return c ? JSON.stringify(c) : "null";
@@ -491,8 +661,8 @@ export function createDirectCallTool(): AgentApiCallTool {
             recipeStore.appendToolCall(name, args, msg);
             return finish(msg);
           }
-          const { id_or_identifier: idOrId, name: n, identifier: id, trust_level: tl, bus_ids: bids, notes: notesVal } = a as Record<string, unknown>;
-          contactUpdate(String(idOrId ?? ""), {
+          const { name: n, identifier: id, trust_level: tl, bus_ids: bids, notes: notesVal } = a as Record<string, unknown>;
+          contactUpdate(contactLookupKey(a as Record<string, unknown>), {
             name: n != null ? String(n) : undefined,
             identifier: id != null ? String(id) : undefined,
             trust_level: tl as "root" | "normal" | undefined,
@@ -505,12 +675,12 @@ export function createDirectCallTool(): AgentApiCallTool {
 
         case "contacts.delete":
         case "contacts_delete": {
-          const msg = validateUnknownParams(args, new Set(["id_or_identifier"]));
+          const msg = validateUnknownParams(args, new Set(["id_or_identifier", "identifier"]));
           if (msg) {
             recipeStore.appendToolCall(name, args, msg);
             return finish(msg);
           }
-          const idOrIdentifier = String(a.id_or_identifier ?? "").trim();
+          const idOrIdentifier = contactLookupKey(a as Record<string, unknown>);
           contactDelete(idOrIdentifier);
           recipeStore.appendToolCall(name, args, "Contact deleted");
           return "Contact deleted.";
@@ -552,6 +722,147 @@ export function createDirectCallTool(): AgentApiCallTool {
           soulSet(String(a.content ?? ""));
           recipeStore.appendToolCall(name, args, "Soul updated");
           return "Soul updated.";
+        }
+
+        case "memory.put": {
+          if (!memoryEval) {
+            recipeStore.appendToolCall(name, args, "no memory eval context");
+            return finish("Error: memory tools require agent ts eval context.");
+          }
+          const msg = validateUnknownParams(args, new Set(["kind", "body", "tags", "key", "provenance"]));
+          if (msg) {
+            recipeStore.appendToolCall(name, args, msg);
+            return finish(msg);
+          }
+          const body = String(a.body ?? "");
+          const prov = parseMemoryProvenance(a.provenance);
+          const out = memoryPut(
+            getHistoryDb(),
+            {
+              kind: a.kind != null ? String(a.kind) : undefined,
+              body,
+              tags: toStrArray(a.tags),
+              key: a.key != null ? String(a.key) : undefined,
+              provenance: prov,
+            },
+            memoryEval.buffers,
+            { assistantDbId: memoryEval.assistantDbId, triggeringUserDbId: memoryEval.triggeringUserDbId }
+          );
+          if (!out.ok) {
+            recipeStore.appendToolCall(name, args, out.error);
+            return finish(`Error: ${out.error}`);
+          }
+          const resultText = JSON.stringify({ id: out.id });
+          recipeStore.appendToolCall(name, args, resultText);
+          return resultText;
+        }
+
+        case "memory.get": {
+          if (!memoryEval) {
+            recipeStore.appendToolCall(name, args, "no memory eval context");
+            return finish("Error: memory tools require agent ts eval context.");
+          }
+          const msg = validateUnknownParams(args, new Set(["id"]));
+          if (msg) {
+            recipeStore.appendToolCall(name, args, msg);
+            return finish(msg);
+          }
+          const id = Number(a.id);
+          if (!Number.isFinite(id)) return finish("Error: id must be a number.");
+          const row = memoryGet(getHistoryDb(), id, memoryEval.buffers);
+          const resultText = JSON.stringify(row);
+          recipeStore.appendToolCall(name, args, row ? "ok" : "null");
+          return resultText;
+        }
+
+        case "memory.list": {
+          if (!memoryEval) {
+            recipeStore.appendToolCall(name, args, "no memory eval context");
+            return finish("Error: memory tools require agent ts eval context.");
+          }
+          const msg = validateUnknownParams(args, new Set([
+            "kind",
+            "tags",
+            "body_substring",
+            "source_bus_id",
+            "source_contact_id",
+            "source_db_id",
+            "from_timestamp",
+            "to_timestamp",
+            "limit",
+            "offset",
+          ]));
+          if (msg) {
+            recipeStore.appendToolCall(name, args, msg);
+            return finish(msg);
+          }
+          const f: MemoryListFilter = {};
+          if (a.kind != null && String(a.kind).trim() !== "") f.kind = String(a.kind);
+          if (a.tags != null) f.tags = toStrArray(a.tags);
+          if (a.body_substring != null) f.body_substring = String(a.body_substring);
+          if (a.source_bus_id != null) f.source_bus_id = String(a.source_bus_id);
+          if (a.source_contact_id != null) f.source_contact_id = String(a.source_contact_id);
+          if (a.source_db_id != null && a.source_db_id !== "") f.source_db_id = Number(a.source_db_id);
+          if (a.from_timestamp != null) f.from_timestamp = String(a.from_timestamp);
+          if (a.to_timestamp != null) f.to_timestamp = String(a.to_timestamp);
+          if (a.limit != null) f.limit = Number(a.limit);
+          if (a.offset != null) f.offset = Number(a.offset);
+          const rows = memoryList(getHistoryDb(), f, memoryEval.buffers);
+          const resultText = JSON.stringify(rows);
+          recipeStore.appendToolCall(name, args, `count ${rows.length}`);
+          return resultText;
+        }
+
+        case "memory.delete": {
+          if (!memoryEval) {
+            recipeStore.appendToolCall(name, args, "no memory eval context");
+            return finish("Error: memory tools require agent ts eval context.");
+          }
+          const msg = validateUnknownParams(args, new Set(["id"]));
+          if (msg) {
+            recipeStore.appendToolCall(name, args, msg);
+            return finish(msg);
+          }
+          const id = Number(a.id);
+          if (!Number.isFinite(id)) return finish("Error: id must be a number.");
+          const ok = memoryDelete(getHistoryDb(), id, memoryEval.buffers);
+          recipeStore.appendToolCall(name, args, ok ? "deleted" : "miss");
+          return ok ? `Deleted memory ${id}.` : `No memory ${id}.`;
+        }
+
+        case "memory.find": {
+          if (!memoryEval) {
+            recipeStore.appendToolCall(name, args, "no memory eval context");
+            return finish("Error: memory tools require agent ts eval context.");
+          }
+          const msg = validateUnknownParams(args, new Set(["query", "mode", "limit"]));
+          if (msg) {
+            recipeStore.appendToolCall(name, args, msg);
+            return finish(msg);
+          }
+          const query = String(a.query ?? "");
+          if (!query.trim()) return finish("Error: query is required.");
+          const mode = a.mode === "like" ? "like" : "fts";
+          const limit = a.limit != null ? Number(a.limit) : undefined;
+          const rows = memoryFind(getHistoryDb(), { query, mode, limit }, memoryEval.buffers);
+          const resultText = JSON.stringify(rows);
+          recipeStore.appendToolCall(name, args, `count ${rows.length}`);
+          return resultText;
+        }
+
+        case "memory.set_help": {
+          if (!memoryEval) {
+            recipeStore.appendToolCall(name, args, "no memory eval context");
+            return finish("Error: memory tools require agent ts eval context.");
+          }
+          const msg = validateUnknownParams(args, new Set(["text"]));
+          if (msg) {
+            recipeStore.appendToolCall(name, args, msg);
+            return finish(msg);
+          }
+          setMemoryHelpText(getHistoryDb(), String(a.text ?? ""));
+          recipeStore.appendToolCall(name, args, "help set");
+          return "Memory help text updated.";
         }
 
         case "vm.power_on": {
