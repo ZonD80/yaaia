@@ -1,31 +1,29 @@
-#!/bin/bash
-set -e
+#!/usr/bin/env bash
+set -euo pipefail
+
 cd "$(dirname "$0")"
 ROOT="$(pwd)"
 
-echo "[launch] Building YAAIA..."
-cd yaaia-app
-npm install
-npm run build
-npm run build:vm
-npm run build:vm-agent
-
-if [[ "$(uname -s)" == "Darwin" ]]; then
-  DYLIB="${ROOT}/yaaia-app/native/ntgcalls/macos-arm64/lib/libntgcalls.dylib"
-  if [[ ! -f "$DYLIB" ]]; then
-    echo "[launch] No libntgcalls.dylib — building NTgCalls from source (first run: several minutes)..."
-    (cd "${ROOT}" && INSTALL_TO_YAAIA=1 ./scripts/build-ntgcalls-macos-shared.sh)
-  fi
-  echo "[launch] Building Apple STT/TTS helper (yaaia-voip-helper)..."
-  npm run build:voip-helper
-  echo "[launch] Building VoIP-capable yaaia-tg-gateway (ntgcalls + dylib)..."
-  npm run build:telegram-gateway-voip
-else
-  echo "[launch] Non-macOS: building telegram gateway without ntgcalls VoIP..."
-  npm run build:telegram-gateway
+if [[ -f "${ROOT}/.env" ]]; then
+  while IFS='=' read -r key value; do
+    [[ -z "${key}" || "${key}" =~ ^[[:space:]]*# ]] && continue
+    [[ "${key}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    if [[ -z "${!key+x}" ]]; then
+      value="${value%$'\r'}"
+      value="${value#\"}"
+      value="${value%\"}"
+      value="${value#\'}"
+      value="${value%\'}"
+      value="${value/#\~/${HOME}}"
+      export "${key}=${value}"
+    fi
+  done < "${ROOT}/.env"
 fi
 
-echo "[launch] Launching YAAIA..."
-export DEBUG="${DEBUG:-yaaia:*,tsdav:*}"
-export YAAIA_IMAP_DEBUG="${YAAIA_IMAP_DEBUG:-1}"
-exec npx electron .
+ENV_PREFIX="${YAAIA_CONDA_PREFIX:-${ROOT}/.conda}"
+
+if [[ ! -x "${ENV_PREFIX}/bin/python" ]]; then
+  "${ROOT}/scripts/setup-conda.sh"
+fi
+
+exec conda run --no-capture-output -p "${ENV_PREFIX}" python -m yaaia

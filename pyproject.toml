@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "yaaia"
+version = "0.1.0"
+description = "Python console client for Telegram text chat and Google Workspace"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+  "python-telegram==0.19.0",
+  "google-api-python-client>=2.196.0",
+  "google-auth-httplib2>=0.2.0",
+  "google-auth-oauthlib>=1.2.2",
+  "rich>=14.0.0",
+]
+
+[project.optional-dependencies]
+voice = [
+  "py-tgcalls[pyrogram]>=2.2.12",
+  "TgCrypto>=1.2.5",
+  "mlx-audio>=0.4.3",
+]
+
+[project.scripts]
+yaaia = "yaaia.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["yaaia*"]
