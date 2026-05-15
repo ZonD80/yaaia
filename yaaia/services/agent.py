@@ -9,7 +9,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -20,7 +20,7 @@ from .secrets import SecretsStore
 from .script_runner import ScriptBlock, ScriptExecution, execute_python_script, extract_script_blocks
 
 Stream = Callable[[str], None]
-Deliver = Callable[[str, str], None]
+Deliver = Callable[[str, str], str | None]
 Log = Callable[[str], None]
 ScriptObserver = Callable[[str, dict[str, Any]], None]
 
@@ -216,7 +216,12 @@ class AgentService:
         for bus_id, content in parsed:
             if not content.strip():
                 continue
-            if bus_id.startswith(("telegram-", "gmail-", "email-")) or bus_id in {"call", "email"}:
+            if bus_id.startswith(("telegram-", "gmail-", "email-")) or bus_id in {
+                "call",
+                "email",
+                "telegram-search",
+                "telegram-resolve",
+            }:
                 self.deliver(bus_id, content)
                 continue
             event = MessageEvent(
@@ -295,8 +300,16 @@ class AgentService:
                     "routes": execution.routes,
                 },
             )
+            route_results: list[str] = []
             for route in execution.routes:
-                self.deliver(route["bus_id"], route["content"])
+                delivered = self.deliver(route["bus_id"], route["content"])
+                if delivered:
+                    route_results.append(f"{route['bus_id']} result: {delivered}")
+            if route_results:
+                execution = replace(
+                    execution,
+                    stdout="\n".join(part for part in [execution.stdout.strip(), *route_results] if part),
+                )
             results.append((block, execution))
         return results
 
@@ -445,6 +458,7 @@ def _system_prompt() -> str:
 Every assistant message must use prefix routing:
 - root:<message> for the console/root chat.
 - telegram-<chat_id>:<message> to send a Telegram text message.
+- telegram-@username:<message> is also allowed; the app resolves it before sending.
 - email:<to> | <subject> | <body> to send a new Gmail message.
 - gmail-<bus_id>:<message> to reply to the latest inbound Gmail message on that bus.
 - call:<command> to control Telegram calls when explicitly requested.
@@ -462,9 +476,11 @@ attachments: /absolute/path/file.pdf
 
 Plain-text body here
 Use `html: true` when the body is HTML, or `html: <p>HTML body</p>` plus a plain body. Do not send email unless the user asked for an email or you are directly replying to an inbound email.
-If a Telegram voice call is active on a `telegram-<chat_id>` bus, replying to that Telegram bus is spoken into the call via TTS and may also be sent as text.
-Available call commands are: `call:status`, `call:start telegram-<chat_id>`, `call:accept telegram-<chat_id>`, `call:hangup [telegram-<chat_id>]`, `call:reject [telegram-<chat_id>]`, and `call:say telegram-<chat_id> <text>`.
+If a Telegram voice call is active on a `telegram-<chat_id>` bus, replying to that Telegram bus is spoken into the call via TTS and may also be sent as text. Keep voice-call replies brief: one or two short spoken sentences unless the user explicitly asks for detail.
+Available call commands are: `call:status`, `call:check`, `call:start telegram-<chat_id>`, `call:accept telegram-<chat_id>`, `call:hangup [telegram-<chat_id>]`, `call:reject [telegram-<chat_id>]`, and `call:say telegram-<chat_id> <text>`.
 Only forget a bus when the user explicitly asks; forgetting deletes local bus messages, root mirrors, and contact bus links.
+For Telegram contacts you do not know, use `telegram_search(query, limit=20)` or `telegram_resolve("@username")` in Python first; search results are returned in execution output with `telegram-<chat_id>` bus ids.
+For schedules, use Python helpers. Due schedules are injected into root as scheduled tasks and should be completed when received.
 
 If you need local computation, write Python in a bbtag block:
 [yaaia=python]
@@ -472,7 +488,7 @@ print("diagnostic output")
 root("optional root message")
 [/yaaia]
 The app executes Python with the same interpreter/environment as YAAIA and displays the script plus stdout/stderr in root.
-Available helpers inside Python: history(bus_id="root", limit=50), buses(), send(bus_id, content), root(content), call(command), email(to, subject, body, cc="", bcc="", html="", attachments=[]), reply_email(bus_id, body, subject="", cc="", bcc="", html="", attachments=[]), forget_bus(bus_id, reason="script"), restore_bus(bus_id), forgotten_buses().
+Available helpers inside Python: history(bus_id="root", limit=50), buses(), send(bus_id, content), root(content), call(command), email(to, subject, body, cc="", bcc="", html="", attachments=[]), reply_email(bus_id, body, subject="", cc="", bcc="", html="", attachments=[]), telegram_search(query, limit=20), telegram_resolve(target), schedule_create(title, instructions, at, repeat="", bus_id="root"), schedules_list(include_disabled=True), schedule_update(id, **updates), schedule_delete(id), schedule_run_due(), forget_bus(bus_id, reason="script"), restore_bus(bus_id), forgotten_buses().
 Addressbook helpers: contacts_list(), contacts_search(query), contact_get(id_or_identifier), contact_create(name, identifier, trust_level="normal", bus_ids=[], notes=""), contact_update(id_or_identifier, **updates), contact_delete(id_or_identifier), contact_is_trusted(bus_id, sender_email=None).
 Secrets helpers: secrets_list(), secret_get(description_or_uuid, raw=False), secret_set(description, type, value, force=False), secret_delete(description_or_uuid). Use secret_get only when the task requires the secret value.
 After execution results are returned, provide a final bus-prefixed answer. Do not use TypeScript or vm-bash.
@@ -513,6 +529,7 @@ def _is_valid_bus_id(bus_id: str) -> bool:
     return (
         bus_id == ROOT_BUS_ID
         or bus_id == "email"
+        or bus_id in {"telegram-search", "telegram-resolve"}
         or bus_id.startswith("telegram-")
         or bus_id.startswith("gmail-")
         or bus_id.startswith("calendar-")

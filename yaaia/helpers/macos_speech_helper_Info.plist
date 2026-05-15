@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>local.yaaia.speech-helper</string>
+    <key>CFBundleName</key>
+    <string>YAAIA Speech Helper</string>
+    <key>CFBundleExecutable</key>
+    <string>yaaia-speech-helper</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>NSSpeechRecognitionUsageDescription</key>
+    <string>YAAIA uses macOS Speech Recognition to transcribe Telegram call audio.</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>YAAIA may use microphone audio during Telegram calls.</string>
+</dict>
+</plist>

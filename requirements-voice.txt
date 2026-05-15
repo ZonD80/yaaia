@@ -1,3 +1,2 @@
 py-tgcalls[pyrogram]>=2.2.12
 TgCrypto>=1.2.5
-mlx-audio>=0.4.3

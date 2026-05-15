@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import shlex
 import sys
 import threading
 import time
+import textwrap
 from array import array
 from collections.abc import Callable
 from concurrent.futures import TimeoutError as FutureTimeoutError
@@ -14,7 +16,7 @@ from typing import Any
 
 from ..config import TelegramConfig, VoiceConfig
 from ..events import MessageEvent, utc_now
-from .voice import MlxAudioService
+from .voice import MacOSSpeechService, sanitize_text_for_tts
 
 Emit = Callable[[MessageEvent], None]
 Log = Callable[[str], None]
@@ -27,6 +29,7 @@ class _ActiveCall:
     mode: str = "listening"
     recording: bool = False
     buffer: bytearray = field(default_factory=bytearray)
+    pre_roll: bytearray = field(default_factory=bytearray)
     last_voice_at: float = 0.0
     utterance_started_at: float = 0.0
     silence_task: asyncio.Task[Any] | None = None
@@ -37,7 +40,7 @@ class TelegramVoiceCallService:
         self,
         telegram_config: TelegramConfig,
         voice_config: VoiceConfig,
-        voice: MlxAudioService,
+        voice: MacOSSpeechService,
         emit: Emit,
         log: Log,
     ) -> None:
@@ -108,8 +111,17 @@ class TelegramVoiceCallService:
             "pending_incoming": pending,
             "sample_rate": self.config.sample_rate,
             "channels": self.config.channels,
-            "tts_model": self.config.tts_model,
-            "stt_model": self.config.stt_model,
+            "pre_roll_seconds": self.config.pre_roll_seconds,
+            "tts_engine": "NSSpeechSynthesizer",
+            "tts_voice": self.config.tts_voice,
+            "tts_rate": self.config.tts_rate,
+            "tts_chunk_chars": self.config.tts_chunk_chars,
+            "tts_max_chunks": self.config.tts_max_chunks,
+            "stt_engine": "SpeechAnalyzer/DictationTranscriber",
+            "speech_locale": self.config.speech_locale,
+            "stt_audio": f"{self.config.stt_sample_rate}Hz/{self.config.stt_channels}ch",
+            "stt_normalize": self.config.stt_normalize,
+            "speech_check": self.config.preflight_enabled,
         }
 
     def list_connected_buses(self) -> list[dict[str, Any]]:
@@ -176,11 +188,43 @@ class TelegramVoiceCallService:
         with self._lock:
             if chat_id not in self._calls:
                 raise RuntimeError(f"No active call on telegram-{chat_id}.")
-            self._calls[chat_id].mode = "speaking"
+        chunks = _split_tts_chunks(
+            sanitize_text_for_tts(text),
+            max_chars=self.config.tts_chunk_chars,
+            max_chunks=self.config.tts_max_chunks,
+        )
+        if not chunks:
+            raise RuntimeError("Nothing to speak after stripping routing and markup.")
+        audio_paths: list[str] = []
         try:
-            audio_path = self.voice.synthesize_to_file(text)
-            pcm = self.voice.audio_file_to_pcm16(audio_path)
-            self._run(self._send_pcm(chat_id, pcm), timeout=max(30, self.config.command_timeout_seconds))
+            for index, chunk in enumerate(chunks, start=1):
+                with self._lock:
+                    if chat_id not in self._calls:
+                        raise RuntimeError(f"Call is no longer active on telegram-{chat_id}.")
+                started = time.monotonic()
+                self.log(
+                    f"Preparing TTS chunk {index}/{len(chunks)} for telegram-{chat_id} "
+                    f"({len(chunk)} chars)."
+                )
+                audio_path = self.voice.synthesize_to_file(chunk)
+                self.log(
+                    f"TTS chunk {index}/{len(chunks)} ready for telegram-{chat_id} "
+                    f"in {time.monotonic() - started:.1f}s."
+                )
+                pcm = self.voice.audio_file_to_pcm16(audio_path)
+                with self._lock:
+                    state = self._calls.get(chat_id)
+                    if state is None:
+                        raise RuntimeError(f"Call is no longer active on telegram-{chat_id}.")
+                    state.mode = "speaking"
+                try:
+                    self._run(self._send_pcm(chat_id, pcm), timeout=max(30, self.config.command_timeout_seconds))
+                finally:
+                    with self._lock:
+                        state = self._calls.get(chat_id)
+                        if state:
+                            state.mode = "listening"
+                audio_paths.append(str(audio_path))
             self.emit(
                 MessageEvent(
                     source="telegram-call",
@@ -189,10 +233,10 @@ class TelegramVoiceCallService:
                     text=f"[Spoken] {text}",
                     timestamp=utc_now(),
                     outbound=True,
-                    meta={"audio_path": str(audio_path)},
+                    meta={"audio_path": audio_paths[-1], "audio_paths": audio_paths},
                 )
             )
-            return f"Spoke {len(pcm)} PCM bytes on telegram-{chat_id} from {audio_path}."
+            return f"Spoke {len(chunks)} TTS chunk(s) on telegram-{chat_id}."
         finally:
             with self._lock:
                 state = self._calls.get(chat_id)
@@ -205,10 +249,13 @@ class TelegramVoiceCallService:
     def preview_tts(self, text: str) -> Path:
         return self.voice.preview_tts(text)
 
+    def check_speech(self) -> None:
+        self.voice.check()
+
     def handle_agent_command(self, content: str) -> str:
         parts = shlex.split(content)
         if not parts:
-            raise ValueError("Usage: call:<status|start|accept|hangup|reject|say|tts|stt> ...")
+            raise ValueError("Usage: call:<status|start|accept|hangup|reject|say|tts|stt|check> ...")
         command = parts[0].lower()
         if command == "status":
             return str(self.status())
@@ -226,7 +273,10 @@ class TelegramVoiceCallService:
             return str(self.preview_tts(" ".join(parts[1:])))
         if command == "stt" and len(parts) == 2:
             return self.transcribe_file(Path(parts[1]).expanduser())
-        raise ValueError("Usage: call:<status|start|accept|hangup|reject|say|tts|stt> ...")
+        if command == "check":
+            self.check_speech()
+            return "Native speech check finished."
+        raise ValueError("Usage: call:<status|start|accept|hangup|reject|say|tts|stt|check> ...")
 
     def _thread_main(self) -> None:
         loop = asyncio.new_event_loop()
@@ -252,6 +302,7 @@ class TelegramVoiceCallService:
 
     async def _async_start(self) -> None:
         try:
+            _patch_pyrogram_groupcall_forbidden()
             from pyrogram import Client
             from pytgcalls import PyTgCalls, filters
             from pytgcalls.types import ChatUpdate, Device, Direction, ExternalMedia, MediaStream, RecordStream
@@ -392,12 +443,19 @@ class TelegramVoiceCallService:
             if state is None or state.mode in {"speaking", "transcribing"}:
                 return
             rms = _pcm16_rms(data)
+            if not state.recording:
+                self._append_pre_roll(state, data)
             if rms >= self.config.vad_threshold:
                 if not state.recording:
                     state.buffer.clear()
+                    state.buffer.extend(state.pre_roll)
+                    state.pre_roll.clear()
                     state.recording = True
                     state.utterance_started_at = now
-                state.buffer.extend(data)
+                    if not state.buffer:
+                        state.buffer.extend(data)
+                else:
+                    state.buffer.extend(data)
                 state.last_voice_at = now
                 return
             if not state.recording:
@@ -410,6 +468,7 @@ class TelegramVoiceCallService:
                     finalize = bytes(state.buffer)
                     state.mode = "transcribing"
                 state.buffer.clear()
+                state.pre_roll.clear()
                 state.recording = False
         if finalize:
             threading.Thread(
@@ -421,8 +480,8 @@ class TelegramVoiceCallService:
 
     def _transcribe_utterance(self, chat_id: int, pcm: bytes) -> None:
         try:
-            wav_path = self.voice.pcm_to_wav(pcm, prefix=f"telegram-{chat_id}")
-            text = self.voice.transcribe_file(wav_path).strip()
+            wav_path = self.voice.pcm_to_stt_wav(pcm, prefix=f"telegram-{chat_id}")
+            text = self.voice.transcribe_prepared_file(wav_path).strip()
             if text:
                 self.emit(
                     MessageEvent(
@@ -472,6 +531,17 @@ class TelegramVoiceCallService:
     def _pcm_chunk_size(self) -> int:
         return max(1, self.config.sample_rate // 100) * self.config.channels * 2
 
+    def _pre_roll_bytes(self) -> int:
+        return max(0, int(self.config.sample_rate * self.config.channels * 2 * self.config.pre_roll_seconds))
+
+    def _append_pre_roll(self, state: _ActiveCall, data: bytes) -> None:
+        max_bytes = self._pre_roll_bytes()
+        if max_bytes <= 0:
+            return
+        state.pre_roll.extend(data)
+        if len(state.pre_roll) > max_bytes:
+            del state.pre_roll[: len(state.pre_roll) - max_bytes]
+
 
 def parse_telegram_chat_id(bus_or_chat_id: str) -> int:
     value = str(bus_or_chat_id).strip()
@@ -497,3 +567,52 @@ def _pcm16_rms(data: bytes) -> float:
     for sample in samples:
         total += sample * sample
     return (total / len(samples)) ** 0.5
+
+
+def _split_tts_chunks(text: str, *, max_chars: int, max_chunks: int) -> list[str]:
+    cleaned = re.sub(r"\s+", " ", text).strip()
+    if not cleaned:
+        return []
+    if max_chars <= 0 or len(cleaned) <= max_chars:
+        return [cleaned]
+
+    chunks: list[str] = []
+    current = ""
+    sentences = re.split(r"(?<=[.!?])\s+", cleaned)
+    for sentence in sentences:
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+        if len(sentence) > max_chars:
+            pieces = textwrap.wrap(sentence, width=max_chars, break_long_words=False, break_on_hyphens=False)
+        else:
+            pieces = [sentence]
+        for piece in pieces:
+            candidate = f"{current} {piece}".strip() if current else piece
+            if current and len(candidate) > max_chars:
+                chunks.append(current)
+                current = piece
+            else:
+                current = candidate
+    if current:
+        chunks.append(current)
+
+    if max_chunks > 0 and len(chunks) > max_chunks:
+        chunks = chunks[:max_chunks]
+        suffix = " More details are in text."
+        if len(chunks[-1]) + len(suffix) <= max_chars:
+            chunks[-1] = chunks[-1] + suffix
+        else:
+            chunks[-1] = chunks[-1][: max(0, max_chars - len(suffix) - 3)].rstrip() + "..." + suffix
+    return chunks
+
+
+def _patch_pyrogram_groupcall_forbidden() -> None:
+    try:
+        import pyrogram.errors as errors
+    except Exception:
+        return
+    if hasattr(errors, "GroupcallForbidden"):
+        return
+    fallback = getattr(errors, "Forbidden", Exception)
+    setattr(errors, "GroupcallForbidden", fallback)

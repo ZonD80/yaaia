@@ -150,6 +150,7 @@ def _run_payload(payload: dict[str, Any]) -> dict[str, Any]:
     home = Path(str(payload.get("home") or Path.home() / "yaaia")).expanduser()
     database_path = Path(str(payload.get("database_path") or home / "data" / "messages.sqlite3")).expanduser()
 
+    from ..schedules import consume_due_schedules, create_schedule, delete_schedule, list_schedules, update_schedule
     from ..storage import MessageStore
     from .addressbook import AddressBookStore
     from .secrets import SecretsStore
@@ -191,6 +192,12 @@ def _run_payload(payload: dict[str, Any]) -> dict[str, Any]:
     ) -> None:
         send(str(bus_id), _email_route_payload("", subject, body, cc=cc, bcc=bcc, html=html, attachments=attachments))
 
+    def telegram_search(query: object, limit: int = 20) -> None:
+        send("telegram-search", f"{query} | {limit}")
+
+    def telegram_resolve(target: object) -> None:
+        send("telegram-resolve", target)
+
     def history(bus_id: str = "root", limit: int = 50) -> list[dict[str, Any]]:
         selected = [item for item in history_items if isinstance(item, dict) and item.get("bus_id") == bus_id]
         return selected[-max(1, min(int(limit), 500)) :]
@@ -208,6 +215,27 @@ def _run_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
     def restore_bus(bus_id: str) -> bool:
         return message_store.restore_bus(bus_id)
+
+    def schedule_create(
+        title: str,
+        instructions: str,
+        at: str,
+        repeat: str = "",
+        bus_id: str = "root",
+    ) -> dict[str, Any]:
+        return create_schedule(home, title=title, instructions=instructions, at=at, repeat=repeat, bus_id=bus_id)
+
+    def schedules_list(include_disabled: bool = True) -> list[dict[str, Any]]:
+        return list_schedules(home, include_disabled=include_disabled)
+
+    def schedule_update(schedule_id: str, **updates: Any) -> dict[str, Any]:
+        return update_schedule(home, schedule_id, **updates)
+
+    def schedule_delete(schedule_id: str) -> bool:
+        return delete_schedule(home, schedule_id)
+
+    def schedule_run_due() -> list[dict[str, Any]]:
+        return consume_due_schedules(home)
 
     def contacts_list() -> list[dict[str, Any]]:
         return [contact.to_dict() for contact in addressbook.list()]
@@ -278,12 +306,19 @@ def _run_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "root": root,
         "reply_email": reply_email,
         "restore_bus": restore_bus,
+        "schedule_create": schedule_create,
+        "schedule_delete": schedule_delete,
+        "schedule_run_due": schedule_run_due,
+        "schedule_update": schedule_update,
+        "schedules_list": schedules_list,
         "secret_delete": secret_delete,
         "secret_get": secret_get,
         "secret_set": secret_set,
         "secrets_list": secrets_list,
         "send": send,
         "timezone": timezone,
+        "telegram_resolve": telegram_resolve,
+        "telegram_search": telegram_search,
     }
 
     started = time.monotonic()

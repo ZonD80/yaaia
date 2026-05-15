@@ -71,14 +71,22 @@ class VoiceConfig:
     sample_rate: int
     channels: int
     vad_threshold: int
+    pre_roll_seconds: float
     silence_seconds: float
     min_utterance_seconds: float
     max_utterance_seconds: float
-    tts_model: str
     tts_voice: str
-    tts_language: str
-    stt_model: str
+    tts_rate: int
+    tts_chunk_chars: int
+    tts_max_chunks: int
+    speech_locale: str
+    speech_helper_path: Path | None
+    stt_sample_rate: int
+    stt_channels: int
+    stt_normalize: bool
+    stt_pad_seconds: float
     command_timeout_seconds: int
+    preflight_enabled: bool
     data_dir: Path
 
 
@@ -120,6 +128,7 @@ class AppConfig:
             home / "google" / "token.json",
         )
         google_auto_enabled = credentials_path.exists() or token_path.exists()
+        speech_helper_raw = os.getenv("YAAIA_SPEECH_HELPER")
 
         return cls(
             home=home,
@@ -159,17 +168,22 @@ class AppConfig:
                 sample_rate=_int_env("YAAIA_CALLS_SAMPLE_RATE", 48000),
                 channels=_int_env("YAAIA_CALLS_CHANNELS", 2),
                 vad_threshold=_int_env("YAAIA_CALLS_VAD_THRESHOLD", 450),
+                pre_roll_seconds=_float_env("YAAIA_CALLS_PRE_ROLL_SECONDS", 0.35),
                 silence_seconds=_float_env("YAAIA_CALLS_SILENCE_SECONDS", 1.2),
                 min_utterance_seconds=_float_env("YAAIA_CALLS_MIN_UTTERANCE_SECONDS", 0.45),
                 max_utterance_seconds=_float_env("YAAIA_CALLS_MAX_UTTERANCE_SECONDS", 20.0),
-                tts_model=os.getenv(
-                    "YAAIA_MLX_TTS_MODEL",
-                    "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit",
-                ),
-                tts_voice=os.getenv("YAAIA_MLX_TTS_VOICE", "Chelsie"),
-                tts_language=os.getenv("YAAIA_MLX_TTS_LANGUAGE", "English"),
-                stt_model=os.getenv("YAAIA_MLX_STT_MODEL", "mlx-community/whisper-large-v3-turbo-asr-fp16"),
-                command_timeout_seconds=_int_env("YAAIA_MLX_COMMAND_TIMEOUT_SECONDS", 300),
+                tts_voice=os.getenv("YAAIA_MACOS_TTS_VOICE", "").strip(),
+                tts_rate=_int_env("YAAIA_MACOS_TTS_RATE", 210),
+                tts_chunk_chars=_int_env("YAAIA_CALLS_TTS_CHUNK_CHARS", 180),
+                tts_max_chunks=_int_env("YAAIA_CALLS_TTS_MAX_CHUNKS", 3),
+                speech_locale=os.getenv("YAAIA_SPEECH_LOCALE", "en-US").strip() or "en-US",
+                speech_helper_path=_expand_path(speech_helper_raw, Path()) if speech_helper_raw else None,
+                stt_sample_rate=_int_env("YAAIA_SPEECH_STT_SAMPLE_RATE", 16000),
+                stt_channels=_int_env("YAAIA_SPEECH_STT_CHANNELS", 1),
+                stt_normalize=_bool_env("YAAIA_SPEECH_STT_NORMALIZE", True),
+                stt_pad_seconds=_float_env("YAAIA_SPEECH_STT_PAD_SECONDS", 0.15),
+                command_timeout_seconds=_int_env("YAAIA_SPEECH_COMMAND_TIMEOUT_SECONDS", 90),
+                preflight_enabled=_bool_env("YAAIA_SPEECH_PREFLIGHT_ENABLED", True),
                 data_dir=_expand_path(os.getenv("YAAIA_VOICE_DATA_DIR"), home / "voice"),
             ),
         )

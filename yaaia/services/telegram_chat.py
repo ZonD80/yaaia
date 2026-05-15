@@ -205,6 +205,71 @@ class TelegramChatService:
             for chat in self.list_chats(limit)
         ]
 
+    def search_chats(self, query: str, limit: int = 20) -> list[dict[str, Any]]:
+        query = query.strip()
+        if not query:
+            return []
+        limit = max(1, min(limit, 50))
+        results: dict[int, dict[str, Any]] = {}
+
+        for chat in self.list_chats(100):
+            title = str(chat.get("title") or "")
+            if query.lower() in title.lower():
+                chat_id = int(chat["id"])
+                results[chat_id] = {
+                    "id": chat_id,
+                    "bus_id": f"telegram-{chat_id}",
+                    "title": title or str(chat_id),
+                    "source": "local",
+                    "unread_count": chat.get("unread_count", 0),
+                }
+
+        for method_name, params in (
+            ("searchChats", {"query": query, "limit": limit}),
+            ("searchChatsOnServer", {"query": query, "limit": limit}),
+            ("searchPublicChats", {"query": query}),
+        ):
+            try:
+                update = self._call_method(method_name, params, timeout=10)
+                for chat_id in _extract_chat_ids(update):
+                    if chat_id not in results:
+                        results[chat_id] = self._chat_search_result(chat_id, source=method_name)
+            except Exception as exc:  # noqa: BLE001 - search should degrade across TDLib methods
+                self.log(f"Telegram {method_name} failed: {exc}")
+
+        try:
+            update = self._call_method("searchContacts", {"query": query, "limit": limit}, timeout=10)
+            for user_id in _extract_user_ids(update):
+                try:
+                    chat = self._create_private_chat(user_id)
+                    chat_id = int(chat.get("id"))
+                    if chat_id not in results:
+                        results[chat_id] = self._chat_search_result(chat_id, source="searchContacts")
+                except Exception as exc:  # noqa: BLE001
+                    self.log(f"Telegram createPrivateChat failed for user {user_id}: {exc}")
+        except Exception as exc:  # noqa: BLE001
+            self.log(f"Telegram searchContacts failed: {exc}")
+
+        return list(results.values())[:limit]
+
+    def resolve_chat_id(self, target: str) -> int:
+        raw = target.strip()
+        if raw.startswith("telegram-"):
+            raw = raw.removeprefix("telegram-")
+        if raw.lstrip("-").isdigit():
+            return int(raw)
+        username = raw.removeprefix("@")
+        if not username:
+            raise ValueError("Telegram target is empty.")
+        update = self._call_method("searchPublicChat", {"username": username}, timeout=10)
+        chat_id = _extract_single_chat_id(update)
+        if chat_id is None:
+            matches = self.search_chats(username, limit=1)
+            if not matches:
+                raise ValueError(f"Telegram chat not found: {target}")
+            chat_id = int(matches[0]["id"])
+        return chat_id
+
     def _require_client(self) -> Any:
         with self._lock:
             if self._tg is None or not self._connected:
@@ -263,12 +328,35 @@ class TelegramChatService:
         update = getattr(result, "update", {}) or {}
         return update if isinstance(update, dict) else {}
 
+    def _create_private_chat(self, user_id: int) -> dict[str, Any]:
+        update = self._call_method("createPrivateChat", {"user_id": user_id, "force": False}, timeout=10)
+        return update if isinstance(update, dict) else {}
+
+    def _chat_search_result(self, chat_id: int, *, source: str) -> dict[str, Any]:
+        chat = self._get_chat(chat_id)
+        title = str(chat.get("title") or chat_id)
+        self._chat_cache[chat_id] = title
+        return {
+            "id": chat_id,
+            "bus_id": f"telegram-{chat_id}",
+            "title": title,
+            "source": source,
+            "type": _chat_type(chat),
+            "unread_count": chat.get("unread_count", 0),
+        }
+
+    def _call_method(self, method_name: str, params: dict[str, Any], *, timeout: float | None = None) -> Any:
+        tg = self._require_client()
+        result = tg.call_method(method_name, params=params)
+        if timeout is not None:
+            result.wait(timeout=timeout, raise_exc=True)
+        else:
+            result.wait(raise_exc=True)
+        return getattr(result, "update", None)
+
     def _call_method_safe(self, method_name: str, params: dict[str, Any], *, timeout: float | None = None) -> None:
         try:
-            tg = self._require_client()
-            result = tg.call_method(method_name, params=params)
-            if timeout is not None:
-                result.wait(timeout=timeout, raise_exc=True)
+            self._call_method(method_name, params, timeout=timeout)
         except Exception as exc:  # noqa: BLE001 - best-effort UX/read receipt
             self.log(f"Telegram {method_name} failed: {exc}")
 
@@ -341,3 +429,53 @@ def _message_external_id(update: Any) -> str | None:
         if message_id is not None:
             return str(message_id)
     return None
+
+
+def _extract_chat_ids(update: Any) -> list[int]:
+    if not isinstance(update, dict):
+        return []
+    chat_ids = update.get("chat_ids")
+    if isinstance(chat_ids, list):
+        return [int(chat_id) for chat_id in chat_ids if str(chat_id).lstrip("-").isdigit()]
+    chats = update.get("chats")
+    if isinstance(chats, list):
+        return [
+            int(chat["id"])
+            for chat in chats
+            if isinstance(chat, dict) and str(chat.get("id")).lstrip("-").isdigit()
+        ]
+    if str(update.get("id")).lstrip("-").isdigit() and str(update.get("@type") or "").lower().endswith("chat"):
+        return [int(update["id"])]
+    return []
+
+
+def _extract_single_chat_id(update: Any) -> int | None:
+    chat_ids = _extract_chat_ids(update)
+    if chat_ids:
+        return chat_ids[0]
+    if isinstance(update, dict) and str(update.get("id")).lstrip("-").isdigit():
+        return int(update["id"])
+    return None
+
+
+def _extract_user_ids(update: Any) -> list[int]:
+    if not isinstance(update, dict):
+        return []
+    user_ids = update.get("user_ids")
+    if isinstance(user_ids, list):
+        return [int(user_id) for user_id in user_ids if str(user_id).isdigit()]
+    users = update.get("users")
+    if isinstance(users, list):
+        return [
+            int(user["id"])
+            for user in users
+            if isinstance(user, dict) and str(user.get("id")).isdigit()
+        ]
+    return []
+
+
+def _chat_type(chat: dict[str, Any]) -> str:
+    chat_type = chat.get("type")
+    if isinstance(chat_type, dict):
+        return str(chat_type.get("@type") or chat_type.get("type") or "")
+    return str(chat_type or "")

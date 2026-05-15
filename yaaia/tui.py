@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import shlex
 import sys
@@ -18,7 +19,16 @@ from rich.text import Text
 
 from .config import AppConfig
 from .events import MessageEvent
-from .schedules import consume_due_schedules, get_startup_command, set_startup_command
+from .schedules import (
+    build_schedule_message,
+    consume_due_schedules,
+    create_schedule,
+    delete_schedule,
+    get_startup_command,
+    list_schedules,
+    set_startup_command,
+    update_schedule,
+)
 from .services.addressbook import AddressBookStore
 from .services.agent import AgentService
 from .services.google_workspace import GoogleWorkspaceService
@@ -57,6 +67,8 @@ class ConsoleTUI:
         self._agent_queue_lock = threading.RLock()
         self._agent_pending: list[MessageEvent] = []
         self._agent_worker_active = False
+        self._schedule_stop = threading.Event()
+        self._schedule_thread: threading.Thread | None = None
         self.telegram: TelegramChatService | None = None
         self.google: GoogleWorkspaceService | None = None
         self.agent: AgentService | None = None
@@ -111,6 +123,18 @@ class ConsoleTUI:
     def log(self, message: str) -> None:
         self.emit(MessageEvent(source="system", bus_id="system", sender="yaaia", text=message))
 
+    def start_schedule_runner(self) -> None:
+        if self._schedule_thread and self._schedule_thread.is_alive():
+            return
+        self._schedule_stop.clear()
+        self._schedule_thread = threading.Thread(target=self._schedule_loop, name="yaaia-schedules", daemon=True)
+        self._schedule_thread.start()
+
+    def stop_schedule_runner(self) -> None:
+        self._schedule_stop.set()
+        if self._schedule_thread and self._schedule_thread.is_alive():
+            self._schedule_thread.join(timeout=2)
+
     def run(self) -> None:
         while True:
             try:
@@ -127,6 +151,22 @@ class ConsoleTUI:
                 keep_running = True
             if not keep_running:
                 return
+
+    def _schedule_loop(self) -> None:
+        while not self._schedule_stop.wait(10.0):
+            try:
+                self._run_due_schedules()
+            except Exception as exc:  # noqa: BLE001 - keep scheduler alive
+                self.log(f"Schedule runner failed: {exc}")
+
+    def _run_due_schedules(self) -> list[dict[str, Any]]:
+        due = consume_due_schedules(self.config.home)
+        if not due:
+            return []
+        event = self._append_root_message(build_schedule_message(due), sender="schedule")
+        self.log(f"Scheduled task trigger appended to root bus ({len(due)} due).")
+        self._respond_with_agent(event)
+        return due
 
     def print_event(self, event: MessageEvent) -> None:
         timestamp = event.timestamp.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -178,6 +218,12 @@ class ConsoleTUI:
             return True
         if line in {"call status", "calls status", "voice status"}:
             self._print_call_status()
+            return True
+        if line in {"voice check", "speech check", "calls check"}:
+            if not self.calls:
+                raise RuntimeError("Call service not configured.")
+            self.calls.check_speech()
+            self.console.print("[green]Native speech ready.[/green]")
             return True
         if line in {"calls start", "call service start", "voice start"}:
             if not self.calls:
@@ -262,6 +308,22 @@ class ConsoleTUI:
         if line.startswith(("restore bus ", "bus restore ", "unforget bus ")):
             self._restore_bus(_bus_arg(line))
             return True
+        if line in {"schedules", "schedule list"}:
+            self._print_schedules()
+            return True
+        if line.startswith("schedule add "):
+            self._add_schedule(line)
+            return True
+        if line.startswith("schedule delete "):
+            self._delete_schedule(line.removeprefix("schedule delete ").strip())
+            return True
+        if line.startswith("schedule update "):
+            self._update_schedule(line.removeprefix("schedule update ").strip())
+            return True
+        if line == "schedule run due":
+            due = self._run_due_schedules()
+            self.console.print(f"[green]Ran {len(due)} due schedule(s).[/green]")
+            return True
         if line == "startup":
             self._print_startup_command()
             return True
@@ -291,6 +353,17 @@ class ConsoleTUI:
             limit = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 30
             self._print_telegram_chats(limit)
             return True
+        if line.startswith("telegram search "):
+            query = line.removeprefix("telegram search ").strip()
+            self._print_telegram_search(query)
+            return True
+        if line.startswith("telegram resolve "):
+            if not self.telegram:
+                raise RuntimeError("Telegram service not configured.")
+            target = line.removeprefix("telegram resolve ").strip()
+            chat_id = self.telegram.resolve_chat_id(target)
+            self.console.print(f"telegram-{chat_id}")
+            return True
         if line.startswith("telegram send "):
             _, _, rest = line.partition("telegram send ")
             chat_id_raw, _, text = rest.partition(" ")
@@ -298,7 +371,7 @@ class ConsoleTUI:
                 raise ValueError("Usage: telegram send <chat_id> <message>")
             if not self.telegram:
                 raise RuntimeError("Telegram service not configured.")
-            self.telegram.send_text(int(chat_id_raw), text)
+            self.telegram.send_text(self.telegram.resolve_chat_id(chat_id_raw), text)
             return True
         if line == "google auth":
             if not self.google:
@@ -410,13 +483,14 @@ class ConsoleTUI:
         table.add_row("agent reset", "Clear in-memory agent conversation session.")
         table.add_row("clear chat", "Clear root chat history and reset the agent session.")
         table.add_row("call status", "Show Telegram call/STT/TTS state.")
+        table.add_row("voice check", "Check native macOS TTS and SpeechAnalyzer STT.")
         table.add_row("calls start", "Start the optional py-tgcalls media service.")
         table.add_row("call start <telegram-bus|chat_id>", "Place a Telegram audio call.")
         table.add_row("call accept <telegram-bus|chat_id>", "Accept an incoming Telegram call.")
         table.add_row("call hangup [telegram-bus|chat_id]", "Hang up an active call.")
-        table.add_row("call say <telegram-bus|chat_id> <text>", "Speak text into an active call via mlx-audio TTS.")
-        table.add_row("voice tts <text>", "Generate a local mlx-audio TTS file.")
-        table.add_row("voice stt <path>", "Transcribe an audio file with mlx-audio STT.")
+        table.add_row("call say <telegram-bus|chat_id> <text>", "Speak text into an active call via macOS native TTS.")
+        table.add_row("voice tts <text>", "Generate a local macOS native TTS file.")
+        table.add_row("voice stt <path>", "Transcribe an audio file with SpeechAnalyzer.")
         table.add_row("contacts", "List addressbook contacts.")
         table.add_row("contacts search <query>", "Search addressbook contacts.")
         table.add_row("contact get <id|identifier>", "Show one contact.")
@@ -434,11 +508,18 @@ class ConsoleTUI:
         table.add_row("forgotten buses", "List hidden buses.")
         table.add_row("history [limit]", "Print root bus history.")
         table.add_row("history all [limit]", "Print stored messages from every bus.")
+        table.add_row("schedules", "List scheduled tasks.")
+        table.add_row("schedule add <at> | <title> | <instructions> [| repeat]", "Create a scheduled agent task.")
+        table.add_row("schedule update <id> field=value ...", "Update a scheduled task.")
+        table.add_row("schedule delete <id>", "Delete a scheduled task.")
+        table.add_row("schedule run due", "Run currently due schedules now.")
         table.add_row("startup", "Show configured startup command.")
         table.add_row("startup run", "Append startup command to root bus.")
         table.add_row("startup set <title> | <instructions>", "Update startup command.")
         table.add_row("telegram chats [limit]", "List Telegram chats and IDs.")
-        table.add_row("telegram send <chat_id> <message>", "Send a Telegram text message.")
+        table.add_row("telegram search <query>", "Search local/server/public Telegram chats and contacts.")
+        table.add_row("telegram resolve <username|chat_id>", "Resolve a Telegram target to a bus id.")
+        table.add_row("telegram send <chat_id|@username> <message>", "Send a Telegram text message.")
         table.add_row("google auth", "Run Google OAuth and save token.")
         table.add_row("google logout", "Remove the saved Google OAuth token.")
         table.add_row("google poll", "Poll Gmail and Calendar immediately.")
@@ -477,8 +558,17 @@ class ConsoleTUI:
         table.add_row("running", "yes" if status["running"] else "no")
         table.add_row("sample_rate", str(status["sample_rate"]))
         table.add_row("channels", str(status["channels"]))
-        table.add_row("tts_model", str(status["tts_model"]))
-        table.add_row("stt_model", str(status["stt_model"]))
+        table.add_row("pre_roll_seconds", str(status["pre_roll_seconds"]))
+        table.add_row("tts_engine", str(status["tts_engine"]))
+        table.add_row("tts_voice", str(status["tts_voice"] or "system default"))
+        table.add_row("tts_rate", str(status["tts_rate"]))
+        table.add_row("tts_chunk_chars", str(status["tts_chunk_chars"]))
+        table.add_row("tts_max_chunks", str(status["tts_max_chunks"]))
+        table.add_row("stt_engine", str(status["stt_engine"]))
+        table.add_row("speech_locale", str(status["speech_locale"]))
+        table.add_row("stt_audio", str(status["stt_audio"]))
+        table.add_row("stt_normalize", "yes" if status["stt_normalize"] else "no")
+        table.add_row("speech_check", "startup" if status["speech_check"] else "manual")
         pending = ", ".join(status["pending_incoming"]) if status["pending_incoming"] else ""
         table.add_row("pending_incoming", pending)
         calls = status["active_calls"]
@@ -588,6 +678,62 @@ class ConsoleTUI:
         force = len(parts) > 3 and parts[3].strip().lower() in {"1", "true", "yes", "force"}
         secret_id = self.secrets.set(description=parts[0], type=parts[1], value=parts[2], force=force)
         self.console.print(f"[green]Secret saved.[/green] {secret_id}")
+
+    def _print_schedules(self) -> None:
+        table = Table(title="Schedules", show_header=True, header_style="bold cyan")
+        table.add_column("ID")
+        table.add_column("At")
+        table.add_column("Repeat")
+        table.add_column("Enabled")
+        table.add_column("Bus")
+        table.add_column("Title")
+        table.add_column("Instructions")
+        for item in list_schedules(self.config.home):
+            table.add_row(
+                str(item.get("id") or ""),
+                str(item.get("at") or ""),
+                str(item.get("repeat") or "none"),
+                "yes" if item.get("enabled", True) else "no",
+                str(item.get("bus_id") or "root"),
+                str(item.get("title") or ""),
+                str(item.get("instructions") or ""),
+            )
+        self.console.print(table)
+
+    def _add_schedule(self, line: str) -> None:
+        payload = line.removeprefix("schedule add ").strip()
+        parts = [part.strip() for part in payload.split("|")]
+        if len(parts) < 3:
+            raise ValueError("Usage: schedule add <at> | <title> | <instructions> [| repeat]")
+        item = create_schedule(
+            self.config.home,
+            at=parts[0],
+            title=parts[1],
+            instructions=parts[2],
+            repeat=parts[3] if len(parts) > 3 else "",
+        )
+        self.console.print(f"[green]Schedule created.[/green] {item['id']}")
+
+    def _update_schedule(self, payload: str) -> None:
+        schedule_id, _, raw_updates = payload.partition(" ")
+        if not schedule_id or not raw_updates:
+            raise ValueError("Usage: schedule update <id> field=value ...")
+        updates: dict[str, Any] = {}
+        for token in shlex.split(raw_updates):
+            field, sep, value = token.partition("=")
+            if not sep:
+                raise ValueError("Updates must be field=value pairs.")
+            if field not in {"title", "instructions", "at", "repeat", "bus_id", "enabled"}:
+                raise ValueError(f"Unsupported schedule field: {field}")
+            updates[field] = value
+        update_schedule(self.config.home, schedule_id, **updates)
+        self.console.print("[green]Schedule updated.[/green]")
+
+    def _delete_schedule(self, schedule_id: str) -> None:
+        if not schedule_id:
+            raise ValueError("Usage: schedule delete <id>")
+        deleted = delete_schedule(self.config.home, schedule_id)
+        self.console.print("[green]Schedule deleted.[/green]" if deleted else "[yellow]Schedule not found.[/yellow]")
 
     def _print_agent_status(self) -> None:
         table = Table(title="Agent", show_header=True, header_style="bold cyan")
@@ -954,9 +1100,25 @@ class ConsoleTUI:
                 continue
         return sorted(set(chat_ids))
 
-    def deliver_agent_message(self, bus_id: str, content: str) -> None:
+    def deliver_agent_message(self, bus_id: str, content: str) -> str | None:
         if self.store.is_bus_forgotten(bus_id):
             raise RuntimeError(f"{bus_id} is forgotten. Run `restore bus {bus_id}` before sending.")
+        if bus_id == "telegram-search":
+            if not self.telegram or not self.telegram.connected:
+                raise RuntimeError("Telegram is not connected.")
+            query, limit = _parse_search_payload(content)
+            results = self.telegram.search_chats(query, limit=limit)
+            text = json.dumps(results, ensure_ascii=False)
+            self.emit(MessageEvent(source="telegram", bus_id="telegram-search", sender="search", text=text, outbound=True))
+            return text
+        if bus_id == "telegram-resolve":
+            if not self.telegram or not self.telegram.connected:
+                raise RuntimeError("Telegram is not connected.")
+            chat_id = self.telegram.resolve_chat_id(content)
+            result = {"id": chat_id, "bus_id": f"telegram-{chat_id}"}
+            text = json.dumps(result, ensure_ascii=False)
+            self.emit(MessageEvent(source="telegram", bus_id="telegram-resolve", sender="resolve", text=text, outbound=True))
+            return text
         if bus_id == "call":
             if not self.calls:
                 raise RuntimeError("Call service not configured.")
@@ -970,22 +1132,38 @@ class ConsoleTUI:
                     outbound=True,
                 )
             )
-            return
+            return result
         if bus_id == "email" or bus_id.startswith(("gmail-", "email-")):
             self._send_agent_email(bus_id, content)
-            return
+            return "email sent"
         if bus_id.startswith("telegram-"):
+            active_call = bool(self.calls and self.calls.is_active_bus(bus_id))
             spoken = False
-            if self.calls and self.calls.is_active_bus(bus_id):
-                self.calls.say(bus_id, content)
-                spoken = True
-            if self.config.voice.text_fallback or not spoken:
-                if not self.telegram or not self.telegram.connected:
-                    if spoken:
-                        return
+            text_sent = False
+            if self.config.voice.text_fallback:
+                if self.telegram and self.telegram.connected:
+                    chat_id = self.telegram.resolve_chat_id(bus_id.removeprefix("telegram-"))
+                    self.telegram.send_text(chat_id, content)
+                    text_sent = True
+                elif not active_call:
                     raise RuntimeError(f"Telegram is not connected for {bus_id}.")
-                self.telegram.send_text(int(bus_id.removeprefix("telegram-")), content)
-            return
+            if active_call and self.calls:
+                try:
+                    self.calls.say(bus_id, content)
+                    spoken = True
+                except Exception as exc:  # noqa: BLE001 - text fallback still delivers the reply
+                    self.log(f"Telegram call TTS failed on {bus_id}: {exc}")
+            if not spoken and not text_sent:
+                if not self.telegram or not self.telegram.connected:
+                    raise RuntimeError(f"Telegram is not connected for {bus_id}.")
+                chat_id = self.telegram.resolve_chat_id(bus_id.removeprefix("telegram-"))
+                self.telegram.send_text(chat_id, content)
+                text_sent = True
+            if spoken and text_sent:
+                return "telegram sent and spoken"
+            if spoken:
+                return "spoken in active Telegram call"
+            return "telegram sent"
         event = MessageEvent(
             source=ROOT_BUS_ID,
             bus_id=ROOT_BUS_ID,
@@ -994,6 +1172,7 @@ class ConsoleTUI:
             outbound=False,
         )
         self.emit(event)
+        return None
 
     def _send_agent_email(self, bus_id: str, content: str) -> None:
         if not self.google:
@@ -1036,6 +1215,24 @@ class ConsoleTUI:
         table.add_column("Unread", justify="right")
         for chat in chats:
             table.add_row(str(chat["id"]), str(chat["title"]), str(chat.get("unread_count", 0)))
+        self.console.print(table)
+
+    def _print_telegram_search(self, query: str) -> None:
+        if not self.telegram:
+            raise RuntimeError("Telegram service not configured.")
+        results = self.telegram.search_chats(query)
+        table = Table(title=f"Telegram Search: {query}", show_header=True, header_style="bold cyan")
+        table.add_column("Bus")
+        table.add_column("Title")
+        table.add_column("Source")
+        table.add_column("Type")
+        for item in results:
+            table.add_row(
+                str(item.get("bus_id") or f"telegram-{item.get('id')}"),
+                str(item.get("title") or ""),
+                str(item.get("source") or ""),
+                str(item.get("type") or ""),
+            )
         self.console.print(table)
 
 
@@ -1144,3 +1341,14 @@ def _split_email_list(value: str) -> list[str]:
     if "," in value:
         return [part.strip() for part in value.split(",") if part.strip()]
     return shlex.split(value)
+
+
+def _parse_search_payload(content: str) -> tuple[str, int]:
+    raw = content.strip()
+    if not raw:
+        raise ValueError("Usage: telegram_search(query, limit=20)")
+    query, sep, limit_raw = raw.partition("|")
+    limit = 20
+    if sep and limit_raw.strip().isdigit():
+        limit = int(limit_raw.strip())
+    return query.strip(), max(1, min(limit, 50))

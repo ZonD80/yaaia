@@ -7,7 +7,7 @@ from .services.google_workspace import GoogleWorkspaceService
 from .services.secrets import SecretsStore
 from .services.telegram_chat import TelegramChatService
 from .services.telegram_calls import TelegramVoiceCallService
-from .services.voice import MlxAudioService
+from .services.voice import MacOSSpeechService
 from .setup import load_env_file, maybe_run_setup
 from .storage import MessageStore
 from .tui import ConsoleTUI
@@ -24,7 +24,7 @@ def run() -> int:
     tui = ConsoleTUI(config, store, addressbook, secrets)
     telegram = TelegramChatService(config.telegram, tui.emit, tui.log)
     google = GoogleWorkspaceService(config.google, store, tui.emit, tui.log)
-    voice = MlxAudioService(config.voice, tui.log)
+    voice = MacOSSpeechService(config.voice, tui.log)
     calls = TelegramVoiceCallService(config.telegram, config.voice, voice, tui.emit, tui.log)
     agent = AgentService(
         config.home,
@@ -43,13 +43,20 @@ def run() -> int:
         telegram.start()
         google.start()
         if config.voice.enabled:
+            if config.voice.preflight_enabled:
+                try:
+                    voice.check()
+                except Exception as exc:  # noqa: BLE001 - calls can still start without warm models
+                    tui.log(f"Native speech check failed: {exc}")
             try:
                 calls.start()
             except Exception as exc:  # noqa: BLE001 - voice is optional
                 tui.log(f"Telegram calls not started: {exc}")
         tui.prompt_startup_command()
+        tui.start_schedule_runner()
         tui.run()
     finally:
+        tui.stop_schedule_runner()
         calls.stop()
         telegram.stop()
         google.stop()
