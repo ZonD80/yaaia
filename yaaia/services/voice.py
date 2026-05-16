@@ -15,6 +15,40 @@ from ..config import VoiceConfig
 
 Log = Callable[[str], None]
 
+_KEYCAP_EMOJI_RE = re.compile("[0-9#*]\ufe0f?\u20e3")
+_EMOJI_RE = re.compile(
+    "["
+    "\u00a9"
+    "\u00ae"
+    "\u200d"
+    "\u203c"
+    "\u2049"
+    "\u20e3"
+    "\u2122"
+    "\u2139"
+    "\u2194-\u21aa"
+    "\u231a-\u231b"
+    "\u2328"
+    "\u23cf"
+    "\u23e9-\u23f3"
+    "\u23f8-\u23fa"
+    "\u24c2"
+    "\u25aa-\u25ab"
+    "\u25b6"
+    "\u25c0"
+    "\u25fb-\u25fe"
+    "\u2600-\u27bf"
+    "\u2934-\u2935"
+    "\u2b05-\u2b55"
+    "\u3030"
+    "\u303d"
+    "\u3297"
+    "\u3299"
+    "\ufe0e-\ufe0f"
+    "\U0001f000-\U0001faff"
+    "]+"
+)
+
 
 class MacOSSpeechService:
     def __init__(self, config: VoiceConfig, log: Log) -> None:
@@ -305,6 +339,8 @@ def sanitize_text_for_tts(text: str) -> str:
     cleaned = re.sub(r"\*([^*]+)\*", r"\1", cleaned)
     cleaned = re.sub(r"_([^_]+)_", r"\1", cleaned)
     cleaned = re.sub(r"\[([^\]]+)\]\((https?://[^)]+)\)", r"\1", cleaned)
+    cleaned = _KEYCAP_EMOJI_RE.sub(" ", cleaned)
+    cleaned = _EMOJI_RE.sub(" ", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned)
     return cleaned.strip()
 
